@@ -12,3 +12,6 @@ sysroot_path = "target/sysroot"
 
 [dependencies]
 bootloader = "0.8.2"
+volatile = "0.2.6"
+lazy_static = { version="1.4.0", features=["spin_no_std"] }
+spin = "0.5.2"
