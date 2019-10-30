@@ -1,4 +1,8 @@
 
-.PHONY: build
+.PHONY: build run
+
 build:
-	cargo xbuild
+	cargo bootimage
+
+run:
+	cargo xrun

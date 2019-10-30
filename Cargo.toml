@@ -11,3 +11,4 @@ memcpy = true
 sysroot_path = "target/sysroot"
 
 [dependencies]
+bootloader = "0.8.2"
