@@ -5,7 +5,7 @@
 #![reexport_test_harness_main = "test_main"]
 
 use core::panic::PanicInfo;
-use os::println;
+use os::{println, init};
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -24,6 +24,10 @@ fn panic(info: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     println!("Hello World{}", "!");
+
+    init();
+
+    x86_64::instructions::interrupts::int3(); 
 
     #[cfg(test)]
     test_main();
