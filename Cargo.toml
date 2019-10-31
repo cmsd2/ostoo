@@ -34,3 +34,4 @@ lazy_static = { version="1.4.0", features=["spin_no_std"] }
 spin = "0.5.2"
 x86_64 = "0.7.5"
 uart_16550 = "0.2.1"
+pic8259_simple = "0.1.1"

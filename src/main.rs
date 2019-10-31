@@ -27,10 +27,8 @@ pub extern "C" fn _start() -> ! {
 
     init();
 
-    x86_64::instructions::interrupts::int3(); 
-
     #[cfg(test)]
     test_main();
 
-    panic!("Some panic message");
+    loop {}
 }
