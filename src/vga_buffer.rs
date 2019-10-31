@@ -146,6 +146,7 @@ impl fmt::Write for Writer {
 
 #[cfg(test)]
 mod test {
+    use core::fmt::Write;
     use crate::{serial_print, serial_println};
     use super::{WRITER, BUFFER_HEIGHT};
 
@@ -170,9 +171,11 @@ mod test {
         serial_print!("test_println_output... ");
 
         let s = "Some test string that fits on a single line";
-        println!("{}", s);
+
+        let mut writer = WRITER.lock();
+        writeln!(writer, "\n{}", s).expect("writeln failed");
         for (i, c) in s.chars().enumerate() {
-            let screen_char = WRITER.lock().buffer.chars[BUFFER_HEIGHT - 2][i].read();
+            let screen_char = writer.buffer.chars[BUFFER_HEIGHT - 2][i].read();
             assert_eq!(char::from(screen_char.ascii_character), c);
         }
 
