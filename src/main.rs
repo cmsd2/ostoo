@@ -5,14 +5,14 @@
 #![reexport_test_harness_main = "test_main"]
 
 use core::panic::PanicInfo;
-use os::{println, init};
+use os::{println, init, hlt_loop};
 
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("{}", info);
 
-    loop {}
+    hlt_loop();
 }
 
 #[cfg(test)]
@@ -30,5 +30,5 @@ pub extern "C" fn _start() -> ! {
     #[cfg(test)]
     test_main();
 
-    loop {}
+    hlt_loop();
 }

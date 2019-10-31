@@ -5,20 +5,19 @@
 #![reexport_test_harness_main = "test_main"]
 
 use core::panic::PanicInfo;
+use os::{println, serial_print, serial_println, hlt_loop};
 
 #[no_mangle] // don't mangle the name of this function
 pub extern "C" fn _start() -> ! {
     test_main();
 
-    loop {}
+    hlt_loop();
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     os::test_panic_handler(info)
 }
-
-use os::{println, serial_print, serial_println};
 
 #[test_case]
 fn test_println() {
