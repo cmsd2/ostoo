@@ -10,8 +10,13 @@ edition = "2018"
 memcpy = true
 sysroot_path = "target/sysroot"
 
+[package.metadata.bootimage]
+test-args = ["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]
+test-success-exit-code = 33
+
 [dependencies]
 bootloader = "0.8.2"
 volatile = "0.2.6"
 lazy_static = { version="1.4.0", features=["spin_no_std"] }
 spin = "0.5.2"
+x86_64 = "0.7.5"
