@@ -1,14 +1,17 @@
 #![no_std]
 #![no_main]
 #![feature(custom_test_frameworks)]
-#![test_runner(kernel::test_runner)]
+#![test_runner(libkernel::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
 extern crate alloc;
 
 use core::panic::PanicInfo;
 use bootloader::{BootInfo, entry_point};
-use kernel::{println, init, hlt_loop};
+use libkernel::{println, init, hlt_loop};
+use x86_64::VirtAddr;
+
+pub const APIC_BASE: u64 = 0x_5555_5555_0000;
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -21,14 +24,14 @@ fn panic(info: &PanicInfo) -> ! {
 #[cfg(test)]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    kernel::test_panic_handler(info)
+    libkernel::test_panic_handler(info)
 }
 
-entry_point!(kernel_main);
+entry_point!(libkernel_main);
 
-pub fn kernel_main(boot_info: &'static BootInfo) -> ! {
-    use kernel::memory;
-    use kernel::allocator;
+pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
+    use libkernel::memory;
+    use libkernel::allocator;
     use x86_64::VirtAddr;
     use x86_64::structures::paging::{
         Page,
@@ -47,6 +50,8 @@ pub fn kernel_main(boot_info: &'static BootInfo) -> ! {
     };
     allocator::init_heap(&mut mapper, &mut frame_allocator)
         .expect("heap initialization failed");
+
+    apic::init(VirtAddr::new(APIC_BASE), &mut mapper, &mut frame_allocator);
 
     let heap_value = Box::new(41);
     println!("heap_value at {:p}", heap_value);

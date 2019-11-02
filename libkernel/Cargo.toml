@@ -1,5 +1,5 @@
 [package]
-name = "kernel"
+name = "libkernel"
 version = "0.1.0"
 authors = ["Chris Dawes <cmsd2@cantab.net>"]
 edition = "2018"
@@ -19,17 +19,7 @@ test-args = [
 test-success-exit-code = 33
 test-timeout = 30
 
-[[test]]
-name = "should_panic"
-harness = false
-
-[[test]]
-name = "stack_overflow"
-harness = false
-
 [dependencies]
-apic = { path = "../apic" }
-libkernel = { path = "../libkernel" }
 bootloader = { version = "0.8.2", features = ["map_physical_memory"] }
 volatile = "0.2.6"
 lazy_static = { version="1.4.0", features=["spin_no_std"] }

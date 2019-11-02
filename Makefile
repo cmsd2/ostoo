@@ -1,5 +1,5 @@
 
-.PHONY: build run test
+.PHONY: build run test clean
 
 build:
 	cargo bootimage --manifest-path kernel/Cargo.toml
@@ -9,3 +9,6 @@ run:
 
 test:
 	cargo xtest
+
+clean:
+	cargo clean

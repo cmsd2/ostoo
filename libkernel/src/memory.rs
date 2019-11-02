@@ -1,11 +1,8 @@
-use x86_64::{
-    structures::paging::PageTable,
-    VirtAddr,
-    PhysAddr,
-};
-
+use x86_64::{VirtAddr, PhysAddr};
 use x86_64::structures::paging::{
     Page,
+    PageTable,
+    PageTableFlags,
     PhysFrame,
     Mapper,
     Size4KiB,
@@ -90,19 +87,20 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     }
 }
 
-/// Creates an example mapping for the given page to frame `0xb8000`.
-pub fn create_example_mapping(
+pub fn map_page(
     page: Page,
+    addr: PhysAddr,
     mapper: &mut OffsetPageTable,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) {
-    use x86_64::structures::paging::PageTableFlags as Flags;
-
-    let frame = PhysFrame::containing_address(PhysAddr::new(0xb8000));
-    let flags = Flags::PRESENT | Flags::WRITABLE;
+    flags: PageTableFlags,
+) -> VirtAddr {
+    let frame = PhysFrame::containing_address(addr);
 
     let map_to_result = unsafe {
         mapper.map_to(page, frame, flags, frame_allocator)
     };
     map_to_result.expect("map_to failed").flush();
+
+    let offset = addr.as_u64() - frame.start_address().as_u64();
+    VirtAddr::new(page.start_address().as_u64() + offset)
 }

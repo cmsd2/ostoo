@@ -1,14 +1,14 @@
 #![no_std]
 #![no_main]
 #![feature(custom_test_frameworks)]
-#![test_runner(kernel::test_runner)]
+#![test_runner(libkernel::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
 extern crate alloc;
 
 use bootloader::{entry_point, BootInfo};
 use core::panic::PanicInfo;
-use kernel::{serial_print, serial_println};
+use libkernel::{serial_print, serial_println};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
@@ -16,15 +16,15 @@ entry_point!(main);
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    kernel::test_panic_handler(info)
+    libkernel::test_panic_handler(info)
 }
 
 fn main(boot_info: &'static BootInfo) -> ! {
-    use kernel::allocator;
-    use kernel::memory::{self, BootInfoFrameAllocator};
+    use libkernel::allocator;
+    use libkernel::memory::{self, BootInfoFrameAllocator};
     use x86_64::VirtAddr;
 
-    kernel::init();
+    libkernel::init();
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
     let mut mapper = unsafe { memory::init(phys_mem_offset) };
     let mut frame_allocator = unsafe {
