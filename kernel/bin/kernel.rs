@@ -1,14 +1,14 @@
 #![no_std]
 #![no_main]
 #![feature(custom_test_frameworks)]
-#![test_runner(os::test_runner)]
+#![test_runner(kernel::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
 extern crate alloc;
 
 use core::panic::PanicInfo;
 use bootloader::{BootInfo, entry_point};
-use os::{println, init, hlt_loop};
+use kernel::{println, init, hlt_loop};
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -21,14 +21,14 @@ fn panic(info: &PanicInfo) -> ! {
 #[cfg(test)]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    os::test_panic_handler(info)
+    kernel::test_panic_handler(info)
 }
 
 entry_point!(kernel_main);
 
 pub fn kernel_main(boot_info: &'static BootInfo) -> ! {
-    use os::memory;
-    use os::allocator;
+    use kernel::memory;
+    use kernel::allocator;
     use x86_64::VirtAddr;
     use x86_64::structures::paging::{
         Page,

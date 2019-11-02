@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 #![feature(custom_test_frameworks)]
-#![test_runner(os::test_runner)]
+#![test_runner(kernel::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
 use core::panic::PanicInfo;
-use os::{println, serial_print, serial_println, hlt_loop};
+use kernel::{println, serial_print, serial_println, hlt_loop};
 
 #[no_mangle] // don't mangle the name of this function
 pub extern "C" fn _start() -> ! {
@@ -16,7 +16,7 @@ pub extern "C" fn _start() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    os::test_panic_handler(info)
+    kernel::test_panic_handler(info)
 }
 
 #[test_case]

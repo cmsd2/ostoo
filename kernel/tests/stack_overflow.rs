@@ -6,7 +6,7 @@ use core::panic::PanicInfo;
 use lazy_static::lazy_static;
 use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::structures::idt::InterruptStackFrame;
-use os::{exit_qemu, QemuExitCode, serial_println, serial_print, hlt_loop};
+use kernel::{exit_qemu, QemuExitCode, serial_println, serial_print, hlt_loop};
 
 lazy_static! {
     static ref TEST_IDT: InterruptDescriptorTable = {
@@ -14,7 +14,7 @@ lazy_static! {
         unsafe {
             idt.double_fault
                 .set_handler_fn(test_double_fault_handler)
-                .set_stack_index(os::gdt::DOUBLE_FAULT_IST_INDEX);
+                .set_stack_index(kernel::gdt::DOUBLE_FAULT_IST_INDEX);
         }
 
         idt
@@ -38,7 +38,7 @@ extern "x86-interrupt" fn test_double_fault_handler(
 pub extern "C" fn _start() -> ! {
     serial_print!("stack_overflow... ");
 
-    os::gdt::init();
+    kernel::gdt::init();
     init_test_idt();
 
     // trigger a stack overflow
@@ -49,7 +49,7 @@ pub extern "C" fn _start() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    os::test_panic_handler(info)
+    kernel::test_panic_handler(info)
 }
 
 #[allow(unconditional_recursion)]

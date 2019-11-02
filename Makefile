@@ -2,10 +2,10 @@
 .PHONY: build run test
 
 build:
-	cargo bootimage
+	cargo bootimage --manifest-path kernel/Cargo.toml
 
 run:
-	cargo xrun
+	bootimage run --manifest-path kernel/Cargo.toml
 
 test:
 	cargo xtest
