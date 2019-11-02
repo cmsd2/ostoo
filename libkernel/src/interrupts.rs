@@ -50,6 +50,11 @@ lazy_static! {
 
 pub fn init_idt() {
     IDT.load();
+    let mut pics = PICS.lock();
+    unsafe {
+        pics.disable();
+        pics.maskall();
+    }
 }
 
 extern "x86-interrupt" fn breakpoint_handler(

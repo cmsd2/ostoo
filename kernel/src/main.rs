@@ -9,7 +9,6 @@ extern crate alloc;
 use core::panic::PanicInfo;
 use bootloader::{BootInfo, entry_point};
 use libkernel::{println, init, hlt_loop};
-use x86_64::VirtAddr;
 
 pub const APIC_BASE: u64 = 0x_5555_5555_0000;
 
@@ -33,10 +32,6 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     use libkernel::memory;
     use libkernel::allocator;
     use x86_64::VirtAddr;
-    use x86_64::structures::paging::{
-        Page,
-        MapperAllSizes
-    };
     use alloc::{boxed::Box, vec, vec::Vec, rc::Rc};
 
     println!("Hello World{}", "!");
