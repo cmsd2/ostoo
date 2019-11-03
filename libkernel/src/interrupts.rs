@@ -48,10 +48,19 @@ lazy_static! {
     };
 }
 
-pub fn init_idt() {
+pub fn init() {
+    init_idt();
+    init_pics();
+}
+
+fn init_idt() {
     IDT.load();
+}
+
+fn init_pics() {
     let mut pics = PICS.lock();
     unsafe {
+        pics.initialize();
         pics.disable();
         pics.maskall();
     }

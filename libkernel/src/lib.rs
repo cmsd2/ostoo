@@ -27,8 +27,7 @@ pub mod logger;
 
 pub fn init() {
     gdt::init();
-    interrupts::init_idt();
-    unsafe { interrupts::PICS.lock().initialize() };
+    interrupts::init();
     x86_64::instructions::interrupts::enable();
 }
 
