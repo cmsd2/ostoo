@@ -45,7 +45,7 @@ impl <S> VmemAllocator<S> for DumbVmemAllocator<S> where S: PageSize {
         (start, end)
     }
 
-    fn dealloc(&mut self, start: Page<S>, end: Page<S>) {
+    fn dealloc(&mut self, _start: Page<S>, _end: Page<S>) {
         // do nothing
     }
 }
