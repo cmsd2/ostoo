@@ -28,6 +28,8 @@ use bootloader::{entry_point, BootInfo};
 #[cfg(test)]
 use core::panic::PanicInfo;
 
+pub mod ioapic;
+
 bitflags! {
     pub struct ApicBaseMsrFlags: u64 {
         const BSP           = 0b0001_00000000;
