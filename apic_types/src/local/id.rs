@@ -52,6 +52,7 @@ impl From<Id8Bit> for IdFlags {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Id4Bit(pub u32);
 pub struct Id4BitRegister;
 impl LocalApicRegister for Id4BitRegister {
@@ -66,6 +67,7 @@ impl LocalApicRegister for Id4BitRegister {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Id8Bit(pub u32);
 pub struct Id8BitRegister;
 impl LocalApicRegister for Id8BitRegister {

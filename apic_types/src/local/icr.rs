@@ -25,15 +25,15 @@ bitflags! {
 }
 
 impl InterruptCommandFlags {
-    pub fn delivery_mode(&self) -> DeliveryMode {
+    pub fn delivery_mode(&self) -> IcrDeliveryMode {
         let bits = (*self & InterruptCommandFlags::DELIVERY_MODE).bits() >> 8;
-        DeliveryMode::try_from(bits as u8).expect("delivery mode")
+        IcrDeliveryMode::try_from(bits as u8).expect("icr delivery mode")
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(u8)]
-pub enum DeliveryMode {
+pub enum IcrDeliveryMode {
     Fixed = 0x0,
     LowestPriority,
     SMI,
@@ -44,7 +44,7 @@ pub enum DeliveryMode {
     Reserved2,
 }
 
-impl DeliveryMode {
+impl IcrDeliveryMode {
     pub fn as_u8(self) -> u8 {
         self as u8
     }
@@ -58,20 +58,20 @@ impl DeliveryMode {
     }
 }
 
-impl TryFrom<u8> for DeliveryMode {
+impl TryFrom<u8> for IcrDeliveryMode {
     type Error = &'static str;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0x0 => Ok(DeliveryMode::Fixed),
-            0x1 => Ok(DeliveryMode::LowestPriority),
-            0x2 => Ok(DeliveryMode::SMI),
-            0x3 => Ok(DeliveryMode::Reserved),
-            0x4 => Ok(DeliveryMode::NMI),
-            0x5 => Ok(DeliveryMode::INIT),
-            0x6 => Ok(DeliveryMode::StartUp),
-            0x7 => Ok(DeliveryMode::Reserved2),
-            _ => Err("invalid delivery mode")
+            0x0 => Ok(IcrDeliveryMode::Fixed),
+            0x1 => Ok(IcrDeliveryMode::LowestPriority),
+            0x2 => Ok(IcrDeliveryMode::SMI),
+            0x3 => Ok(IcrDeliveryMode::Reserved),
+            0x4 => Ok(IcrDeliveryMode::NMI),
+            0x5 => Ok(IcrDeliveryMode::INIT),
+            0x6 => Ok(IcrDeliveryMode::StartUp),
+            0x7 => Ok(IcrDeliveryMode::Reserved2),
+            _ => Err("invalid icr delivery mode")
         }
     }
 }

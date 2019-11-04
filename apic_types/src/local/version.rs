@@ -12,8 +12,16 @@ bitflags! {
 }
 
 impl VersionFlags {
+    pub fn version(&self) -> u8 {
+        (*self & VersionFlags::VERSION).bits() as u8
+    }
+
     pub fn lvt_entries(&self) -> u32 {
         ((*self & VersionFlags::MAX_LVT_ENTRY).bits() >> 16) + 1
+    }
+
+    pub fn can_suppress_eoi(&self) -> bool {
+        self.contains(VersionFlags::CAN_SUPPRESS_EOI)
     }
 }
 
