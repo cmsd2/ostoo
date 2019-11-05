@@ -3,5 +3,4 @@ members = [
     "kernel",
     "libkernel",
     "apic",
-    "pic8259_simple",
 ]
