@@ -4,3 +4,6 @@ members = [
     "libkernel",
     "apic",
 ]
+
+[patch."https://github.com/cmsd2/apic_types"]
+apic_types = { path = "../apic_types" }

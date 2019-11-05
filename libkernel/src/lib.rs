@@ -8,6 +8,9 @@
 
 extern crate alloc;
 
+#[macro_use]
+extern crate log;
+
 #[cfg(test)]
 use bootloader::{entry_point, BootInfo};
 
@@ -24,8 +27,10 @@ pub mod gdt;
 pub mod memory;
 pub mod allocator;
 pub mod logger;
+pub mod cpuid;
 
 pub fn init() {
+    cpuid::init();
     gdt::init();
     interrupts::init();
     x86_64::instructions::interrupts::enable();

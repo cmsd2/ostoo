@@ -1,5 +1,4 @@
 use core::ptr::NonNull;
-use libkernel::println;
 use libkernel::memory::{VmemAllocator, DumbVmemAllocator};
 use x86_64::{PhysAddr, VirtAddr, align_up};
 use x86_64::structures::paging::{Page, PageSize, PageTableFlags, PhysFrame, FrameAllocator, Size4KiB, Mapper};

@@ -28,17 +28,19 @@ use x86_64::structures::paging::{
     Size4KiB,
     FrameAllocator,
 };
-use local_apic::LocalApic;
+use local_apic::MappedLocalApic;
+#[macro_use]
+extern crate log;
 
 lazy_static! {
-    pub static ref LOCAL_APIC: Mutex<Option<LocalApic>> = Mutex::new(None);
+    pub static ref LOCAL_APIC: Mutex<Option<MappedLocalApic>> = Mutex::new(None);
 }
 
 pub fn init(remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
     use x86_64::structures::paging::page_table::PageTableFlags as Flags;
 
     let page = Page::from_start_address(remap_addr).expect("remap apic page");
-    let frame = PhysFrame::containing_address(unsafe { LocalApic::get_base_phys_addr() });
+    let frame = PhysFrame::from_start_address(unsafe { MappedLocalApic::get_base_phys_addr() }).expect("non-0 frame offset");
     let flags = Flags::PRESENT | Flags::WRITABLE | Flags::NO_CACHE;
 
     let map_to_result = unsafe {
@@ -50,7 +52,9 @@ pub fn init(remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allo
     println!("mapped local apic from {:?} to {:?}", frame, page);
 
     let mut local_apic = LOCAL_APIC.lock();
-    *local_apic = Some(LocalApic::new(remap_addr));
+    let mapped_apic = MappedLocalApic::new(remap_addr);
+    unsafe { mapped_apic.init(); }
+    *local_apic = Some(mapped_apic);
 }
 
 #[cfg(test)]

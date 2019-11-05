@@ -22,11 +22,11 @@ pub enum IoApicReg {
 }
 
 impl IoApicReg {
-    fn as_u8(self) -> u8 {
+    pub fn as_u8(self) -> u8 {
         self as u8
     }
 
-    fn as_u32(self) -> u32 {
+    pub fn as_u32(self) -> u32 {
         self as u32
     }
 }
