@@ -14,7 +14,7 @@ dependencies = [
 name = "apic"
 version = "0.1.0"
 dependencies = [
- "apic_types 0.1.0",
+ "apic_types 0.1.0 (git+https://github.com/cmsd2/apic_types.git)",
  "bitflags 1.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "bootloader 0.8.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "lazy_static 1.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -27,6 +27,7 @@ dependencies = [
 [[package]]
 name = "apic_types"
 version = "0.1.0"
+source = "git+https://github.com/cmsd2/apic_types.git#cecb890b606c8f3642848e069ebe1a45b016e00c"
 dependencies = [
  "bitflags 1.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
@@ -224,6 +225,7 @@ dependencies = [
 
 [metadata]
 "checksum acpi 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)" = "2c18d706bdc322dd4f8f7930a5879ad8df3d78d4452a678d5419c72f9f69acea"
+"checksum apic_types 0.1.0 (git+https://github.com/cmsd2/apic_types.git)" = "<none>"
 "checksum array-init 0.0.4 (registry+https://github.com/rust-lang/crates.io-index)" = "23589ecb866b460d3a0f1278834750268c607e8e28a1b982c907219f3178cd72"
 "checksum bit_field 0.9.0 (registry+https://github.com/rust-lang/crates.io-index)" = "ed8765909f9009617974ab6b7d332625b320b33c326b1e9321382ef1999b5d56"
 "checksum bitflags 1.2.1 (registry+https://github.com/rust-lang/crates.io-index)" = "cf1de2fe8c75bc145a2f577add951f8134889b4795d47466a54a5c846d691693"
