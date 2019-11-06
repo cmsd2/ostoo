@@ -13,6 +13,7 @@ sysroot_path = "target/sysroot"
 [package.metadata.bootimage]
 run-args = [
     "-serial", "stdio",
+    #"-monitor", "stdio"
 ]
 test-args = [
     "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",

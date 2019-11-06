@@ -1,8 +1,11 @@
 use x86_64::VirtAddr;
-use apic_types::io::{IoApic, IoApic32BitRegisterIndex, IoApic64BitRegisterIndex};
+use apic_types::io::{IoApic, IoApicRegister, IoApic32BitRegisterIndex, IoApic64BitRegisterIndex};
+use apic_types::io::{ArbitrationIdRegister, IdRegister, VersionRegister, VersionFlags};
 
 pub struct MappedIoApic {
+    pub id: u8,
     pub base_addr: VirtAddr,
+    pub interrupt_base: u32,
 }
 
 impl MappedIoApic {
@@ -26,17 +29,29 @@ impl MappedIoApic {
         }
     }
     
+    pub fn init(&self) {
+        let id = unsafe { IdRegister.read(self) };
+        let arb = unsafe { ArbitrationIdRegister.read(self) };
+        let ver_reg = unsafe { VersionRegister.read(self) };
+        let ver = ver_reg.version();
+        let max_reds = ver_reg.max_redirect_entry();
+
+        info!("[apic] init io_apic id={:?} arb={:?} ver={:?} max_reds={:?}", id, arb, ver, max_reds);
+    }
 }
 
 impl IoApic for MappedIoApic {
     unsafe fn read_reg_32(&self, index: IoApic32BitRegisterIndex) -> u32 {
         *self.io_reg_sel_mut() = index.as_u32();
-        *self.io_reg_win()
+        let value = *self.io_reg_win();
+        info!("[apic] read sel={:?} win={:?}", index.as_u32(), value);
+        value
     }
 
     unsafe fn write_reg_32(&self, index: IoApic32BitRegisterIndex, value: u32) {
         *self.io_reg_sel_mut() = index.as_u32();
         *self.io_reg_win_mut() = value;
+        info!("[apic] write sel={:?} win={:?}", index.as_u32(), value);
     }
 
     unsafe fn read_reg_64(&self, index: IoApic64BitRegisterIndex) -> u64 {

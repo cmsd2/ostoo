@@ -12,6 +12,7 @@ use libkernel::{println, init, hlt_loop};
 use libkernel::logger;
 use x86_64::VirtAddr;
 use log::{debug, info, warn, error};
+use acpi::interrupt::InterruptModel;
 
 mod kernel_acpi;
 
@@ -56,8 +57,6 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     allocator::init_heap(&mut mapper, &mut frame_allocator)
         .expect("heap initialization failed");
 
-    apic::init(VirtAddr::new(APIC_BASE), &mut mapper, &mut frame_allocator);
-
     let heap_value = Box::new(41);
     println!("heap_value at {:p}", heap_value);
 
@@ -80,6 +79,14 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     };
 
     println!("interrupt model: {:?}", acpi_table.interrupt_model);
+
+    if let Some(InterruptModel::Apic(acpi_apic)) = acpi_table.interrupt_model {
+        info!("[kernel] init configuring apic");
+        apic::init(&acpi_apic, VirtAddr::new(APIC_BASE), &mut mapper, &mut frame_allocator);
+    } else {
+        info!("[kernel] init configuring pic");
+        //...
+    }
 
     #[cfg(test)]
     test_main();
