@@ -52,16 +52,15 @@ impl MappedLocalApic {
     pub unsafe fn init(&self) {
         info!("[apic] init phys_addr={:?} enabled={}", Self::get_base_phys_addr(), self.is_global_enabled());
 
-        if cpuid::is_p4_or_xeon_or_later().expect("cpuid") {
-            let id = Id8BitRegister.read(self);
-            info!("[apic] init id8bit={:?}", id);
+        let id = if cpuid::is_p4_or_xeon_or_later().expect("cpuid") {
+            Id8BitRegister.read(self)
         } else {
-            let id = Id4BitRegister.read(self);
-            info!("[apic] init id4bit={:?}", id);
-        }
+            Id4BitRegister.read(self)
+        };
 
         let version = VersionRegister.read(self);
-        info!("[apic] init version={:?}", version);
+
+        info!("[apic] init id={:?} version={:?}", id, version);
 
         let icr = InterruptCommandRegister.read(self);
         let ldr = LogicalDestinationRegister.read(self);
