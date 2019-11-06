@@ -16,6 +16,7 @@ use core::panic::PanicInfo;
 
 pub mod ioapic;
 pub mod local_apic;
+pub mod io_apic;
 
 use spin::Mutex;
 use lazy_static::lazy_static;
