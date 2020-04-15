@@ -5,6 +5,7 @@
 #![reexport_test_harness_main = "test_main"]
 #![feature(abi_x86_interrupt)]
 #![feature(alloc_error_handler)]
+#![feature(wake_trait)]
 
 extern crate alloc;
 
@@ -31,6 +32,7 @@ pub mod memory;
 pub mod allocator;
 pub mod logger;
 pub mod cpuid;
+pub mod task;
 
 pub fn init() {
     cpuid::init();

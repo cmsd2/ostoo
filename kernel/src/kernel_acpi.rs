@@ -1,7 +1,7 @@
 use core::ptr::NonNull;
 use libkernel::memory::{VmemAllocator, DumbVmemAllocator};
 use x86_64::{PhysAddr, VirtAddr, align_up};
-use x86_64::structures::paging::{Page, PageSize, PageTableFlags, PhysFrame, FrameAllocator, Size4KiB, Mapper};
+use x86_64::structures::paging::{Page, PageSize, PageTableFlags, PhysFrame, UnusedPhysFrame, FrameAllocator, Size4KiB, Mapper};
 use acpi::handler::{PhysicalMapping, AcpiHandler};
 use acpi::{Acpi, AcpiError};
 
@@ -33,7 +33,8 @@ impl <'a, F, M> AcpiHandler for AcpiMapper<'a, F, M> where F: FrameAllocator<Siz
 
         for (frame, page) in frame_range.zip(page_range) {
             unsafe {
-                self.page_table.map_to(page, frame, flags, self.frame_allocator)
+                let unused_frame = UnusedPhysFrame::new(frame);
+                self.page_table.map_to(page, unused_frame, flags, self.frame_allocator)
                     .expect("map_to")
                     .flush();
             }

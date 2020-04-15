@@ -4,6 +4,7 @@ use x86_64::structures::paging::{
     PageTable,
     PageTableFlags,
     PhysFrame,
+    UnusedPhysFrame,
     Mapper,
     Size4KiB,
     FrameAllocator,
@@ -56,9 +57,11 @@ pub fn map_page(
     flags: PageTableFlags,
 ) -> VirtAddr {
     let frame = PhysFrame::containing_address(addr);
+    // TODO: is this ok?
+    let unused_frame = unsafe { UnusedPhysFrame::new(frame) };
 
     let map_to_result = unsafe {
-        mapper.map_to(page, frame, flags, frame_allocator)
+        mapper.map_to(page, unused_frame, flags, frame_allocator)
     };
     map_to_result.expect("map_to failed").flush();
 
