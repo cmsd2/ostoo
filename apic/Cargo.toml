@@ -16,11 +16,11 @@ test-timeout = 30
 [dependencies]
 libkernel = { path = "../libkernel" }
 apic_types = { git = "https://github.com/cmsd2/apic_types.git" }
-bootloader = { version = "0.8.2", features = ["map_physical_memory"] }
+bootloader = { version = "0.9.34", features = ["map_physical_memory"] }
 raw-cpuid = "7.0.3"
-spin = "0.5.2"
+spin = { version = "0.9", features = ["mutex"] }
 lazy_static = "1.4.0"
-x86_64 = "0.7.5"
+x86_64 = "0.15"
 bitflags = "1.2.1"
 log = "0.4.8"
-acpi = "0.4.0"
+acpi = "6.1.1"

@@ -5,8 +5,8 @@ use x86_64::structures::idt::{
     InterruptStackFrame,
     PageFaultErrorCode,
 };
-use pic8259_simple::ChainedPics;
-use crate::{gdt, print, println};
+use pic8259::ChainedPics;
+use crate::{gdt, println};
 
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -40,9 +40,9 @@ lazy_static! {
             idt.double_fault.set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
-        idt[InterruptIndex::Timer.as_usize()]
+        idt[InterruptIndex::Timer.as_u8()]
             .set_handler_fn(timer_interrupt_handler);
-        idt[InterruptIndex::Keyboard.as_usize()]
+        idt[InterruptIndex::Keyboard.as_u8()]
             .set_handler_fn(keyboard_interrupt_handler);
         idt
     };
@@ -67,19 +67,19 @@ fn init_pics() {
 }
 
 extern "x86-interrupt" fn breakpoint_handler(
-    stack_frame: &mut InterruptStackFrame)
+    stack_frame: InterruptStackFrame)
 {
     println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
 
 extern "x86-interrupt" fn double_fault_handler(
-    stack_frame: &mut InterruptStackFrame, _error_code: u64) -> !
+    stack_frame: InterruptStackFrame, _error_code: u64) -> !
 {
     panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
 }
 
 extern "x86-interrupt" fn page_fault_handler(
-    stack_frame: &mut InterruptStackFrame,
+    stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
     use x86_64::registers::control::Cr2;
@@ -88,7 +88,7 @@ extern "x86-interrupt" fn page_fault_handler(
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(
-    _stack_frame: &mut InterruptStackFrame)
+    _stack_frame: InterruptStackFrame)
 {
     // TODO: do stuff
 
@@ -99,7 +99,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(
-    _stack_frame: &mut InterruptStackFrame)
+    _stack_frame: InterruptStackFrame)
 {
     // use x86_64::instructions::port::Port;
     // use pc_keyboard::{Keyboard, ScancodeSet1, DecodedKey, HandleControl, layouts};

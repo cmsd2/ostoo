@@ -57,7 +57,7 @@ impl Executor {
     }
 
     fn wake_tasks(&mut self) {
-        while let Ok(task_id) = self.wake_queue.pop() {
+        while let Some(task_id) = self.wake_queue.pop() {
             if let Some(task) = self.waiting_tasks.remove(&task_id) {
                 self.task_queue.push_back(task);
             }
@@ -73,7 +73,7 @@ impl Executor {
     }
 
     fn sleep_if_idle(&self) {
-        use x86_64::instructions::interrupts::{self, enable_interrupts_and_hlt};
+        use x86_64::instructions::interrupts;
 
         if !self.wake_queue.is_empty() {
             return;
@@ -81,7 +81,9 @@ impl Executor {
 
         interrupts::disable();
         if self.wake_queue.is_empty() {
-            enable_interrupts_and_hlt();
+            // Atomically re-enable interrupts and halt. The x86 guarantee that sti takes
+            // effect after the following instruction prevents a missed-wakeup race.
+            interrupts::enable_and_hlt();
         } else {
             interrupts::enable();
         }

@@ -21,6 +21,6 @@ Install with `cargo install <crate>`:
 
 ## License
 
-This work is derived from blog_os by Philipp Oppermann.
+This work is derived from blog_os by Philipp Oppermann: https://os.phil-opp.com/
 
 Dual licensed Apache-2 and MIT. The user may use this software according to the terms of either of the two licenses.

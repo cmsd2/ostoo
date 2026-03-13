@@ -5,10 +5,10 @@ build:
 	cargo bootimage --manifest-path kernel/Cargo.toml
 
 run:
-	bootimage run --manifest-path kernel/Cargo.toml
+	cargo bootimage run --manifest-path kernel/Cargo.toml
 
 test:
-	cargo xtest
+	cargo test --manifest-path kernel/Cargo.toml
 
 clean:
 	cargo clean

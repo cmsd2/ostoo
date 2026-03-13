@@ -21,7 +21,7 @@ pub mod local_apic;
 pub mod io_apic;
 
 use alloc::vec::Vec;
-use acpi::interrupt::{Apic as AcpiApic, IoApic as AcpiIoApic};
+use acpi::platform::interrupt::{InterruptModel, IoApic as AcpiIoApic};
 use spin::Mutex;
 use lazy_static::lazy_static;
 use libkernel::{println};
@@ -47,15 +47,15 @@ lazy_static! {
     pub static ref IO_APICS: Mutex<Vec<MappedIoApic>> = Mutex::new(Vec::new());
 }
 
-pub fn init(interrupt_model: &AcpiApic, remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
-    init_local(interrupt_model, remap_addr, mapper, frame_allocator);
-    init_io(interrupt_model, remap_addr + Size4KiB::SIZE, mapper, frame_allocator);
+pub fn init(interrupt_model: &InterruptModel, remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
+    if let InterruptModel::Apic(apic_info) = interrupt_model {
+        init_local(remap_addr, mapper, frame_allocator);
+        init_io(&apic_info.io_apics, remap_addr + Size4KiB::SIZE, mapper, frame_allocator);
+    }
 }
 
-pub fn init_io(interrupt_model: &AcpiApic, mut remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
-    use x86_64::structures::paging::page_table::PageTableFlags as Flags;
-
-    let mapped_io_apics = interrupt_model.io_apics.iter().map(|io_apic| {
+pub fn init_io(io_apics: &[AcpiIoApic], mut remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
+    let mapped_io_apics = io_apics.iter().map(|io_apic| {
         let mapped_io_apic = init_io_apic(io_apic, remap_addr, mapper, frame_allocator);
 
         remap_addr = remap_addr + Size4KiB::SIZE;
@@ -63,8 +63,8 @@ pub fn init_io(interrupt_model: &AcpiApic, mut remap_addr: VirtAddr, mapper: &mu
         mapped_io_apic
     }).collect();
 
-    let mut io_apics = IO_APICS.lock();
-    *io_apics = mapped_io_apics;
+    let mut io_apics_guard = IO_APICS.lock();
+    *io_apics_guard = mapped_io_apics;
 }
 
 fn init_io_apic(io_apic: &AcpiIoApic, remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> MappedIoApic {
@@ -83,7 +83,7 @@ fn init_io_apic(io_apic: &AcpiIoApic, remap_addr: VirtAddr, mapper: &mut impl Ma
     mapped_io_apic
 }
 
-pub fn init_local(interrupt_model: &AcpiApic, remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
+pub fn init_local(remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
     let phys_addr = unsafe {
         MappedLocalApic::get_base_phys_addr()
     };

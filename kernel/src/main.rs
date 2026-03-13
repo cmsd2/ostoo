@@ -15,7 +15,7 @@ use libkernel::task::executor::Executor;
 use libkernel::task::keyboard;
 use x86_64::VirtAddr;
 use log::{debug, info, warn, error};
-use acpi::interrupt::InterruptModel;
+use acpi::platform::interrupt::InterruptModel;
 
 mod kernel_acpi;
 
@@ -77,13 +77,13 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     core::mem::drop(reference_counted);
     println!("reference count is {} now", Rc::strong_count(&cloned_reference));
 
-    let acpi_table = unsafe {
-        kernel_acpi::read_acpi(&mut mapper, &mut frame_allocator).expect("acpi")
+    let interrupt_model = unsafe {
+        kernel_acpi::read_acpi(phys_mem_offset).expect("acpi")
     };
 
-    println!("interrupt model: {:?}", acpi_table.interrupt_model);
+    println!("interrupt model: {:?}", interrupt_model);
 
-    if let Some(InterruptModel::Apic(acpi_apic)) = acpi_table.interrupt_model {
+    if let InterruptModel::Apic(_) = interrupt_model {
         info!("[kernel] init configuring apic");
         //apic::init(&acpi_apic, VirtAddr::new(APIC_BASE), &mut mapper, &mut frame_allocator);
     } else {

@@ -1,76 +1,146 @@
 use core::ptr::NonNull;
-use libkernel::memory::{VmemAllocator, DumbVmemAllocator};
-use x86_64::{PhysAddr, VirtAddr, align_up};
-use x86_64::structures::paging::{Page, PageSize, PageTableFlags, PhysFrame, UnusedPhysFrame, FrameAllocator, Size4KiB, Mapper};
-use acpi::handler::{PhysicalMapping, AcpiHandler};
-use acpi::{Acpi, AcpiError};
+use x86_64::VirtAddr;
+use acpi::{AcpiError, AcpiTables, Handle, PhysicalMapping};
+use acpi::platform::interrupt::InterruptModel;
+use acpi::rsdp::Rsdp;
 
-pub const ACPI_HEAP_BASE: u64 = 0x_6666_6666_0000;
-pub const ACPI_HEAP_SIZE: u64 = 200 * 4096;
-
-struct AcpiMapper<'a, F, M> where F: FrameAllocator<Size4KiB>, M: Mapper<Size4KiB> {
-    vmem_allocator: DumbVmemAllocator<Size4KiB>,
-    page_table: &'a mut M,
-    frame_allocator: &'a mut F,
+/// ACPI handler backed by the bootloader's complete physical-memory map.
+///
+/// The bootloader (with `map_physical_memory` feature) maps all physical RAM at a
+/// fixed offset: `virt = phys + physical_memory_offset`. No dynamic page mapping is
+/// required. This works for ACPI table parsing because all ACPI tables live in
+/// physical RAM. MMIO regions (APIC registers etc.) are mapped separately by the
+/// apic crate via `mapper.map_to()`.
+#[derive(Clone)]
+pub struct KernelAcpiHandler {
+    physical_memory_offset: u64,
 }
 
-impl <'a, F, M> AcpiHandler for AcpiMapper<'a, F, M> where F: FrameAllocator<Size4KiB>, M: Mapper<Size4KiB> {
-    fn map_physical_region<T>(
-        &mut self, 
-        physical_address: usize, 
-        size: usize
-    ) -> PhysicalMapping<T> {
-        let physical_address = PhysAddr::new(physical_address as u64);
-        let start_frame = PhysFrame::<Size4KiB>::containing_address(physical_address);
-        let end_frame = PhysFrame::<Size4KiB>::containing_address((physical_address + size).align_up(Size4KiB::SIZE));
-        let frame_range = PhysFrame::<Size4KiB>::range(start_frame, end_frame);
+impl KernelAcpiHandler {
+    fn phys_to_virt(&self, phys: usize) -> usize {
+        phys + self.physical_memory_offset as usize
+    }
+}
 
-        let layout_size = align_up(size as u64, Size4KiB::SIZE);
-        let (start_page, end_page) = self.vmem_allocator.alloc(layout_size / Size4KiB::SIZE);
-        let page_range = Page::<Size4KiB>::range_inclusive(start_page, end_page);
-
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-
-        for (frame, page) in frame_range.zip(page_range) {
-            unsafe {
-                let unused_frame = UnusedPhysFrame::new(frame);
-                self.page_table.map_to(page, unused_frame, flags, self.frame_allocator)
-                    .expect("map_to")
-                    .flush();
-            }
-        }
-
-        let page_offset = physical_address - start_frame.start_address();
-
+impl acpi::Handler for KernelAcpiHandler {
+    unsafe fn map_physical_region<T>(&self, physical_address: usize, size: usize) -> PhysicalMapping<Self, T> {
+        let virt = self.phys_to_virt(physical_address);
         PhysicalMapping {
-            physical_start: start_frame.start_address().as_u64() as usize,
-            virtual_start: NonNull::new((start_page.start_address() + page_offset).as_mut_ptr()).unwrap(),
+            physical_start: physical_address,
+            virtual_start: NonNull::new_unchecked(virt as *mut T),
             region_length: size,
-            mapped_length: layout_size as usize,
+            mapped_length: size,
+            handler: self.clone(),
         }
     }
 
-    fn unmap_physical_region<T>(&mut self, region: PhysicalMapping<T>) {
-        let start_page = Page::containing_address(VirtAddr::new(region.virtual_start.as_ptr() as usize as u64));
-        let end_page = start_page + region.mapped_length as u64 / Size4KiB::SIZE;
-        let page_range = Page::<Size4KiB>::range(start_page, end_page);
+    fn unmap_physical_region<T>(_region: &PhysicalMapping<Self, T>) {
+        // Nothing to do: physical memory is permanently mapped by the bootloader.
+    }
 
-        for page in page_range {
-            let (_frame, flush) = self.page_table.unmap(page).expect("unmap");
-            // could free frame except dumb vmem allocator does nothing
-            flush.flush();
+    fn read_u8(&self, address: usize) -> u8 {
+        unsafe { *(self.phys_to_virt(address) as *const u8) }
+    }
+    fn read_u16(&self, address: usize) -> u16 {
+        unsafe { *(self.phys_to_virt(address) as *const u16) }
+    }
+    fn read_u32(&self, address: usize) -> u32 {
+        unsafe { *(self.phys_to_virt(address) as *const u32) }
+    }
+    fn read_u64(&self, address: usize) -> u64 {
+        unsafe { *(self.phys_to_virt(address) as *const u64) }
+    }
+
+    fn write_u8(&self, address: usize, value: u8) {
+        unsafe { *(self.phys_to_virt(address) as *mut u8) = value }
+    }
+    fn write_u16(&self, address: usize, value: u16) {
+        unsafe { *(self.phys_to_virt(address) as *mut u16) = value }
+    }
+    fn write_u32(&self, address: usize, value: u32) {
+        unsafe { *(self.phys_to_virt(address) as *mut u32) = value }
+    }
+    fn write_u64(&self, address: usize, value: u64) {
+        unsafe { *(self.phys_to_virt(address) as *mut u64) = value }
+    }
+
+    fn read_io_u8(&self, port: u16) -> u8 {
+        unsafe { x86_64::instructions::port::PortReadOnly::new(port).read() }
+    }
+    fn read_io_u16(&self, port: u16) -> u16 {
+        unsafe { x86_64::instructions::port::PortReadOnly::new(port).read() }
+    }
+    fn read_io_u32(&self, port: u16) -> u32 {
+        unsafe { x86_64::instructions::port::PortReadOnly::new(port).read() }
+    }
+
+    fn write_io_u8(&self, port: u16, value: u8) {
+        unsafe { x86_64::instructions::port::PortWriteOnly::new(port).write(value) }
+    }
+    fn write_io_u16(&self, port: u16, value: u16) {
+        unsafe { x86_64::instructions::port::PortWriteOnly::new(port).write(value) }
+    }
+    fn write_io_u32(&self, port: u16, value: u32) {
+        unsafe { x86_64::instructions::port::PortWriteOnly::new(port).write(value) }
+    }
+
+    fn read_pci_u8(&self, _address: acpi::PciAddress, _offset: u16) -> u8 {
+        unimplemented!("PCI config space access not implemented")
+    }
+    fn read_pci_u16(&self, _address: acpi::PciAddress, _offset: u16) -> u16 {
+        unimplemented!("PCI config space access not implemented")
+    }
+    fn read_pci_u32(&self, _address: acpi::PciAddress, _offset: u16) -> u32 {
+        unimplemented!("PCI config space access not implemented")
+    }
+    fn write_pci_u8(&self, _address: acpi::PciAddress, _offset: u16, _value: u8) {
+        unimplemented!("PCI config space access not implemented")
+    }
+    fn write_pci_u16(&self, _address: acpi::PciAddress, _offset: u16, _value: u16) {
+        unimplemented!("PCI config space access not implemented")
+    }
+    fn write_pci_u32(&self, _address: acpi::PciAddress, _offset: u16, _value: u32) {
+        unimplemented!("PCI config space access not implemented")
+    }
+
+    fn nanos_since_boot(&self) -> u64 {
+        0
+    }
+
+    fn stall(&self, microseconds: u64) {
+        for _ in 0..microseconds * 100 {
+            core::hint::spin_loop();
         }
+    }
+
+    fn sleep(&self, milliseconds: u64) {
+        self.stall(milliseconds * 1000);
+    }
+
+    fn create_mutex(&self) -> Handle {
+        unimplemented!("AML mutex support not implemented")
+    }
+
+    fn acquire(&self, _mutex: Handle, _timeout: u16) -> Result<(), acpi::aml::AmlError> {
+        unimplemented!("AML mutex support not implemented")
+    }
+
+    fn release(&self, _mutex: Handle) {
+        unimplemented!("AML mutex support not implemented")
     }
 }
 
-pub unsafe fn read_acpi<'a, F, M>(mapper: &mut M, frame_allocator: &mut F) -> Result<Acpi, AcpiError> 
-        where F: FrameAllocator<Size4KiB>, M: Mapper<Size4KiB> {
-    // TODO: get acpi table addresses from bootloader
-    let mut mapper = AcpiMapper {
-        vmem_allocator: DumbVmemAllocator::new(VirtAddr::new(ACPI_HEAP_BASE), ACPI_HEAP_SIZE),
-        page_table: mapper,
-        frame_allocator: frame_allocator,
+pub unsafe fn read_acpi(physical_memory_offset: VirtAddr) -> Result<InterruptModel, AcpiError> {
+    let handler = KernelAcpiHandler {
+        physical_memory_offset: physical_memory_offset.as_u64(),
     };
 
-    acpi::search_for_rsdp_bios(&mut mapper)
+    let rsdp_mapping = Rsdp::search_for_on_bios(handler.clone())?;
+    let rsdp_phys_addr = rsdp_mapping.physical_start;
+    drop(rsdp_mapping);
+
+    let tables = AcpiTables::from_rsdp(handler, rsdp_phys_addr)?;
+    let (interrupt_model, _processor_info) = InterruptModel::new(&tables)?;
+
+    Ok(interrupt_model)
 }
