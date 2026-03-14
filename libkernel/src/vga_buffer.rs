@@ -22,6 +22,12 @@ macro_rules! println {
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
 }
 
+/// Write a formatted string to row 0 (the fixed status bar).
+#[macro_export]
+macro_rules! status_bar {
+    ($($arg:tt)*) => ($crate::vga_buffer::print_status_bar(format_args!($($arg)*)));
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
@@ -116,7 +122,8 @@ impl Writer {
     }
 
     fn new_line(&mut self) {
-        for row in 1..BUFFER_HEIGHT {
+        // Rows 0 (status bar) and 1 (timeline) are fixed; scroll only rows 2..24.
+        for row in 3..BUFFER_HEIGHT {
             for col in 0..BUFFER_WIDTH {
                 let character = self.buffer.chars[row][col].read();
                 self.buffer.chars[row - 1][col].write(character);
@@ -124,6 +131,17 @@ impl Writer {
         }
         self.clear_row(BUFFER_HEIGHT - 1);
         self.column_position = 0;
+    }
+
+    /// Overwrite row 0 (status bar) with `data`, rendered white-on-blue.
+    fn write_status_row(&mut self, data: &[u8; BUFFER_WIDTH]) {
+        let color = ColorCode::new(Color::White, Color::Blue);
+        for col in 0..BUFFER_WIDTH {
+            self.buffer.chars[0][col].write(ScreenChar {
+                ascii_character: data[col],
+                color_code: color,
+            });
+        }
     }
 
     fn clear_row(&mut self, row: usize) {
@@ -141,6 +159,87 @@ impl fmt::Write for Writer {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.write_string(s);
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Status bar and timeline strip
+
+/// A fixed-width byte buffer that implements `fmt::Write` without allocating.
+struct FixedBuf {
+    data: [u8; BUFFER_WIDTH],
+    len: usize,
+}
+
+impl FixedBuf {
+    fn new() -> Self {
+        FixedBuf { data: [b' '; BUFFER_WIDTH], len: 0 }
+    }
+}
+
+impl fmt::Write for FixedBuf {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for b in s.bytes() {
+            if self.len >= BUFFER_WIDTH { break; }
+            self.data[self.len] = if (0x20..=0x7e).contains(&b) { b } else { b'?' };
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Initialise rows 0 and 1: blue status bar and dark-grey timeline placeholder.
+/// Call once before the first `println!` so the reserved rows look intentional.
+pub fn init_display() {
+    let mut w = WRITER.lock();
+    let bar_color = ColorCode::new(Color::White, Color::Blue);
+    for col in 0..BUFFER_WIDTH {
+        w.buffer.chars[0][col].write(ScreenChar { ascii_character: b' ', color_code: bar_color });
+    }
+    let tl_color = ColorCode::new(Color::DarkGray, Color::Black);
+    for col in 0..BUFFER_WIDTH {
+        w.buffer.chars[1][col].write(ScreenChar { ascii_character: b' ', color_code: tl_color });
+    }
+}
+
+/// Write a formatted message to the fixed status bar at row 0 (white-on-blue).
+/// Safe to call from any kernel thread (acquires `WRITER` lock).
+#[doc(hidden)]
+pub fn print_status_bar(args: fmt::Arguments) {
+    use core::fmt::Write;
+    let mut buf = FixedBuf::new();
+    let _ = buf.write_fmt(args);
+    WRITER.lock().write_status_row(&buf.data);
+}
+
+/// Append a coloured block to the timeline strip at row 1, shifting old blocks
+/// left.  Each call represents one context switch; colours cycle per thread.
+///
+/// # ISR Safety
+/// Writes directly to VGA memory without acquiring any lock, so it is safe to
+/// call from interrupt context (interrupts are already disabled by the CPU on
+/// IDT dispatch).
+pub fn timeline_append(thread_idx: usize) {
+    const THREAD_BG: [Color; 6] = [
+        Color::LightGreen, Color::LightCyan, Color::LightRed,
+        Color::Pink,       Color::Yellow,    Color::LightGray,
+    ];
+    let bg = THREAD_BG[thread_idx % THREAD_BG.len()];
+    let color_byte = ColorCode::new(Color::Black, bg).0;
+
+    // VGA RAM: each cell is a u16 (low byte = character, high byte = colour).
+    // Row 1 starts at offset BUFFER_WIDTH from the base address.
+    let vga = 0xb8000 as *mut u16;
+    let row1 = BUFFER_WIDTH; // offset in u16 units
+    unsafe {
+        // Shift the 80-column row left by one position.
+        for col in 0..BUFFER_WIDTH - 1 {
+            let val = core::ptr::read_volatile(vga.add(row1 + col + 1));
+            core::ptr::write_volatile(vga.add(row1 + col), val);
+        }
+        // Append a space at the rightmost column; the background colour fills the cell.
+        let entry: u16 = (color_byte as u16) << 8 | b' ' as u16;
+        core::ptr::write_volatile(vga.add(row1 + BUFFER_WIDTH - 1), entry);
     }
 }
 

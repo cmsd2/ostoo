@@ -1,11 +1,24 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
 pub const QUANTUM_TICKS: u32 = 10; // 10 ms at 1000 Hz
 
 static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Total number of context switches since boot.
+pub static CONTEXT_SWITCHES: AtomicU64 = AtomicU64::new(0);
+/// Index of the currently running thread (into the `threads` Vec).
+static CURRENT_THREAD_IDX_ATOMIC: AtomicUsize = AtomicUsize::new(0);
+
+pub fn context_switches() -> u64 {
+    CONTEXT_SWITCHES.load(Ordering::Relaxed)
+}
+
+pub fn current_thread_idx() -> usize {
+    CURRENT_THREAD_IDX_ATOMIC.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ThreadId(u64);
@@ -204,5 +217,12 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
     sched.threads[next_idx].state = ThreadState::Running;
     sched.threads[next_idx].ticks_remaining = QUANTUM_TICKS;
 
-    sched.threads[next_idx].saved_rsp
+    let next_rsp = sched.threads[next_idx].saved_rsp;
+    drop(sched); // release before VGA write (no lock needed, but be explicit)
+
+    CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
+    CURRENT_THREAD_IDX_ATOMIC.store(next_idx, Ordering::Relaxed);
+    crate::vga_buffer::timeline_append(next_idx);
+
+    next_rsp
 }

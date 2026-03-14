@@ -43,6 +43,12 @@ pub fn spawn(task: Task) {
     TASK_QUEUE.lock().push_back(task);
 }
 
+/// Number of tasks currently ready to poll.
+pub fn ready_count() -> usize { TASK_QUEUE.lock().len() }
+
+/// Number of tasks currently waiting for a waker.
+pub fn wait_count() -> usize { WAIT_MAP.lock().len() }
+
 /// Run the async executor loop.  Never returns.
 ///
 /// Multiple kernel threads may call this concurrently; they will all compete

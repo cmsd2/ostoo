@@ -44,6 +44,8 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     use libkernel::allocator;
     use alloc::{boxed::Box, vec, vec::Vec, rc::Rc};
 
+    libkernel::vga_buffer::init_display();
+
     logger::init().expect("logger");
     debug!("debug");
     info!("info");
@@ -100,6 +102,7 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     executor::spawn(Task::new(example_task()));
     executor::spawn(Task::new(keyboard::print_keypresses()));
     executor::spawn(Task::new(timer_task()));
+    executor::spawn(Task::new(status_task()));
 
     // Register the current context as thread 0 of the preemptive scheduler.
     scheduler::init();
@@ -126,5 +129,19 @@ async fn timer_task() {
     loop {
         Delay::from_secs(1).await;
         info!("[timer] tick: {}s elapsed", ticks() / libkernel::task::timer::TICKS_PER_SECOND);
+    }
+}
+
+async fn status_task() {
+    loop {
+        Delay::from_millis(250).await;
+        let ctx = scheduler::context_switches();
+        let rdy = executor::ready_count();
+        let wait = executor::wait_count();
+        let secs = ticks() / libkernel::task::timer::TICKS_PER_SECOND;
+        libkernel::status_bar!(
+            " T{} | ctx:{:6} | rdy:{} wait:{} | up:{:6}s",
+            scheduler::current_thread_idx(), ctx, rdy, wait, secs
+        );
     }
 }
