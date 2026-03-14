@@ -49,6 +49,27 @@ impl MappedLocalApic {
         Self::write_base_msr(flags.bits());
     }
 
+    pub unsafe fn id(&self) -> u8 {
+        let apic_id = if cpuid::is_p4_or_xeon_or_later().expect("cpuid") {
+            Id8BitRegister.read(self)
+        } else {
+            Id4BitRegister.read(self)
+        };
+        match apic_id {
+            ApicId::Id8Bit(id) | ApicId::Id4Bit(id) => id as u8,
+        }
+    }
+
+    pub unsafe fn enable(&self) {
+        let mut sivr = SpuriousInterruptVectorRegister.read(self);
+        sivr.insert(SivrFlags::APIC_ENABLE | SivrFlags::VECTOR);
+        SpuriousInterruptVectorRegister.write(self, sivr);
+    }
+
+    pub unsafe fn eoi(&self) {
+        self.write_reg_32(LocalApicRegisterIndex::EndOfInterrupt, 0);
+    }
+
     pub unsafe fn init(&self) {
         info!("[apic] init phys_addr={:?} enabled={}", Self::get_base_phys_addr(), self.is_global_enabled());
 

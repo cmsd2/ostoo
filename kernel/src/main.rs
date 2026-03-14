@@ -13,6 +13,7 @@ use libkernel::logger;
 use libkernel::task::Task;
 use libkernel::task::executor::Executor;
 use libkernel::task::keyboard;
+use libkernel::task::timer::{Delay, ticks};
 use x86_64::VirtAddr;
 use log::{debug, info, warn, error};
 use acpi::platform::interrupt::InterruptModel;
@@ -85,10 +86,10 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
 
     if let InterruptModel::Apic(_) = interrupt_model {
         info!("[kernel] init configuring apic");
-        //apic::init(&acpi_apic, VirtAddr::new(APIC_BASE), &mut mapper, &mut frame_allocator);
+        apic::init(&interrupt_model, VirtAddr::new(APIC_BASE), &mut mapper, &mut frame_allocator);
+        libkernel::interrupts::disable_pic();
     } else {
         info!("[kernel] init configuring pic");
-        //...
     }
 
     #[cfg(test)]
@@ -97,6 +98,7 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     let mut executor = Executor::new();
     executor.spawn(Task::new(example_task()));
     executor.spawn(Task::new(keyboard::print_keypresses()));
+    executor.spawn(Task::new(timer_task()));
     executor.run(); // doesn't return
 }
 
@@ -107,4 +109,11 @@ async fn async_number() -> u32 {
 async fn example_task() {
     let number = async_number().await;
     println!("async number: {}", number);
+}
+
+async fn timer_task() {
+    loop {
+        Delay::from_secs(1).await;
+        info!("[timer] tick: {}s elapsed", ticks() / libkernel::task::timer::TICKS_PER_SECOND);
+    }
 }

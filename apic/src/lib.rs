@@ -21,10 +21,10 @@ pub mod local_apic;
 pub mod io_apic;
 
 use alloc::vec::Vec;
-use acpi::platform::interrupt::{InterruptModel, IoApic as AcpiIoApic};
+use acpi::platform::interrupt::{InterruptModel, IoApic as AcpiIoApic, InterruptSourceOverride, Polarity, TriggerMode};
 use spin::Mutex;
 use lazy_static::lazy_static;
-use libkernel::{println};
+use libkernel;
 use x86_64::{PhysAddr, VirtAddr};
 use x86_64::structures::paging::{
     Page,
@@ -50,21 +50,50 @@ lazy_static! {
 pub fn init(interrupt_model: &InterruptModel, remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
     if let InterruptModel::Apic(apic_info) = interrupt_model {
         init_local(remap_addr, mapper, frame_allocator);
-        init_io(&apic_info.io_apics, remap_addr + Size4KiB::SIZE, mapper, frame_allocator);
+        init_io(&apic_info.io_apics, &apic_info.interrupt_source_overrides, remap_addr + Size4KiB::SIZE, mapper, frame_allocator);
     }
 }
 
-pub fn init_io(io_apics: &[AcpiIoApic], mut remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
-    let mapped_io_apics = io_apics.iter().map(|io_apic| {
+pub fn init_io(io_apics: &[AcpiIoApic], overrides: &[InterruptSourceOverride], mut remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
+    let mapped_io_apics: Vec<MappedIoApic> = io_apics.iter().map(|io_apic| {
         let mapped_io_apic = init_io_apic(io_apic, remap_addr, mapper, frame_allocator);
-
         remap_addr = remap_addr + Size4KiB::SIZE;
-
         mapped_io_apic
     }).collect();
 
+    // Mask all entries before programming
+    for apic in &mapped_io_apics {
+        unsafe { apic.mask_all(); }
+    }
+
+    // Route ISA IRQ 0 (timer) → vector 0x20, IRQ 1 (keyboard) → vector 0x21
+    let lapic_id = unsafe {
+        LOCAL_APIC.lock().as_ref().map(|a| a.id()).unwrap_or(0)
+    };
+    route_isa_irq(&mapped_io_apics, 0, 0x20, lapic_id, overrides);
+    route_isa_irq(&mapped_io_apics, 1, 0x21, lapic_id, overrides);
+
     let mut io_apics_guard = IO_APICS.lock();
     *io_apics_guard = mapped_io_apics;
+}
+
+fn route_isa_irq(io_apics: &[MappedIoApic], isa_irq: u8, vector: u8, lapic_id: u8, overrides: &[InterruptSourceOverride]) {
+    let ovr = overrides.iter().find(|o| o.isa_source == isa_irq);
+    let gsi        = ovr.map_or(isa_irq as u32, |o| o.global_system_interrupt);
+    let active_low = ovr.map_or(false, |o| matches!(o.polarity, Polarity::ActiveLow));
+    let level_trig = ovr.map_or(false, |o| matches!(o.trigger_mode, TriggerMode::Level));
+
+    for apic in io_apics {
+        let max = unsafe { apic.max_redirect_entries() };
+        let end_gsi = apic.interrupt_base + max + 1;
+        if gsi >= apic.interrupt_base && gsi < end_gsi {
+            let offset = gsi - apic.interrupt_base;
+            unsafe { apic.set_irq(offset, vector, lapic_id, active_low, level_trig); }
+            info!("[apic] isa_irq={} gsi={} vector={:#x} lapic={}", isa_irq, gsi, vector, lapic_id);
+            return;
+        }
+    }
+    warn!("[apic] route_isa_irq: no IO APIC found for gsi={}", gsi);
 }
 
 fn init_io_apic(io_apic: &AcpiIoApic, remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> MappedIoApic {
@@ -92,9 +121,16 @@ pub fn init_local(remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, fram
 
     info!("[apic] init mapped local apic from {:?} to {:?}", frame, page);
 
-    let mut local_apic = LOCAL_APIC.lock();
     let mapped_apic = MappedLocalApic::new(remap_addr);
-    unsafe { mapped_apic.init(); }
+    unsafe {
+        mapped_apic.init();
+        mapped_apic.enable();
+    }
+
+    // Register LAPIC EOI virtual address with libkernel (offset 0xB0 = EndOfInterrupt)
+    libkernel::interrupts::set_local_apic_eoi_addr((remap_addr + 0xB0u64).as_u64());
+
+    let mut local_apic = LOCAL_APIC.lock();
     *local_apic = Some(mapped_apic);
 }
 

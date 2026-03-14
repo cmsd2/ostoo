@@ -7,6 +7,7 @@ use alloc::boxed::Box;
 pub mod executor;
 pub mod simple_executor;
 pub mod keyboard;
+pub mod timer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TaskId(u64);

@@ -1,12 +1,40 @@
+use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use spin;
 use x86_64::structures::idt::{
-    InterruptDescriptorTable, 
+    InterruptDescriptorTable,
     InterruptStackFrame,
     PageFaultErrorCode,
 };
 use pic8259::ChainedPics;
-use crate::{gdt, println};
+use crate::{gdt, println, task};
+
+static LAPIC_EOI_ADDR: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_local_apic_eoi_addr(addr: u64) {
+    LAPIC_EOI_ADDR.store(addr, Ordering::Relaxed);
+}
+
+pub fn disable_pic() {
+    unsafe {
+        use x86_64::instructions::port::Port;
+        let mut master: Port<u8> = Port::new(0x21);
+        let mut slave: Port<u8> = Port::new(0xA1);
+        master.write(0xFF);
+        slave.write(0xFF);
+    }
+}
+
+fn send_eoi(pic_vector: u8) {
+    let addr = LAPIC_EOI_ADDR.load(Ordering::Relaxed);
+    unsafe {
+        if addr != 0 {
+            *(addr as *mut u32) = 0;
+        } else {
+            PICS.lock().notify_end_of_interrupt(pic_vector);
+        }
+    }
+}
 
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -44,6 +72,7 @@ lazy_static! {
             .set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()]
             .set_handler_fn(keyboard_interrupt_handler);
+        idt[0xFF_u8].set_handler_fn(spurious_interrupt_handler);
         idt
     };
 }
@@ -58,11 +87,22 @@ fn init_idt() {
 }
 
 fn init_pics() {
-    let mut pics = PICS.lock();
+    unsafe { PICS.lock().initialize(); }
+    configure_pit_100hz();
+}
+
+/// Configure PIT channel 0 to fire at 100 Hz (reload value = 11932).
+/// At 100 ticks/s, 100 ticks = 1 second.
+fn configure_pit_100hz() {
+    use x86_64::instructions::port::Port;
+    // PIT clock = 1,193,182 Hz; reload = 1,193,182 / 100 = 11,932
+    const RELOAD: u16 = 11932;
     unsafe {
-        pics.initialize();
-        // pics.disable();
-        // pics.maskall();
+        let mut cmd: Port<u8> = Port::new(0x43);
+        let mut data: Port<u8> = Port::new(0x40);
+        cmd.write(0x34); // channel 0, lo/hi byte, mode 2 (rate generator), binary
+        data.write((RELOAD & 0xFF) as u8);
+        data.write((RELOAD >> 8) as u8);
     }
 }
 
@@ -90,12 +130,8 @@ extern "x86-interrupt" fn page_fault_handler(
 extern "x86-interrupt" fn timer_interrupt_handler(
     _stack_frame: InterruptStackFrame)
 {
-    // TODO: do stuff
-
-    unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
-    }
+    task::timer::tick();
+    send_eoi(InterruptIndex::Timer.as_u8());
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(
@@ -128,10 +164,13 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(
     let scancode: u8 = unsafe { port.read() };
     crate::task::keyboard::add_scancode(scancode);
 
-    unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
-    }
+    send_eoi(InterruptIndex::Keyboard.as_u8());
+}
+
+extern "x86-interrupt" fn spurious_interrupt_handler(
+    _stack_frame: InterruptStackFrame)
+{
+    // Spurious LAPIC interrupts must not receive an EOI
 }
 
 #[cfg(test)]

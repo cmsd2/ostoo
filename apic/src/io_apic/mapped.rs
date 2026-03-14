@@ -1,6 +1,6 @@
 use x86_64::VirtAddr;
 use apic_types::io::{IoApic, IoApicRegister, IoApic32BitRegisterIndex, IoApic64BitRegisterIndex};
-use apic_types::io::{ArbitrationIdRegister, IdRegister, VersionRegister, VersionFlags};
+use apic_types::io::{ArbitrationIdRegister, IdRegister, VersionRegister};
 
 pub struct MappedIoApic {
     pub id: u8,
@@ -29,6 +29,28 @@ impl MappedIoApic {
         }
     }
     
+    pub unsafe fn max_redirect_entries(&self) -> u32 {
+        VersionRegister.read(self).max_redirect_entry()
+    }
+
+    pub unsafe fn mask_all(&self) {
+        let max = self.max_redirect_entries();
+        for i in 0..=max {
+            let entry = self.read_reg_64(IoApic64BitRegisterIndex::RedirectionEntry(i));
+            self.write_reg_64(IoApic64BitRegisterIndex::RedirectionEntry(i), entry | (1 << 16));
+        }
+    }
+
+    /// Program a redirection entry. `gsi_offset` = gsi - `self.interrupt_base`.
+    pub unsafe fn set_irq(&self, gsi_offset: u32, vector: u8, lapic_id: u8, active_low: bool, level_triggered: bool) {
+        let mut entry: u64 = vector as u64;        // bits 0-7: vector
+        if active_low      { entry |= 1 << 13; }   // bit 13: pin polarity (1=active low)
+        if level_triggered { entry |= 1 << 15; }   // bit 15: trigger mode (1=level)
+        entry |= (lapic_id as u64) << 56;          // bits 56-63: destination LAPIC ID (physical)
+        // bit 16 (mask) = 0 → unmasked
+        self.write_reg_64(IoApic64BitRegisterIndex::RedirectionEntry(gsi_offset), entry);
+    }
+
     pub fn init(&self) {
         let id = unsafe { IdRegister.read(self) };
         let arb = unsafe { ArbitrationIdRegister.read(self) };
