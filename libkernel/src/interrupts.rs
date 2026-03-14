@@ -39,6 +39,8 @@ fn send_eoi(pic_vector: u8) {
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
+pub const LAPIC_TIMER_VECTOR: u8 = 0x30;
+
 pub static PICS: spin::Mutex<ChainedPics> =
     spin::Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
@@ -72,6 +74,7 @@ lazy_static! {
             .set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()]
             .set_handler_fn(keyboard_interrupt_handler);
+        idt[LAPIC_TIMER_VECTOR].set_handler_fn(lapic_timer_interrupt_handler);
         idt[0xFF_u8].set_handler_fn(spurious_interrupt_handler);
         idt
     };
@@ -165,6 +168,13 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(
     crate::task::keyboard::add_scancode(scancode);
 
     send_eoi(InterruptIndex::Keyboard.as_u8());
+}
+
+extern "x86-interrupt" fn lapic_timer_interrupt_handler(
+    _stack_frame: InterruptStackFrame)
+{
+    task::timer::tick();
+    send_eoi(LAPIC_TIMER_VECTOR);
 }
 
 extern "x86-interrupt" fn spurious_interrupt_handler(

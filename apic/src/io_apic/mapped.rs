@@ -41,6 +41,12 @@ impl MappedIoApic {
         }
     }
 
+    /// Mask a single redirection entry. `gsi_offset` = gsi - `self.interrupt_base`.
+    pub unsafe fn mask_entry(&self, gsi_offset: u32) {
+        let entry = self.read_reg_64(IoApic64BitRegisterIndex::RedirectionEntry(gsi_offset));
+        self.write_reg_64(IoApic64BitRegisterIndex::RedirectionEntry(gsi_offset), entry | (1 << 16));
+    }
+
     /// Program a redirection entry. `gsi_offset` = gsi - `self.interrupt_base`.
     pub unsafe fn set_irq(&self, gsi_offset: u32, vector: u8, lapic_id: u8, active_low: bool, level_triggered: bool) {
         let mut entry: u64 = vector as u64;        // bits 0-7: vector

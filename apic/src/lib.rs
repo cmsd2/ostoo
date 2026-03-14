@@ -22,6 +22,7 @@ pub mod io_apic;
 
 use alloc::vec::Vec;
 use acpi::platform::interrupt::{InterruptModel, IoApic as AcpiIoApic, InterruptSourceOverride, Polarity, TriggerMode};
+use core::sync::atomic::{AtomicU32, Ordering};
 use spin::Mutex;
 use lazy_static::lazy_static;
 use libkernel;
@@ -42,6 +43,9 @@ extern crate log;
 lazy_static! {
     pub static ref LOCAL_APIC: Mutex<Option<MappedLocalApic>> = Mutex::new(None);
 }
+
+/// GSI that ISA IRQ 0 (PIT) was routed to, stored during init for later masking.
+static TIMER_GSI: AtomicU32 = AtomicU32::new(u32::MAX);
 
 lazy_static! {
     pub static ref IO_APICS: Mutex<Vec<MappedIoApic>> = Mutex::new(Vec::new());
@@ -90,6 +94,9 @@ fn route_isa_irq(io_apics: &[MappedIoApic], isa_irq: u8, vector: u8, lapic_id: u
             let offset = gsi - apic.interrupt_base;
             unsafe { apic.set_irq(offset, vector, lapic_id, active_low, level_trig); }
             info!("[apic] isa_irq={} gsi={} vector={:#x} lapic={}", isa_irq, gsi, vector, lapic_id);
+            if isa_irq == 0 {
+                TIMER_GSI.store(gsi, Ordering::Relaxed);
+            }
             return;
         }
     }
@@ -132,6 +139,66 @@ pub fn init_local(remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, fram
 
     let mut local_apic = LOCAL_APIC.lock();
     *local_apic = Some(mapped_apic);
+}
+
+const CALIBRATION_PIT_TICKS: u64 = 50;  // 50 × 10ms = 500ms window
+const CALIBRATION_PIT_HZ:    u64 = 100;
+const LAPIC_TARGET_HZ:       u64 = 1000;
+const LAPIC_DIVIDE_BY_16:    u8  = 0x3;
+
+/// Calibrate the LAPIC timer against the PIT and start it in periodic mode at 1000 Hz.
+/// Must be called after `init()` and with interrupts enabled (PIT drives TICK_COUNT during calibration).
+pub fn calibrate_and_start_lapic_timer() {
+    use libkernel::{interrupts::LAPIC_TIMER_VECTOR, task::timer};
+
+    info!("[apic] calibrating LAPIC timer against PIT ({}ms window)...",
+        CALIBRATION_PIT_TICKS * 1000 / CALIBRATION_PIT_HZ);
+
+    // Phase 1: start one-shot countdown. Release lock before entering HLT loop.
+    {
+        let guard = LOCAL_APIC.lock();
+        let apic = guard.as_ref().expect("LOCAL_APIC not initialised");
+        unsafe {
+            apic.start_oneshot_timer(0xFFFF_FFFF, LAPIC_DIVIDE_BY_16, LAPIC_TIMER_VECTOR);
+        }
+    }
+
+    // Phase 2: busy-wait 500ms (PIT drives TICK_COUNT via timer ISR during this window).
+    timer::wait_ticks(CALIBRATION_PIT_TICKS);
+
+    // Phase 3: read elapsed count, compute bus frequency, start periodic.
+    let guard = LOCAL_APIC.lock();
+    let apic = guard.as_ref().unwrap();
+    unsafe {
+        let remaining = apic.read_current_count();
+        let elapsed = 0xFFFF_FFFFu64 - remaining as u64;
+        apic.stop_timer();
+
+        let lapic_bus_freq = elapsed * 16 * CALIBRATION_PIT_HZ / CALIBRATION_PIT_TICKS;
+        let initial_count  = lapic_bus_freq / (16 * LAPIC_TARGET_HZ);
+        assert!(initial_count > 0 && initial_count <= 0xFFFF_FFFF,
+            "LAPIC calibration out of range: {}", initial_count);
+
+        info!("[apic] LAPIC bus {} MHz, timer initial_count={} ({}Hz)",
+            lapic_bus_freq / 1_000_000, initial_count, LAPIC_TARGET_HZ);
+
+        apic.start_periodic_timer(initial_count as u32, LAPIC_DIVIDE_BY_16, LAPIC_TIMER_VECTOR);
+    }
+
+    // Mask the PIT's IO APIC redirection entry so it no longer fires.
+    let timer_gsi = TIMER_GSI.load(Ordering::Relaxed);
+    if timer_gsi != u32::MAX {
+        let io_apics = IO_APICS.lock();
+        for apic in io_apics.iter() {
+            let max = unsafe { apic.max_redirect_entries() };
+            if timer_gsi >= apic.interrupt_base && timer_gsi <= apic.interrupt_base + max {
+                let offset = timer_gsi - apic.interrupt_base;
+                unsafe { apic.mask_entry(offset); }
+                info!("[apic] masked PIT gsi={} in IO APIC", timer_gsi);
+                break;
+            }
+        }
+    }
 }
 
 fn map(remap_addr: VirtAddr, phys_addr: PhysAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> (PhysFrame, Page) {

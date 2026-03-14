@@ -88,6 +88,7 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
         info!("[kernel] init configuring apic");
         apic::init(&interrupt_model, VirtAddr::new(APIC_BASE), &mut mapper, &mut frame_allocator);
         libkernel::interrupts::disable_pic();
+        apic::calibrate_and_start_lapic_timer();
     } else {
         info!("[kernel] init configuring pic");
     }

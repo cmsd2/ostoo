@@ -70,6 +70,34 @@ impl MappedLocalApic {
         self.write_reg_32(LocalApicRegisterIndex::EndOfInterrupt, 0);
     }
 
+    /// Start LAPIC timer in one-shot mode (used for calibration).
+    /// `divide_bits`: bits[3,1:0] of the divide configuration register (e.g. 0x3 = divide-by-16).
+    pub unsafe fn start_oneshot_timer(&self, initial_count: u32, divide_bits: u8, vector: u8) {
+        self.write_reg_32(LocalApicRegisterIndex::TimerDivideConfiguration, divide_bits as u32);
+        // LVT: one-shot = bits[18:17] = 0b00, unmasked (bit 16 = 0)
+        self.write_reg_32(LocalApicRegisterIndex::LvtTimer, vector as u32);
+        self.write_reg_32(LocalApicRegisterIndex::TimerInitialCount, initial_count);
+    }
+
+    /// Start LAPIC timer in periodic mode.
+    pub unsafe fn start_periodic_timer(&self, initial_count: u32, divide_bits: u8, vector: u8) {
+        self.write_reg_32(LocalApicRegisterIndex::TimerDivideConfiguration, divide_bits as u32);
+        // LVT: periodic = bit 17 set, unmasked (bit 16 = 0)
+        self.write_reg_32(LocalApicRegisterIndex::LvtTimer, (vector as u32) | (1 << 17));
+        self.write_reg_32(LocalApicRegisterIndex::TimerInitialCount, initial_count);
+    }
+
+    /// Mask the LAPIC timer (sets bit 16 in LVT Timer).
+    pub unsafe fn stop_timer(&self) {
+        let lvt = self.read_reg_32(LocalApicRegisterIndex::LvtTimer);
+        self.write_reg_32(LocalApicRegisterIndex::LvtTimer, lvt | (1 << 16));
+    }
+
+    /// Read the current countdown value (decrements toward 0; reloads at 0 if periodic).
+    pub unsafe fn read_current_count(&self) -> u32 {
+        self.read_reg_32(LocalApicRegisterIndex::TimerCurrentCount)
+    }
+
     pub unsafe fn init(&self) {
         info!("[apic] init phys_addr={:?} enabled={}", Self::get_base_phys_addr(), self.is_global_enabled());
 
