@@ -16,12 +16,8 @@ use bootloader::{entry_point, BootInfo};
 
 use core::panic::PanicInfo;
 use linked_list_allocator::LockedHeap;
-use allocator::Locked;
-use allocator::bump::BumpAllocator;
-
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
-//static ALLOCATOR: Locked<BumpAllocator> = Locked::new(BumpAllocator::new());
 
 pub mod serial;
 pub mod vga_buffer;
