@@ -142,6 +142,7 @@ dependencies = [
  "acpi",
  "apic",
  "bootloader",
+ "futures-util",
  "lazy_static",
  "libkernel",
  "linked_list_allocator",
