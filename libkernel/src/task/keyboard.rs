@@ -8,6 +8,8 @@ use core::task::{Context, Poll};
 use crate::print;
 use crate::println;
 
+pub use pc_keyboard::DecodedKey as Key;
+
 static SCANCODE_QUEUE: OnceCell<ArrayQueue<u8>> = OnceCell::uninit();
 static WAKER: AtomicWaker = AtomicWaker::new();
 
@@ -41,6 +43,43 @@ impl Stream for ScancodeStream {
                 Poll::Ready(Some(scancode))
             },
             None => Poll::Pending,
+        }
+    }
+}
+
+/// A stream of fully-decoded keys, built on top of `ScancodeStream`.
+/// Handles PS/2 scancode decoding internally; callers receive `Key` values.
+pub struct KeyStream {
+    scancodes: ScancodeStream,
+    keyboard: Keyboard<layouts::Us104Key, ScancodeSet1>,
+}
+
+impl KeyStream {
+    pub fn new() -> Self {
+        KeyStream {
+            scancodes: ScancodeStream::new(),
+            keyboard: Keyboard::new(layouts::Us104Key, ScancodeSet1, HandleControl::Ignore),
+        }
+    }
+}
+
+impl Stream for KeyStream {
+    type Item = Key;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Key>> {
+        let this = self.get_mut();
+        loop {
+            match Pin::new(&mut this.scancodes).poll_next(cx) {
+                Poll::Ready(Some(scancode)) => {
+                    if let Ok(Some(event)) = this.keyboard.add_byte(scancode) {
+                        if let Some(key) = this.keyboard.process_keyevent(event) {
+                            return Poll::Ready(Some(key));
+                        }
+                    }
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }

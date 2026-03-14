@@ -13,13 +13,13 @@ use libkernel::logger;
 use libkernel::task::Task;
 use libkernel::task::executor;
 use libkernel::task::scheduler;
-use libkernel::task::keyboard;
 use libkernel::task::timer::{Delay, ticks};
 use x86_64::VirtAddr;
 use log::{debug, info, warn, error};
 use acpi::platform::interrupt::InterruptModel;
 
 mod kernel_acpi;
+mod shell;
 
 pub const APIC_BASE: u64 = 0x_5555_5555_0000;
 
@@ -100,7 +100,7 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     test_main();
 
     executor::spawn(Task::new(example_task()));
-    executor::spawn(Task::new(keyboard::print_keypresses()));
+    executor::spawn(Task::new(shell::run()));
     executor::spawn(Task::new(timer_task()));
     executor::spawn(Task::new(status_task()));
 

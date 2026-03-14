@@ -133,6 +133,19 @@ impl Writer {
         self.column_position = 0;
     }
 
+    /// Erase the last character on the current line (if any).
+    fn do_backspace(&mut self) {
+        if self.column_position > 0 {
+            self.column_position -= 1;
+            let row = BUFFER_HEIGHT - 1;
+            let col = self.column_position;
+            self.buffer.chars[row][col].write(ScreenChar {
+                ascii_character: b' ',
+                color_code: self.color_code,
+            });
+        }
+    }
+
     /// Overwrite row 0 (status bar) with `data`, rendered white-on-blue.
     fn write_status_row(&mut self, data: &[u8; BUFFER_WIDTH]) {
         let color = ColorCode::new(Color::White, Color::Blue);
@@ -186,6 +199,21 @@ impl fmt::Write for FixedBuf {
         }
         Ok(())
     }
+}
+
+/// Erase the last typed character on the current line.
+/// No-op if the cursor is already at column 0.
+pub fn backspace() {
+    WRITER.lock().do_backspace();
+}
+
+/// Clear all content rows (2–24), reset cursor to column 0.
+pub fn clear_content() {
+    let mut w = WRITER.lock();
+    for row in 2..BUFFER_HEIGHT {
+        w.clear_row(row);
+    }
+    w.column_position = 0;
 }
 
 /// Initialise rows 0 and 1: blue status bar and dark-grey timeline placeholder.
