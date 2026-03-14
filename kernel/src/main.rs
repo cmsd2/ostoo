@@ -11,7 +11,8 @@ use bootloader::{BootInfo, entry_point};
 use libkernel::{println, init, hlt_loop};
 use libkernel::logger;
 use libkernel::task::Task;
-use libkernel::task::executor::Executor;
+use libkernel::task::executor;
+use libkernel::task::scheduler;
 use libkernel::task::keyboard;
 use libkernel::task::timer::{Delay, ticks};
 use x86_64::VirtAddr;
@@ -96,11 +97,20 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     #[cfg(test)]
     test_main();
 
-    let mut executor = Executor::new();
-    executor.spawn(Task::new(example_task()));
-    executor.spawn(Task::new(keyboard::print_keypresses()));
-    executor.spawn(Task::new(timer_task()));
-    executor.run(); // doesn't return
+    executor::spawn(Task::new(example_task()));
+    executor::spawn(Task::new(keyboard::print_keypresses()));
+    executor::spawn(Task::new(timer_task()));
+
+    // Register the current context as thread 0 of the preemptive scheduler.
+    scheduler::init();
+
+    // Spawn thread 1 — also runs the executor, demonstrating multi-threaded
+    // task dispatch.  Both threads compete for tasks from the shared queue.
+    scheduler::spawn_thread(|| executor::run_worker());
+
+    // Thread 0 enters the executor loop.  The LAPIC timer will preempt it
+    // every 10 ms regardless of what the running async task is doing.
+    executor::run_worker();
 }
 
 async fn async_number() -> u32 {

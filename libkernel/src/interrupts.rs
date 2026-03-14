@@ -25,6 +25,12 @@ pub fn disable_pic() {
     }
 }
 
+/// Send an EOI for the LAPIC timer vector.  Called from `preempt_tick` in the
+/// scheduler, which runs inside the timer ISR with interrupts already disabled.
+pub(crate) fn lapic_eoi() {
+    send_eoi(LAPIC_TIMER_VECTOR);
+}
+
 fn send_eoi(pic_vector: u8) {
     let addr = LAPIC_EOI_ADDR.load(Ordering::Relaxed);
     unsafe {
@@ -61,6 +67,13 @@ impl InterruptIndex {
     }
 }
 
+extern "C" {
+    /// Assembly context-switch stub defined in `task/scheduler.rs` via
+    /// `global_asm!`.  Registered directly in the IDT so the CPU jumps
+    /// straight to it without the `extern "x86-interrupt"` wrapper overhead.
+    fn lapic_timer_stub();
+}
+
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
         let mut idt = InterruptDescriptorTable::new();
@@ -69,12 +82,15 @@ lazy_static! {
         unsafe {
             idt.double_fault.set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+            // Register the raw assembly stub directly so it can manipulate
+            // RSP for context switching before/after iretq.
+            idt[LAPIC_TIMER_VECTOR]
+                .set_handler_addr(x86_64::VirtAddr::new(lapic_timer_stub as *const () as usize as u64));
         }
         idt[InterruptIndex::Timer.as_u8()]
             .set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()]
             .set_handler_fn(keyboard_interrupt_handler);
-        idt[LAPIC_TIMER_VECTOR].set_handler_fn(lapic_timer_interrupt_handler);
         idt[0xFF_u8].set_handler_fn(spurious_interrupt_handler);
         idt
     };
@@ -168,13 +184,6 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(
     crate::task::keyboard::add_scancode(scancode);
 
     send_eoi(InterruptIndex::Keyboard.as_u8());
-}
-
-extern "x86-interrupt" fn lapic_timer_interrupt_handler(
-    _stack_frame: InterruptStackFrame)
-{
-    task::timer::tick();
-    send_eoi(LAPIC_TIMER_VECTOR);
 }
 
 extern "x86-interrupt" fn spurious_interrupt_handler(

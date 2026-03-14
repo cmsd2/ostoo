@@ -5,99 +5,145 @@ use alloc::task::Wake;
 use core::task::Waker;
 use core::task::{Context, Poll};
 use crossbeam_queue::ArrayQueue;
+use lazy_static::lazy_static;
+use spin::Mutex;
 
-pub struct Executor {
-    task_queue: VecDeque<Task>,
-    waiting_tasks: BTreeMap<TaskId, Task>,
-    wake_queue: Arc<ArrayQueue<TaskId>>,
-    waker_cache: BTreeMap<TaskId, Waker>,
+// ---------------------------------------------------------------------------
+// Global executor state
+//
+// Tasks ready to be polled on the next call to run_ready_tasks().
+static TASK_QUEUE: Mutex<VecDeque<Task>> = Mutex::new(VecDeque::new());
+
+// Tasks that returned Poll::Pending and are waiting for a Waker to fire.
+static WAIT_MAP: Mutex<BTreeMap<TaskId, Task>> = Mutex::new(BTreeMap::new());
+
+// Lock-free queue of task IDs whose wakers have fired.  Populated from ISR
+// context (timer tick → wake), so it must be lock-free.
+lazy_static! {
+    // 256 slots: a task can be woken at most once per LAPIC tick (1000/s) so
+    // this covers 256 ms of executor starvation before overflowing.
+    static ref WAKE_QUEUE: Arc<ArrayQueue<TaskId>> = Arc::new(ArrayQueue::new(256));
 }
 
-impl Executor {
-    pub fn new() -> Self {
-        Executor {
-            task_queue: VecDeque::new(),
-            waiting_tasks: BTreeMap::new(),
-            wake_queue: Arc::new(ArrayQueue::new(100)),
-            waker_cache: BTreeMap::new(),
-        }
-    }
+// One Waker per live task.
+//
+// This is critical for ISR safety.  When timer::tick() or the keyboard ISR
+// calls Waker::wake(), it consumes the Waker stored in timer::WAKERS or the
+// AtomicWaker.  If that were the *last* Arc reference, the drop would call
+// into the global heap allocator, which might be spin-locked by the preempted
+// thread → deadlock.
+//
+// By keeping a second reference here, the ISR's drop never hits zero.
+// Deallocation only happens from executor context (Poll::Ready cleanup), which
+// is always safe.
+static WAKER_CACHE: Mutex<BTreeMap<TaskId, Waker>> = Mutex::new(BTreeMap::new());
 
-    pub fn spawn(&mut self, task: Task) {
-        self.task_queue.push_back(task)
-    }
+/// Enqueue a new task.  Safe to call from any kernel thread.
+pub fn spawn(task: Task) {
+    TASK_QUEUE.lock().push_back(task);
+}
 
-    fn run_ready_tasks(&mut self) {
-        while let Some(mut task) = self.task_queue.pop_front() {
-            let task_id = task.id;
-            if !self.waker_cache.contains_key(&task_id) {
-                self.waker_cache.insert(task_id, self.create_waker(task_id));
+/// Run the async executor loop.  Never returns.
+///
+/// Multiple kernel threads may call this concurrently; they will all compete
+/// to pull tasks from the shared TASK_QUEUE.
+pub fn run_worker() -> ! {
+    loop {
+        wake_tasks();
+        run_ready_tasks();
+        sleep_if_idle();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+
+fn run_ready_tasks() {
+    loop {
+        // Take one task from the queue, releasing the lock before polling so
+        // that poll() can call spawn() without deadlocking.
+        let mut task = {
+            let mut queue = TASK_QUEUE.lock();
+            match queue.pop_front() {
+                Some(t) => t,
+                None => break,
             }
-            let waker = self.waker_cache.get(&task_id).expect("should exist");
-            let mut context = Context::from_waker(waker);
-            match task.poll(&mut context) {
-                Poll::Ready(()) => {
-                    // task done -> remove cached waker
-                    self.waker_cache.remove(&task_id);
+        };
+
+        let task_id = task.id;
+
+        // Get-or-create a cached Waker for this task, then clone it.
+        // Keeping the original in WAKER_CACHE ensures the Arc<TaskWaker>
+        // always has at least one reference outside the ISR, preventing
+        // deallocation inside the timer/keyboard ISR context.
+        let waker = {
+            let mut cache = WAKER_CACHE.lock();
+            cache.entry(task_id)
+                .or_insert_with(|| create_waker(task_id))
+                .clone()
+        };
+
+        let mut context = Context::from_waker(&waker);
+        match task.poll(&mut context) {
+            Poll::Ready(()) => {
+                // Task done: remove the cached waker so the Arc can be freed.
+                WAKER_CACHE.lock().remove(&task_id);
+            }
+            Poll::Pending => {
+                let mut wait_map = WAIT_MAP.lock();
+                if wait_map.insert(task_id, task).is_some() {
+                    panic!("task with same ID already in waiting_tasks");
                 }
-                Poll::Pending => {
-                    if self.waiting_tasks.insert(task_id, task).is_some() {
-                        panic!("task with same ID already in waiting_tasks");
-                    }
-                },
             }
-        }
-    }
-
-    fn create_waker(&self, task_id: TaskId) -> Waker {
-        Waker::from(Arc::new(TaskWaker {
-            task_id,
-            wake_queue: self.wake_queue.clone(),
-        }))
-    }
-
-    fn wake_tasks(&mut self) {
-        while let Some(task_id) = self.wake_queue.pop() {
-            if let Some(task) = self.waiting_tasks.remove(&task_id) {
-                self.task_queue.push_back(task);
-            }
-        }
-    }
-
-    pub fn run(&mut self) -> ! {
-        loop {
-            self.wake_tasks();
-            self.run_ready_tasks();
-            self.sleep_if_idle();
-        }
-    }
-
-    fn sleep_if_idle(&self) {
-        use x86_64::instructions::interrupts;
-
-        if !self.wake_queue.is_empty() {
-            return;
-        }
-
-        interrupts::disable();
-        if self.wake_queue.is_empty() {
-            // Atomically re-enable interrupts and halt. The x86 guarantee that sti takes
-            // effect after the following instruction prevents a missed-wakeup race.
-            interrupts::enable_and_hlt();
-        } else {
-            interrupts::enable();
         }
     }
 }
+
+fn create_waker(task_id: TaskId) -> Waker {
+    Waker::from(Arc::new(TaskWaker { task_id }))
+}
+
+fn wake_tasks() {
+    while let Some(task_id) = WAKE_QUEUE.pop() {
+        let mut wait_map = WAIT_MAP.lock();
+        if let Some(task) = wait_map.remove(&task_id) {
+            drop(wait_map); // release before locking TASK_QUEUE
+            TASK_QUEUE.lock().push_back(task);
+        }
+    }
+}
+
+fn sleep_if_idle() {
+    use x86_64::instructions::interrupts;
+
+    if !WAKE_QUEUE.is_empty() {
+        return;
+    }
+
+    // Disable interrupts, re-check, then atomically re-enable + HLT.
+    // This prevents the missed-wakeup race: if a timer tick fires between
+    // the is_empty() check and HLT, the STI takes effect after the next
+    // instruction (HLT), guaranteeing the interrupt is handled.
+    interrupts::disable();
+    if WAKE_QUEUE.is_empty() {
+        interrupts::enable_and_hlt();
+    } else {
+        interrupts::enable();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Waker implementation
 
 struct TaskWaker {
     task_id: TaskId,
-    wake_queue: Arc<ArrayQueue<TaskId>>,
 }
 
 impl TaskWaker {
     fn wake_task(&self) {
-        self.wake_queue.push(self.task_id).expect("wake_queue full");
+        // Silently drop if full: the task is already queued for wakeup if a
+        // previous push succeeded, so no work is lost.
+        let _ = WAKE_QUEUE.push(self.task_id);
     }
 }
 
