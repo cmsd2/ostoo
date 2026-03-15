@@ -80,3 +80,50 @@ unsafe impl GlobalAlloc for Dummy {
         panic!("dealloc should be never called")
     }
 }
+
+#[cfg(test)]
+mod test {
+    use crate::{serial_print, serial_println};
+    use super::{align_up, align_up_pow_2};
+
+    #[test_case]
+    fn test_align_up() {
+        serial_print!("test_align_up... ");
+        assert_eq!(align_up(0, 4), 0);
+        assert_eq!(align_up(1, 4), 4);
+        assert_eq!(align_up(4, 4), 4);
+        assert_eq!(align_up(5, 8), 8);
+        assert_eq!(align_up(8, 8), 8);
+        assert_eq!(align_up(9, 8), 16);
+        assert_eq!(align_up(0, 1), 0);
+        assert_eq!(align_up(7, 1), 7);
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn test_align_up_pow2() {
+        serial_print!("test_align_up_pow2... ");
+        assert_eq!(align_up_pow_2(0, 4), 0);
+        assert_eq!(align_up_pow_2(1, 4), 4);
+        assert_eq!(align_up_pow_2(4, 4), 4);
+        assert_eq!(align_up_pow_2(5, 8), 8);
+        assert_eq!(align_up_pow_2(8, 8), 8);
+        assert_eq!(align_up_pow_2(9, 8), 16);
+        assert_eq!(align_up_pow_2(0, 1), 0);
+        assert_eq!(align_up_pow_2(7, 1), 7);
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn test_align_up_matches_pow2() {
+        serial_print!("test_align_up_matches_pow2... ");
+        // Both implementations must agree on power-of-two alignments.
+        for align in [1usize, 2, 4, 8, 16, 64, 4096] {
+            for addr in [0usize, 1, 3, 4, 7, 8, 15, 16, 100, 1023, 1024, 4095, 4096, 8191] {
+                assert_eq!(align_up(addr, align), align_up_pow_2(addr, align),
+                    "mismatch at addr={addr} align={align}");
+            }
+        }
+        serial_println!("[ok]");
+    }
+}

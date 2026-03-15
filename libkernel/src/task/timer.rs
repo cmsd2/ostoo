@@ -90,3 +90,53 @@ impl Future for Delay {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use crate::{serial_print, serial_println};
+    use core::sync::atomic::Ordering;
+    use super::{Delay, TICK_COUNT, TICKS_PER_SECOND};
+
+    /// Verify that `from_millis` sets `target` to current_tick + expected_ticks.
+    /// We bracket the creation with two tick reads to account for a timer interrupt
+    /// firing between the snapshot and the `Delay::new` read.
+    fn check_millis(ms: u64, expected: u64) {
+        let before = TICK_COUNT.load(Ordering::Acquire);
+        let d = Delay::from_millis(ms);
+        let after = TICK_COUNT.load(Ordering::Acquire);
+        assert!(d.target >= before + expected,
+            "from_millis({ms}): target {} < before {} + {expected}", d.target, before);
+        assert!(d.target <= after + expected,
+            "from_millis({ms}): target {} > after {} + {expected}", d.target, after);
+    }
+
+    #[test_case]
+    fn test_delay_from_millis() {
+        serial_print!("test_delay_from_millis... ");
+        check_millis(0,    0);
+        check_millis(1,    1);
+        check_millis(500,  500);
+        check_millis(999,  999);
+        check_millis(1000, TICKS_PER_SECOND);
+        check_millis(1001, 1001);
+        check_millis(2000, 2 * TICKS_PER_SECOND);
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn test_delay_from_secs() {
+        serial_print!("test_delay_from_secs... ");
+        let before = TICK_COUNT.load(Ordering::Acquire);
+        let d0 = Delay::from_secs(0);
+        let d1 = Delay::from_secs(1);
+        let d5 = Delay::from_secs(5);
+        let after = TICK_COUNT.load(Ordering::Acquire);
+
+        assert!(d0.target >= before && d0.target <= after);
+        assert!(d1.target >= before + TICKS_PER_SECOND
+             && d1.target <= after + TICKS_PER_SECOND);
+        assert!(d5.target >= before + 5 * TICKS_PER_SECOND
+             && d5.target <= after + 5 * TICKS_PER_SECOND);
+        serial_println!("[ok]");
+    }
+}

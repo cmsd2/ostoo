@@ -275,7 +275,7 @@ pub fn timeline_append(thread_idx: usize) {
 mod test {
     use core::fmt::Write;
     use crate::{serial_print, serial_println};
-    use super::{WRITER, BUFFER_HEIGHT};
+    use super::{WRITER, BUFFER_HEIGHT, BUFFER_WIDTH, Color, ColorCode, FixedBuf};
 
     #[test_case]
     fn test_println_simple() {
@@ -306,6 +306,78 @@ mod test {
             assert_eq!(char::from(screen_char.ascii_character), c);
         }
 
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn test_color_code_encoding() {
+        serial_print!("test_color_code_encoding... ");
+        // High nibble = background, low nibble = foreground.
+        let cc = ColorCode::new(Color::White, Color::Blue);
+        assert_eq!(cc.0, (Color::Blue as u8) << 4 | Color::White as u8);
+
+        let cc = ColorCode::new(Color::Black, Color::Black);
+        assert_eq!(cc.0, 0);
+
+        let cc = ColorCode::new(Color::Yellow, Color::Black);
+        assert_eq!(cc.0, Color::Yellow as u8);
+
+        let cc = ColorCode::new(Color::Black, Color::White);
+        assert_eq!(cc.0, (Color::White as u8) << 4);
+
+        // All 16 foreground colours round-trip.
+        for fg in 0u8..16 {
+            for bg in 0u8..16 {
+                let f: Color = unsafe { core::mem::transmute(fg) };
+                let b: Color = unsafe { core::mem::transmute(bg) };
+                let cc = ColorCode::new(f, b);
+                assert_eq!(cc.0 >> 4, bg, "bg mismatch fg={fg} bg={bg}");
+                assert_eq!(cc.0 & 0x0F, fg, "fg mismatch fg={fg} bg={bg}");
+            }
+        }
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn test_fixed_buf_write_printable() {
+        serial_print!("test_fixed_buf_write_printable... ");
+        let mut buf = FixedBuf::new();
+        write!(buf, "hello").unwrap();
+        assert_eq!(buf.len, 5);
+        assert_eq!(&buf.data[..5], b"hello");
+        // Remaining positions keep the initialised space fill.
+        assert_eq!(buf.data[5], b' ');
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn test_fixed_buf_non_printable_replaced() {
+        serial_print!("test_fixed_buf_non_printable_replaced... ");
+        let mut buf = FixedBuf::new();
+        write!(buf, "\x01\x1b\x7f").unwrap();
+        assert_eq!(buf.len, 3);
+        assert_eq!(&buf.data[..3], b"???");
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn test_fixed_buf_truncates_at_buffer_width() {
+        serial_print!("test_fixed_buf_truncates_at_buffer_width... ");
+        let mut buf = FixedBuf::new();
+        for _ in 0..BUFFER_WIDTH + 10 {
+            write!(buf, "x").unwrap();
+        }
+        assert_eq!(buf.len, BUFFER_WIDTH);
+        serial_println!("[ok]");
+    }
+
+    #[test_case]
+    fn test_fixed_buf_format_args() {
+        serial_print!("test_fixed_buf_format_args... ");
+        let mut buf = FixedBuf::new();
+        write!(buf, "n={}", 42u32).unwrap();
+        assert_eq!(&buf.data[..4], b"n=42");
+        assert_eq!(buf.len, 4);
         serial_println!("[ok]");
     }
 }

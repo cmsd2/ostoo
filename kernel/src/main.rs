@@ -8,7 +8,9 @@ extern crate alloc;
 
 use core::panic::PanicInfo;
 use bootloader::{BootInfo, entry_point};
-use libkernel::{println, init, hlt_loop};
+use libkernel::{println, init};
+#[cfg(not(test))]
+use libkernel::hlt_loop;
 use libkernel::logger;
 use libkernel::task::Task;
 use libkernel::task::executor;
