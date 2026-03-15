@@ -109,7 +109,42 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
         info!("[kernel] init configuring pic");
     }
 
+    // Map the PCIe ECAM region (Q35 machine: 1 MiB at phys 0xB000_0000 for bus 0).
+    let ecam_virt = libkernel::memory::with_memory(|mem| {
+        mem.map_mmio_region(x86_64::PhysAddr::new(0xB000_0000), 1024 * 1024)
+    });
+    devices::virtio::set_ecam_base(ecam_virt.as_u64());
+
     devices::pci::init();
+
+    // ── virtio-blk probe ─────────────────────────────────────────────────────
+    // Probe legacy (0x1001) and modern-transitional (0x1042) virtio-blk devices.
+    let blk_dev = devices::pci::find_devices(0x1AF4, 0x1042)
+        .into_iter()
+        .chain(devices::pci::find_devices(0x1AF4, 0x1001))
+        .next();
+
+    if let Some(pci_dev) = blk_dev {
+        info!("[kernel] found virtio-blk at {:02x}:{:02x}.{}",
+            pci_dev.bus, pci_dev.device, pci_dev.function);
+        match devices::virtio::create_blk_transport(
+            pci_dev.bus, pci_dev.device, pci_dev.function,
+        ) {
+            Some(transport) => {
+                let actor = devices::virtio::blk::VirtioBlkActor::new(transport);
+                let (drv, inbox) =
+                    devices::virtio::blk::VirtioBlkActorDriver::new(actor);
+                devices::driver::register(Box::new(drv));
+                libkernel::task::registry::register("virtio-blk", inbox);
+                devices::driver::start_driver("virtio-blk").ok();
+                info!("[kernel] virtio-blk registered");
+            }
+            None => warn!("[kernel] virtio-blk transport init failed"),
+        }
+    } else {
+        info!("[kernel] no virtio-blk device found");
+    }
+
     let (dummy_driver, dummy_inbox) =
         devices::dummy::DummyDriver::new(devices::dummy::Dummy::new());
     devices::driver::register(Box::new(dummy_driver));

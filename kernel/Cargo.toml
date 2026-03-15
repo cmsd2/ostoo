@@ -12,6 +12,7 @@ sysroot_path = "target/sysroot"
 
 [package.metadata.bootimage]
 run-args = [
+    "-machine", "q35",
     "-serial", "stdio",
     #"-monitor", "stdio"
 ]

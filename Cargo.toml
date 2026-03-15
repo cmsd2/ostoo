@@ -29,5 +29,6 @@ pic8259       = "0.10"
 raw-cpuid     = "7.0.3"
 spin          = { version = "0.9", features = ["mutex", "rwlock"] }
 uart_16550    = "0.3"
+virtio-drivers = { version = "0.7", default-features = false, features = ["alloc"] }
 volatile      = "0.2.6"
 x86_64        = "0.15"

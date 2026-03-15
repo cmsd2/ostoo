@@ -8,3 +8,4 @@ pub mod driver;
 pub mod dummy;
 pub mod pci;
 pub mod task_driver;
+pub mod virtio;

@@ -81,7 +81,60 @@ impl Shell {
             "pci"     => cmd_pci(),
             "drivers" => cmd_drivers(),
             "driver"  => self.cmd_driver(rest).await,
+            "blk"     => self.cmd_blk(rest).await,
             other     => println!("unknown command: '{}'  (try 'help')", other),
+        }
+    }
+
+    // ── blk command ───────────────────────────────────────────────────────────
+    async fn cmd_blk(&self, rest: &str) {
+        use libkernel::task::mailbox::ActorMsg;
+        use devices::virtio::blk::{VirtioBlkMsg, VirtioBlkInfo};
+
+        let (sub, arg) = match rest.find(' ') {
+            Some(i) => (rest[..i].trim(), rest[i + 1..].trim()),
+            None    => (rest.trim(), ""),
+        };
+
+        match sub {
+            "info" => {
+                match libkernel::task::registry::ask_info("virtio-blk").await {
+                    Some(s) => {
+                        println!("  name:    {}", s.name);
+                        println!("  running: {}", s.running);
+                        println!("  info:    {:?}", s.info);
+                    }
+                    None => println!("virtio-blk: not found or not responding"),
+                }
+            }
+            "read" => {
+                let sector: u64 = match arg.parse() {
+                    Ok(n)  => n,
+                    Err(_) => { println!("usage: blk read <sector>"); return; }
+                };
+                let inbox = match libkernel::task::registry::get::<VirtioBlkMsg, VirtioBlkInfo>(
+                    "virtio-blk"
+                ) {
+                    Some(mb) => mb,
+                    None => { println!("virtio-blk: driver not found"); return; }
+                };
+                let result: Option<Result<alloc::vec::Vec<u8>, ()>> = inbox.ask(|reply| {
+                    ActorMsg::Inner(VirtioBlkMsg::Read(sector, reply))
+                }).await;
+                match result {
+                    Some(Ok(buf)) => {
+                        println!("sector {}  (first 64 bytes):", sector);
+                        let end = 64.min(buf.len());
+                        for chunk in buf[..end].chunks(16) {
+                            for b in chunk { print!("{:02x} ", b); }
+                            println!();
+                        }
+                    }
+                    Some(Err(())) => println!("virtio-blk: read error"),
+                    None          => println!("virtio-blk: no response"),
+                }
+            }
+            _ => println!("usage: blk <info|read <sector>>"),
         }
     }
 
@@ -158,6 +211,8 @@ fn cmd_help() {
     println!("  driver start <n>  start a driver by name");
     println!("  driver stop <n>   stop a driver by name");
     println!("  driver info <n>   query driver info");
+    println!("  blk info          virtio-blk device info");
+    println!("  blk read <n>      hex-dump sector N from virtio-blk");
 }
 
 // ---------------------------------------------------------------------------

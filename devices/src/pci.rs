@@ -24,7 +24,7 @@ lazy_static! {
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA:    u16 = 0xCFC;
 
-fn read_config_u32(bus: u8, device: u8, func: u8, offset: u8) -> u32 {
+pub fn read_config_u32(bus: u8, device: u8, func: u8, offset: u8) -> u32 {
     let addr: u32 = (1 << 31)
         | ((bus    as u32) << 16)
         | (((device as u32) & 0x1F) << 11)
@@ -39,6 +39,33 @@ fn read_config_u32(bus: u8, device: u8, func: u8, offset: u8) -> u32 {
 fn read_config_u8(bus: u8, device: u8, func: u8, offset: u8) -> u8 {
     let word = read_config_u32(bus, device, func, offset & !3);
     (word >> ((offset & 3) * 8)) as u8
+}
+
+pub fn write_config_u32(bus: u8, device: u8, func: u8, offset: u8, value: u32) {
+    let addr: u32 = (1 << 31)
+        | ((bus    as u32) << 16)
+        | (((device as u32) & 0x1F) << 11)
+        | (((func   as u32) & 0x07) << 8)
+        | ((offset  as u32) & 0xFC);
+    unsafe {
+        Port::new(CONFIG_ADDRESS).write(addr);
+        Port::new(CONFIG_DATA).write(value);
+    }
+}
+
+/// Read a 32-bit BAR value at `bar_idx` (0-based).
+pub fn read_bar(bus: u8, device: u8, func: u8, bar_idx: u8) -> u32 {
+    read_config_u32(bus, device, func, 0x10 + bar_idx * 4)
+}
+
+/// Find all PCI devices matching a given vendor + device ID.
+pub fn find_devices(vendor: u16, device_id: u16) -> alloc::vec::Vec<PciDevice> {
+    PCI_DEVICES
+        .lock()
+        .iter()
+        .filter(|d| d.vendor_id == vendor && d.device_id == device_id)
+        .cloned()
+        .collect()
 }
 
 pub fn init() {
