@@ -105,13 +105,22 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     }
 
     devices::pci::init();
-    devices::driver::register(Box::new(devices::dummy::DummyDriver::new(devices::dummy::Dummy)));
+    let (dummy_driver, dummy_inbox) =
+        devices::dummy::DummyDriver::new(devices::dummy::Dummy);
+    devices::driver::register(Box::new(dummy_driver));
+    libkernel::task::registry::register("dummy", dummy_inbox);
+
+    let (shell_driver, shell_inbox) =
+        shell::ShellDriver::new(shell::Shell::new());
+    devices::driver::register(Box::new(shell_driver));
+    libkernel::task::registry::register("shell", shell_inbox.clone());
+    devices::driver::start_driver("shell").ok();
 
     #[cfg(test)]
     test_main();
 
     executor::spawn(Task::new(example_task()));
-    executor::spawn(Task::new(shell::run()));
+    executor::spawn(Task::new(shell::keyboard_task(shell_inbox)));
     executor::spawn(Task::new(timer_task()));
     executor::spawn(Task::new(status_task()));
 

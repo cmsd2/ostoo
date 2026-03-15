@@ -1,32 +1,91 @@
+extern crate alloc;
+
+use alloc::sync::Arc;
+use alloc::string::String;
+use core::future::Future;
 use futures_util::stream::StreamExt;
 use libkernel::task::keyboard::{Key, KeyStream};
 use libkernel::task::{executor, scheduler, timer};
+use libkernel::task::mailbox::{ActorInfo, ActorMsg, Mailbox, Reply};
+use libkernel::task::registry;
 use libkernel::{print, println};
+use devices::task_driver::{DriverTask, StopToken};
 
 const PROMPT: &str = "ostoo> ";
 /// Maximum input characters; keeps typed text on a single VGA row.
 const MAX_LINE: usize = 80 - 7 - 1; // 80 cols − len("ostoo> ") − safety margin
 
-pub async fn run() {
+// ---------------------------------------------------------------------------
+// Messages
+
+pub enum ShellMsg {
+    KeyLine(String, Reply<()>),
+}
+
+// ---------------------------------------------------------------------------
+// Shell actor
+
+pub struct Shell;
+
+impl Shell {
+    pub fn new() -> Self { Shell }
+}
+
+pub type ShellDriver = devices::task_driver::TaskDriver<Shell>;
+
+impl DriverTask for Shell {
+    type Message = ShellMsg;
+
+    fn name(&self) -> &'static str { "shell" }
+
+    fn run(
+        handle: Arc<Self>,
+        _stop:  StopToken,
+        inbox:  Arc<Mailbox<ActorMsg<ShellMsg>>>,
+    ) -> impl Future<Output = ()> + Send
+    where Self: Sized {
+        async move {
+            log::info!("[shell] started");
+            while let Some(msg) = inbox.recv().await {
+                match msg {
+                    ActorMsg::Info(reply) => {
+                        reply.send(ActorInfo { name: "shell" });
+                    }
+                    ActorMsg::Inner(ShellMsg::KeyLine(line, _reply)) => {
+                        handle.execute_command(&line).await;
+                        // _reply dropped here → keyboard_task's ask().await returns
+                    }
+                }
+            }
+            log::info!("[shell] stopped");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard task — free async fn, spawned independently
+
+pub async fn keyboard_task(shell_inbox: Arc<Mailbox<ActorMsg<ShellMsg>>>) {
+    let mut keys = KeyStream::new();
+    let mut buf  = [0u8; MAX_LINE];
+    let mut len  = 0usize;
+
     println!();
     print!("{}", PROMPT);
 
-    let mut keys = KeyStream::new();
-    let mut buf = [0u8; MAX_LINE];
-    let mut len = 0usize;
-
     while let Some(key) = keys.next().await {
         match key {
-            // Enter — run whatever is in the buffer
             Key::Unicode('\n') | Key::Unicode('\r') => {
                 println!();
                 let line = core::str::from_utf8(&buf[..len]).unwrap_or("").trim();
-                execute(line, &mut keys).await;
+                if !line.is_empty() {
+                    let line_owned = String::from(line);
+                    shell_inbox.ask(|reply| ActorMsg::Inner(ShellMsg::KeyLine(line_owned, reply))).await;
+                }
                 len = 0;
                 print!("{}", PROMPT);
             }
 
-            // Backspace
             Key::Unicode('\x08') => {
                 if len > 0 {
                     len -= 1;
@@ -34,7 +93,6 @@ pub async fn run() {
                 }
             }
 
-            // Printable ASCII only
             Key::Unicode(c) if c.is_ascii() && !c.is_control() => {
                 if len < MAX_LINE {
                     buf[len] = c as u8;
@@ -43,123 +101,120 @@ pub async fn run() {
                 }
             }
 
-            // Ignore raw keys (arrows, F-keys, etc.)
             _ => {}
         }
     }
 }
 
-/// Lines of content shown per page (23-row content area minus the prompt row).
-const PAGE_HEIGHT: usize = 20;
+// ---------------------------------------------------------------------------
+// Command dispatch — methods on Shell
 
-/// Capture command output, then display it page-by-page if it exceeds
-/// `PAGE_HEIGHT` lines.  The caller's `KeyStream` is borrowed so the pager
-/// can read keypresses without creating a competing waker.
-async fn execute(line: &str, keys: &mut KeyStream) {
-    if line.is_empty() { return; }
-    libkernel::vga_buffer::capture_start();
-    run_command(line);
-    let n = libkernel::vga_buffer::capture_end();
-    page_output(n, keys).await;
-}
-
-/// Show captured lines with an interactive pager.
-/// Displays `PAGE_HEIGHT` lines at a time; press Space/Enter to advance or
-/// `q` to quit early.
-async fn page_output(n: usize, keys: &mut KeyStream) {
-    if n == 0 { return; }
-    let mut start = 0usize;
-    loop {
-        let end = (start + PAGE_HEIGHT).min(n);
-        for i in start..end {
-            libkernel::vga_buffer::capture_print_line(i);
-        }
-        start = end;
-        if start >= n { break; }
-        print!("-- More -- ({}/{}) [space/enter=next  q=quit]", start, n);
-        loop {
-            match keys.next().await {
-                Some(Key::Unicode(' '))
-                | Some(Key::Unicode('\n'))
-                | Some(Key::Unicode('\r')) => {
-                    libkernel::vga_buffer::clear_current_line();
-                    break;
-                }
-                Some(Key::Unicode('q')) | Some(Key::Unicode('Q')) => {
-                    libkernel::vga_buffer::clear_current_line();
-                    return;
-                }
-                _ => {}
+impl Shell {
+    async fn execute_command(&self, line: &str) {
+        let (cmd, rest) = match line.find(' ') {
+            Some(i) => (&line[..i], line[i + 1..].trim()),
+            None    => (line, ""),
+        };
+        match cmd {
+            "help"    => cmd_help(),
+            "clear"   => libkernel::vga_buffer::clear_content(),
+            "uptime"  => {
+                let secs = timer::ticks() / timer::TICKS_PER_SECOND;
+                println!("uptime: {}s", secs);
             }
+            "tasks"   => {
+                println!(
+                    "ready: {}  waiting: {}",
+                    executor::ready_count(),
+                    executor::wait_count()
+                );
+            }
+            "threads" => {
+                println!(
+                    "current thread: {}  context switches: {}",
+                    scheduler::current_thread_idx(),
+                    scheduler::context_switches()
+                );
+            }
+            "echo"    => println!("{}", rest),
+            "memmap"  => cmd_memmap(),
+            "meminfo" => cmd_meminfo(),
+            "pmap"    => cmd_pmap(),
+            "cpuinfo" => cmd_cpuinfo(),
+            "lapic"   => cmd_lapic(),
+            "ioapic"  => cmd_ioapic(),
+            "idt"     => cmd_idt(),
+            "pci"     => cmd_pci(),
+            "drivers" => cmd_drivers(),
+            "driver"  => self.cmd_driver(rest).await,
+            other     => println!("unknown command: '{}'  (try 'help')", other),
+        }
+    }
+
+    async fn cmd_driver(&self, rest: &str) {
+        let (subcmd, name) = match rest.find(' ') {
+            Some(i) => (rest[..i].trim(), rest[i + 1..].trim()),
+            None    => (rest.trim(), ""),
+        };
+        match subcmd {
+            "start" => {
+                if name.is_empty() {
+                    println!("usage: driver start <name>");
+                } else {
+                    match devices::driver::start_driver(name) {
+                        Ok(())   => println!("driver '{}' started", name),
+                        Err(msg) => println!("error: {}", msg),
+                    }
+                }
+            }
+            "stop" => {
+                if name.is_empty() {
+                    println!("usage: driver stop <name>");
+                } else {
+                    match devices::driver::stop_driver(name) {
+                        Ok(())   => println!("driver '{}' stop requested", name),
+                        Err(msg) => println!("error: {}", msg),
+                    }
+                }
+            }
+            "info" => {
+                if name.is_empty() {
+                    println!("usage: driver info <name>");
+                } else {
+                    match registry::ask_info(name).await {
+                        Some(info) => println!("  name: {}", info.name),
+                        None       => println!("error: '{}' not found or not responding", name),
+                    }
+                }
+            }
+            _ => println!("usage: driver <start|stop|info> <name>"),
         }
     }
 }
 
-fn run_command(line: &str) {
-    let (cmd, rest) = match line.find(' ') {
-        Some(i) => (&line[..i], line[i + 1..].trim()),
-        None => (line, ""),
-    };
-    match cmd {
-        "help" => {
-            println!("Commands:");
-            println!("  help              show this message");
-            println!("  clear             clear the screen");
-            println!("  uptime            seconds since boot");
-            println!("  tasks             ready / waiting task counts");
-            println!("  threads           current thread and context-switch count");
-            println!("  echo <text>       print text back");
-            println!("  memmap            physical memory regions (bootloader map)");
-            println!("  meminfo           heap usage, frame stats, virtual layout");
-            println!("  pmap              page table walk (coalesced 2 MiB view)");
-            println!("  cpuinfo           CPU vendor, family/model, control registers");
-            println!("  lapic             Local APIC state and timer configuration");
-            println!("  ioapic            IO APIC redirection table");
-            println!("  idt               IDT vector assignments");
-            println!("  pci               list PCI devices");
-            println!("  drivers           list registered device drivers");
-            println!("  driver start <n>  start a driver by name");
-            println!("  driver stop <n>   stop a driver by name");
-            println!("  driver info <n>   show driver state and details");
-        }
-        "clear" => {
-            libkernel::vga_buffer::clear_content();
-        }
-        "uptime" => {
-            let secs = timer::ticks() / timer::TICKS_PER_SECOND;
-            println!("uptime: {}s", secs);
-        }
-        "tasks" => {
-            println!(
-                "ready: {}  waiting: {}",
-                executor::ready_count(),
-                executor::wait_count()
-            );
-        }
-        "threads" => {
-            println!(
-                "current thread: {}  context switches: {}",
-                scheduler::current_thread_idx(),
-                scheduler::context_switches()
-            );
-        }
-        "echo" => {
-            println!("{}", rest);
-        }
-        "memmap" => cmd_memmap(),
-        "meminfo" => cmd_meminfo(),
-        "pmap" => cmd_pmap(),
-        "cpuinfo" => cmd_cpuinfo(),
-        "lapic" => cmd_lapic(),
-        "ioapic" => cmd_ioapic(),
-        "idt" => cmd_idt(),
-        "pci"     => cmd_pci(),
-        "drivers" => cmd_drivers(),
-        "driver"  => cmd_driver(rest),
-        other => {
-            println!("unknown command: '{}'  (try 'help')", other);
-        }
-    }
+// ---------------------------------------------------------------------------
+// help
+
+fn cmd_help() {
+    println!("Commands:");
+    println!("  help              show this message");
+    println!("  clear             clear the screen");
+    println!("  uptime            seconds since boot");
+    println!("  tasks             ready / waiting task counts");
+    println!("  threads           current thread and context-switch count");
+    println!("  echo <text>       print text back");
+    println!("  memmap            physical memory regions (bootloader map)");
+    println!("  meminfo           heap usage, frame stats, virtual layout");
+    println!("  pmap              page table walk (coalesced 2 MiB view)");
+    println!("  cpuinfo           CPU vendor, family/model, control registers");
+    println!("  lapic             Local APIC state and timer configuration");
+    println!("  ioapic            IO APIC redirection table");
+    println!("  idt               IDT vector assignments");
+    println!("  pci               list PCI devices");
+    println!("  drivers           list registered device drivers");
+    println!("  driver start <n>  start a driver by name");
+    println!("  driver stop <n>   stop a driver by name");
+    println!("  driver info <n>   query driver info");
 }
 
 // ---------------------------------------------------------------------------
@@ -579,49 +634,4 @@ fn cmd_drivers() {
     devices::driver::with_drivers(|name, state| {
         println!("  {:16}  {:?}", name, state);
     });
-}
-
-// ---------------------------------------------------------------------------
-// driver — manage a driver lifecycle
-
-fn cmd_driver(rest: &str) {
-    let (subcmd, name) = match rest.find(' ') {
-        Some(i) => (rest[..i].trim(), rest[i + 1..].trim()),
-        None    => (rest.trim(), ""),
-    };
-    match subcmd {
-        "start" => {
-            if name.is_empty() {
-                println!("usage: driver start <name>");
-            } else {
-                match devices::driver::start_driver(name) {
-                    Ok(())   => println!("driver '{}' started", name),
-                    Err(msg) => println!("error: {}", msg),
-                }
-            }
-        }
-        "stop" => {
-            if name.is_empty() {
-                println!("usage: driver stop <name>");
-            } else {
-                match devices::driver::stop_driver(name) {
-                    Ok(())   => println!("driver '{}' stop requested", name),
-                    Err(msg) => println!("error: {}", msg),
-                }
-            }
-        }
-        "info" => {
-            if name.is_empty() {
-                println!("usage: driver info <name>");
-            } else {
-                match devices::driver::with_driver_info(name, |k, v| {
-                    println!("  {:<20}  {}", k, v);
-                }) {
-                    Ok(())   => {}
-                    Err(msg) => println!("error: {}", msg),
-                }
-            }
-        }
-        _ => println!("usage: driver <start|stop|info> <name>"),
-    }
 }

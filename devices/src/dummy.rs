@@ -1,32 +1,15 @@
-use alloc::boxed::Box;
-use alloc::sync::Arc;
-use core::future::Future;
-use core::pin::Pin;
-use libkernel::task::timer::Delay;
-use super::task_driver::{DriverTask, StopToken, TaskDriver};
+use crate::actor;
 
-/// Zero-sized marker type; all lifecycle state lives in [`TaskDriver<Dummy>`].
-pub struct Dummy;
-
-impl DriverTask for Dummy {
-    fn name(&self) -> &'static str { "dummy" }
-
-    fn info(&self, out: &mut dyn FnMut(&str, &str)) {
-        out("heartbeat_interval", "5s");
-    }
-
-    fn run(_handle: Arc<Self>, stop: StopToken) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        Box::pin(async move {
-            info!("[dummy] started");
-            loop {
-                if stop.is_stopped() { break; }
-                Delay::from_secs(5).await;
-                if stop.is_stopped() { break; }
-                info!("[dummy] heartbeat");
-            }
-            info!("[dummy] stopped");
-        })
-    }
+pub enum DummyMsg {
+    SetInterval(u64),
 }
 
-pub type DummyDriver = TaskDriver<Dummy>;
+pub struct Dummy;
+
+#[actor("dummy", DummyMsg)]
+impl Dummy {
+    #[on_message(SetInterval)]
+    async fn set_interval(&self, secs: u64) {
+        info!("[dummy] interval set to {}s — takes effect next heartbeat", secs);
+    }
+}

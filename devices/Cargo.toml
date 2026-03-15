@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2018"
 
 [dependencies]
-lazy_static = { workspace = true }
-libkernel   = { workspace = true }
-log         = { workspace = true }
-spin        = { workspace = true }
-x86_64      = { workspace = true }
+devices-macros = { path = "../devices-macros" }
+lazy_static    = { workspace = true }
+libkernel      = { workspace = true }
+log            = { workspace = true }
+spin           = { workspace = true }
+x86_64         = { workspace = true }

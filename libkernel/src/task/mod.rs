@@ -7,6 +7,8 @@ use alloc::boxed::Box;
 pub mod executor;
 pub mod simple_executor;
 pub mod keyboard;
+pub mod mailbox;
+pub mod registry;
 pub mod timer;
 pub mod scheduler;
 

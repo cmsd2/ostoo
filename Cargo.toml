@@ -4,6 +4,7 @@ members = [
     "libkernel",
     "apic",
     "devices",
+    "devices-macros",
 ]
 
 [workspace.dependencies]

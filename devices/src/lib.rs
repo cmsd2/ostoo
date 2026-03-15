@@ -2,6 +2,8 @@
 extern crate alloc;
 #[macro_use] extern crate log;
 
+pub use devices_macros::{actor, on_message};
+#[macro_use] pub mod macros;
 pub mod driver;
 pub mod dummy;
 pub mod pci;
