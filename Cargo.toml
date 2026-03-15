@@ -5,4 +5,26 @@ members = [
     "apic",
 ]
 
+[workspace.dependencies]
+# workspace-local crates
+apic      = { path = "apic" }
+libkernel = { path = "libkernel" }
 
+# external crates shared across two or more members
+acpi          = "6.1.1"
+apic_types    = { git = "https://github.com/cmsd2/apic_types.git" }
+bitflags      = "1.2.1"
+bootloader    = { version = "0.9.34", features = ["map_physical_memory"] }
+conquer-once  = { version = "0.3", default-features = false }
+crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }
+futures-util  = { version = "0.3", default-features = false, features = ["alloc"] }
+lazy_static   = { version = "1.4.0", features = ["spin_no_std"] }
+linked_list_allocator = "0.10"
+log           = "0.4.8"
+pc-keyboard   = "0.5.0"
+pic8259       = "0.10"
+raw-cpuid     = "7.0.3"
+spin          = { version = "0.9", features = ["mutex", "rwlock"] }
+uart_16550    = "0.3"
+volatile      = "0.2.6"
+x86_64        = "0.15"
