@@ -2,8 +2,8 @@
 
 `ostoo` is a hobby x86-64 kernel written in Rust, following the
 [Writing an OS in Rust](https://os.phil-opp.com/) blog series by Philipp Oppermann.
-All twelve tutorial chapters have been completed and the project has started going
-beyond the tutorial into APIC/ACPI territory.
+All twelve tutorial chapters have been completed and the project has gone
+significantly beyond the tutorial.
 
 ## Workspace Layout
 
@@ -12,9 +12,12 @@ beyond the tutorial into APIC/ACPI territory.
 | `kernel/` | Top-level kernel binary — entry point, ties everything together |
 | `libkernel/` | Core kernel library — all subsystems live here |
 | `apic/` | Advanced Programmable Interrupt Controller support (in progress) |
+| `devices/` | Driver framework — `DriverTask` trait, actor macro, built-in drivers |
+| `devices-macros/` | Proc-macro crate: `#[actor]`, `#[on_message]`, `#[on_info]`, `#[on_tick]`, `#[on_stream]`, `#[on_start]` |
 
 Target triple: `x86_64-os` (custom JSON target, bare-metal, no std).
 Build tooling: `cargo-xbuild` + `bootimage` (BIOS bootloader).
+Toolchain: current nightly (floating, `rust-toolchain.toml`).
 
 ---
 
@@ -29,6 +32,8 @@ Build tooling: `cargo-xbuild` + `bootimage` (BIOS bootloader).
 - `libkernel/src/vga_buffer.rs` — a `Writer` behind a `spin::Mutex`.
 - `print!` / `println!` macros available globally.
 - Volatile writes to avoid compiler optimisation of MMIO.
+- Hardware cursor (CRTC registers 0x3D4/0x3D5) kept in sync on every write.
+- `redraw_line(start_col, buf, len, cursor)` for in-place line editing.
 
 ### 4. Testing
 - Custom test framework (`custom_test_frameworks` feature).
@@ -46,9 +51,9 @@ Build tooling: `cargo-xbuild` + `bootimage` (BIOS bootloader).
 ### 7. Hardware Interrupts
 - 8259 PIC (chained) initialised via the `pic8259_simple` crate.
 - PIC remapped to IRQ vectors 32–47 to avoid conflict with CPU exceptions.
-- Timer interrupt handler (IRQ 0): sends EOI, no other action yet.
+- Timer interrupt handler (IRQ 0): increments tick counter, wakes timer futures.
 - Keyboard interrupt handler (IRQ 1): reads scancode from port 0x60,
-  pushes it into the async scancode queue (see Async/Await below).
+  pushes it into the async scancode queue.
 
 ### 8–9. Paging / Paging Implementation
 - `libkernel/src/memory/mod.rs` — `OffsetPageTable` wrapping the active
@@ -80,23 +85,63 @@ Build tooling: `cargo-xbuild` + `bootimage` (BIOS bootloader).
   - Ready tasks in a `VecDeque`, waiting tasks in a `BTreeMap`.
   - Wake queue (`crossbeam_queue::ArrayQueue`) for interrupt-safe wakeups.
   - `sleep_if_idle` uses `sti; hlt` to avoid busy-waiting.
-- Async keyboard task in `task/keyboard.rs`:
-  - `OnceCell<ArrayQueue<u8>>` scancode queue filled from the IRQ handler.
-  - `ScancodeStream` implements `Future`/`Stream`.
-  - `print_keypresses()` async fn decodes scancodes via `pc-keyboard` and
-    prints characters to the VGA buffer.
-- Main executor loop runs `example_task` and `print_keypresses` on boot.
 
 ---
 
 ## Beyond the Tutorial
+
+### Timer
+- `libkernel/src/task/timer.rs` — PIT tick counter; `TICKS_PER_SECOND = 1000`.
+- `Delay` future: resolves after a given number of ticks.
+- `Mailbox::recv_timeout(ticks)` races inbox against a `Delay`.
+
+### Actor System (`devices/`, `devices-macros/`)
+- `DriverTask` trait: `name()`, `run(inbox, handle)`.
+- `Mailbox<M>` / `Inbox<M>` MPSC queue; `ActorMsg<M,I>` envelope wraps
+  inner messages, info queries, and erased-type info queries.
+- Process registry (`libkernel/src/task/registry.rs`): actors register by name;
+  `registry::get::<M,I>(name)` returns a typed sender handle.
+- `ErasedInfo` registry: actors register a `Box<dyn Fn() -> ...>` so the shell
+  can query any actor's info without knowing its concrete type.
+
+#### Proc-macro attributes (used inside `#[actor]` blocks)
+| Attribute | Effect |
+|---|---|
+| `#[on_start]` | Called once before the run loop |
+| `#[on_message(Variant)]` | Handles one inner message enum variant |
+| `#[on_info]` | Returns the actor's typed info struct |
+| `#[on_tick]` | Called periodically; actor provides `tick_interval_ticks()` |
+| `#[on_stream(factory)]` | Polls a `Stream + Unpin` in the unified event loop |
+
+The macro generates a unified `poll_fn` loop when `#[on_tick]` or `#[on_stream]`
+are present, racing all event sources in a single future.
+
+### Shell (`kernel/src/shell.rs`)
+- `#[actor]`-based shell actor; registered as `"shell"`.
+- Commands: `help`, `echo`, `driver <start|stop|info|list|...>`.
+- Output pager for long command output (press any key to scroll).
+
+### Keyboard Actor (`kernel/src/keyboard_actor.rs`)
+- `#[actor]` + `#[on_stream(key_stream)]`; registered as `"keyboard"`.
+- Full readline-style line editing:
+  - Cursor movement: ← → / Ctrl+B/F, Home/End / Ctrl+A/E
+  - Editing: Backspace, Delete, Ctrl+K (kill to end), Ctrl+U (kill to start),
+    Ctrl+W (delete word)
+  - History: ↑↓ / Ctrl+P/N, 50-entry `VecDeque`, live-buffer save/restore
+  - Ctrl+C clears the line; Ctrl+L clears the screen
+- Dispatches complete lines to the shell via `ShellMsg::KeyLine`.
+
+### Dummy Driver (`devices/src/dummy.rs`)
+- Example actor with `#[on_tick]` heartbeat, `#[on_message(SetInterval)]`,
+  and `#[on_info]`.
+- Demonstrates the full actor feature set.
 
 ### ACPI Parsing
 - `kernel/src/kernel_acpi.rs` implements an `AcpiHandler` that maps
   physical ACPI regions into virtual memory via the `DumbVmemAllocator`.
 - ACPI virtual address space: `0x6666_6666_0000`, up to 200 pages.
 - Calls `acpi::search_for_rsdp_bios` to locate and parse ACPI tables.
-- On boot the interrupt model is printed; Apic vs legacy PIC is detected.
+- On boot the interrupt model is printed; APIC vs legacy PIC is detected.
 
 ### APIC Crate (`apic/`)
 - A separate crate for APIC initialisation, mapped at `0x5555_5555_0000`.
@@ -104,7 +149,7 @@ Build tooling: `cargo-xbuild` + `bootimage` (BIOS bootloader).
 - `apic/src/io_apic/` — I/O APIC register access via MMIO.
 - `apic::init()` maps both the local APIC and all I/O APICs from the ACPI
   table into virtual memory, then calls `init()` on each.
-- **Status: written but not yet wired in** — the call in `main.rs:88` is
+- **Status: written but not yet wired in** — the call in `main.rs` is
   commented out. The 8259 PIC is still active.
 
 ### Logging
@@ -121,17 +166,6 @@ Build tooling: `cargo-xbuild` + `bootimage` (BIOS bootloader).
 
 ## Known Issues / Technical Debt
 
-### Stale Toolchain
-The pinned toolchain (`rust-toolchain`) is `nightly-2020-04-10` — approximately
-six years old. Several language features used were unstable at the time and have
-since been stabilised or changed:
-
-| Feature | Current status |
-|---|---|
-| `wake_trait` | Stabilised; no longer needs a feature gate |
-| `alloc_error_handler` | Stabilised in recent nightly |
-| `abi_x86_interrupt` | Still unstable but the attribute form changed |
-
 ### Stale Dependencies
 All dependencies are pinned to 2019–2020 versions. Key crates with significant
 breaking changes since:
@@ -146,17 +180,16 @@ breaking changes since:
 | `crossbeam-queue` | 0.2.1 | ~0.3 | |
 
 ### `UnusedPhysFrame` Usage
-`libkernel/src/memory/mod.rs:61` and `kernel/src/kernel_acpi.rs:37` use
+`libkernel/src/memory/mod.rs` and `kernel/src/kernel_acpi.rs` use
 `UnusedPhysFrame::new(frame)` which was removed from `x86_64` after 0.11.
 Any dependency update must address this.
 
 ### APIC Not Wired In
-The `apic::init()` call is commented out in `kernel/src/main.rs:88`. Before
+The `apic::init()` call is commented out in `kernel/src/main.rs`. Before
 enabling it:
 - The 8259 PIC should be masked/disabled after APIC is initialised.
 - IRQ routing via the I/O APIC redirection table needs to be configured.
-- The IDT needs entries for APIC interrupt vectors (≥ 32 are already used by
-  the PIC mapping; APIC typically uses vectors 0x20–0xFF differently).
+- The IDT needs entries for APIC interrupt vectors.
 
 ### Two Versions of x86_64
 `libkernel` uses `x86_64 = "0.9.6"` and `apic` uses `x86_64 = "0.7.5"`. Cargo
@@ -164,7 +197,7 @@ will resolve these separately but it is a source of confusion. They should be
 unified.
 
 ### Heap Size
-The heap is 100 KiB. This is sufficient for the tutorial workload but would need
+The heap is 100 KiB. This is sufficient for the current workload but would need
 to grow for any real subsystem work.
 
 ---
@@ -175,17 +208,14 @@ to grow for any real subsystem work.
    redirection table entries for keyboard (IRQ 1) and timer (IRQ 0), then disable
    the 8259 PIC.
 
-2. **Update the toolchain and dependencies** — this is a significant but
-   worthwhile undertaking. The `bootloader` 0.9+ series and the current `x86_64`
-   crate are much cleaner. The tutorial second-edition branch may be worth
-   consulting as a reference.
+2. **Update dependencies** — modernise `bootloader`, `x86_64`, `acpi`, etc.
+   The `bootloader` 0.9+ series and current `x86_64` crate are much cleaner.
 
-3. **PIT / timer abstraction** — the timer IRQ currently does nothing. A simple
-   tick counter would enable sleep/timeout primitives for the async executor.
+3. **Process / scheduling** — the async executor is cooperative. A preemptive
+   scheduler on top of the timer interrupt would be the natural next step.
 
-4. **Process / scheduling** — the async executor is a cooperative multitasking
-   primitive. A preemptive scheduler on top of the timer interrupt would be the
-   natural next step.
-
-5. **Filesystem / block device** — QEMU's `virtio-blk` or an ATA PIO driver
+4. **Filesystem / block device** — QEMU's `virtio-blk` or an ATA PIO driver
    would enable persistent storage.
+
+5. **Heap growth** — a demand-paged heap that grows on fault rather than a
+   fixed 100 KiB allocation.
