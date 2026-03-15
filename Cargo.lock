@@ -117,6 +117,7 @@ name = "devices"
 version = "0.1.0"
 dependencies = [
  "lazy_static",
+ "libkernel",
  "log",
  "spin 0.9.8",
  "x86_64 0.15.4",

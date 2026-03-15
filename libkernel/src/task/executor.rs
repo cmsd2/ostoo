@@ -1,5 +1,5 @@
 use super::{Task, TaskId};
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
 use alloc::task::Wake;
 use core::task::Waker;
@@ -37,6 +37,27 @@ lazy_static! {
 // Deallocation only happens from executor context (Poll::Ready cleanup), which
 // is always safe.
 static WAKER_CACHE: Mutex<BTreeMap<TaskId, Waker>> = Mutex::new(BTreeMap::new());
+
+// Task IDs whose wakeup signal was consumed by wake_tasks() while the task was
+// "in flight" (popped from TASK_QUEUE, currently being polled, not yet in
+// WAIT_MAP).  Checked immediately after WAIT_MAP.insert so the task is
+// re-queued without ever sleeping.
+//
+// Why this is needed (two-thread executor race):
+//
+//   Thread 0: task.poll() returns Poll::Pending
+//   ← LAPIC fires → tick() pushes task_id to WAKE_QUEUE; preempts to Thread 1
+//   Thread 1: wake_tasks() pops task_id — not in WAIT_MAP → signal gone
+//   Thread 0 resumes: WAIT_MAP.insert(task_id) — no pending wake, task stuck
+//
+// The original single-thread fix (wake_tasks after insert) only catches wakeups
+// from on-core interrupts that fire after the insert.  It cannot catch the case
+// above where Thread 1 consumed the signal before Thread 0 reached the insert.
+//
+// Locking WAIT_MAP across poll() would fix the race but deadlocks any task body
+// that calls wait_count() (which also locks WAIT_MAP).  DEFERRED_WAKES avoids
+// holding any lock during poll().
+static DEFERRED_WAKES: Mutex<BTreeSet<TaskId>> = Mutex::new(BTreeSet::new());
 
 /// Enqueue a new task.  Safe to call from any kernel thread.
 pub fn spawn(task: Task) {
@@ -92,21 +113,29 @@ fn run_ready_tasks() {
         let mut context = Context::from_waker(&waker);
         match task.poll(&mut context) {
             Poll::Ready(()) => {
-                // Task done: remove the cached waker so the Arc can be freed.
+                // Task done: remove cached waker and any deferred wake entry.
                 WAKER_CACHE.lock().remove(&task_id);
+                DEFERRED_WAKES.lock().remove(&task_id);
             }
             Poll::Pending => {
-                let mut wait_map = WAIT_MAP.lock();
-                if wait_map.insert(task_id, task).is_some() {
-                    panic!("task with same ID already in waiting_tasks");
+                WAIT_MAP.lock().insert(task_id, task);
+
+                // Case 1 — on-core interrupt: a timer tick may have fired
+                // between poll() returning Pending and the insert above.
+                // wake_tasks() will drain the WAKE_QUEUE and re-queue the task.
+                //
+                // Case 2 — cross-thread race: the LAPIC may have fired tick()
+                // AND preempted to Thread 1, which ran wake_tasks() and
+                // consumed this task's ID from WAKE_QUEUE before the insert.
+                // That path records the task_id in DEFERRED_WAKES; we handle
+                // it here by immediately moving the task back to TASK_QUEUE.
+                if DEFERRED_WAKES.lock().remove(&task_id) {
+                    if let Some(t) = WAIT_MAP.lock().remove(&task_id) {
+                        TASK_QUEUE.lock().push_back(t);
+                    }
+                } else {
+                    wake_tasks();
                 }
-                drop(wait_map);
-                // A timer tick may have fired between poll() returning Pending
-                // and the insert above, pushing this task's ID to WAKE_QUEUE
-                // while it wasn't yet visible in WAIT_MAP.  wake_tasks() would
-                // have silently dropped that signal.  Drain the queue now so
-                // the task is immediately re-queued if that happened.
-                wake_tasks();
             }
         }
     }
@@ -122,6 +151,22 @@ fn wake_tasks() {
         if let Some(task) = wait_map.remove(&task_id) {
             drop(wait_map); // release before locking TASK_QUEUE
             TASK_QUEUE.lock().push_back(task);
+        } else {
+            drop(wait_map);
+            // Task is not in WAIT_MAP: it is either in TASK_QUEUE, currently
+            // in-flight (being polled by another thread), or completed.
+            //
+            // If in-flight, the waker has been consumed from timer::WAKERS so
+            // no future tick will re-wake the task.  Record a deferred wake;
+            // run_ready_tasks() checks this set after WAIT_MAP.insert and
+            // immediately re-queues if found.
+            //
+            // We distinguish "in-flight / queued" (still in WAKER_CACHE) from
+            // "completed" (removed from WAKER_CACHE on Poll::Ready) to avoid
+            // leaking entries for finished tasks.
+            if WAKER_CACHE.lock().contains_key(&task_id) {
+                DEFERRED_WAKES.lock().insert(task_id);
+            }
         }
     }
 }

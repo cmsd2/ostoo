@@ -117,6 +117,10 @@ fn run_command(line: &str) {
             println!("  ioapic            IO APIC redirection table");
             println!("  idt               IDT vector assignments");
             println!("  pci               list PCI devices");
+            println!("  drivers           list registered device drivers");
+            println!("  driver start <n>  start a driver by name");
+            println!("  driver stop <n>   stop a driver by name");
+            println!("  driver info <n>   show driver state and details");
         }
         "clear" => {
             libkernel::vga_buffer::clear_content();
@@ -149,7 +153,9 @@ fn run_command(line: &str) {
         "lapic" => cmd_lapic(),
         "ioapic" => cmd_ioapic(),
         "idt" => cmd_idt(),
-        "pci" => cmd_pci(),
+        "pci"     => cmd_pci(),
+        "drivers" => cmd_drivers(),
+        "driver"  => cmd_driver(rest),
         other => {
             println!("unknown command: '{}'  (try 'help')", other);
         }
@@ -561,5 +567,61 @@ fn cmd_pci() {
             d.vendor_id, d.device_id, d.revision,
             d.class, d.subclass,
             devices::pci::class_name(d.class, d.subclass));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// drivers — list registered device drivers
+
+fn cmd_drivers() {
+    println!("Drivers:");
+    println!("  {:<16}  State", "Name");
+    devices::driver::with_drivers(|name, state| {
+        println!("  {:16}  {:?}", name, state);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// driver — manage a driver lifecycle
+
+fn cmd_driver(rest: &str) {
+    let (subcmd, name) = match rest.find(' ') {
+        Some(i) => (rest[..i].trim(), rest[i + 1..].trim()),
+        None    => (rest.trim(), ""),
+    };
+    match subcmd {
+        "start" => {
+            if name.is_empty() {
+                println!("usage: driver start <name>");
+            } else {
+                match devices::driver::start_driver(name) {
+                    Ok(())   => println!("driver '{}' started", name),
+                    Err(msg) => println!("error: {}", msg),
+                }
+            }
+        }
+        "stop" => {
+            if name.is_empty() {
+                println!("usage: driver stop <name>");
+            } else {
+                match devices::driver::stop_driver(name) {
+                    Ok(())   => println!("driver '{}' stop requested", name),
+                    Err(msg) => println!("error: {}", msg),
+                }
+            }
+        }
+        "info" => {
+            if name.is_empty() {
+                println!("usage: driver info <name>");
+            } else {
+                match devices::driver::with_driver_info(name, |k, v| {
+                    println!("  {:<20}  {}", k, v);
+                }) {
+                    Ok(())   => {}
+                    Err(msg) => println!("error: {}", msg),
+                }
+            }
+        }
+        _ => println!("usage: driver <start|stop|info> <name>"),
     }
 }

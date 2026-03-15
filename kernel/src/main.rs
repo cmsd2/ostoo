@@ -105,6 +105,7 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     }
 
     devices::pci::init();
+    devices::driver::register(Box::new(devices::dummy::DummyDriver::new(devices::dummy::Dummy)));
 
     #[cfg(test)]
     test_main();
