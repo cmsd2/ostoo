@@ -152,7 +152,7 @@ async fn async_number() -> u32 {
 
 async fn example_task() {
     let number = async_number().await;
-    println!("async number: {}", number);
+    info!("async number: {}", number);
 }
 
 async fn timer_task() {
