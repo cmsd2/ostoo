@@ -100,6 +100,13 @@ fn run_ready_tasks() {
                 if wait_map.insert(task_id, task).is_some() {
                     panic!("task with same ID already in waiting_tasks");
                 }
+                drop(wait_map);
+                // A timer tick may have fired between poll() returning Pending
+                // and the insert above, pushing this task's ID to WAKE_QUEUE
+                // while it wasn't yet visible in WAIT_MAP.  wake_tasks() would
+                // have silently dropped that signal.  Drain the queue now so
+                // the task is immediately re-queued if that happened.
+                wake_tasks();
             }
         }
     }
