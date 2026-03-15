@@ -58,10 +58,10 @@ by the second check or will wake the (now-registered) waker.
 
 ```rust
 // Actor receives:
-ActorMsg::Info(reply) => reply.send(ActorInfo { name: "dummy" }),
+ActorMsg::Info(reply) => reply.send(ActorStatus { name: "dummy", running: true, info: () }),
 
 // Sender awaits:
-let info: Option<ActorInfo> = inbox.ask(ActorMsg::Info).await;
+let status: Option<ActorStatus<()>> = inbox.ask(|r| ActorMsg::Info(r)).await;
 ```
 
 `Reply::new()` returns `(Reply<T>, Arc<Mailbox<T>>)`.  The actor calls
@@ -73,20 +73,38 @@ the inner mailbox regardless, so the receiver always unblocks:
 - **`reply` dropped without send** → `close()` called on an empty mailbox →
   `recv()` returns `None`.
 
-### `ActorMsg<M>` — the envelope type
+### `ActorMsg<M, I>` — the envelope type
 
-Every actor mailbox is `Mailbox<ActorMsg<M>>` where `M` is the actor-specific
-message type.
+Every actor mailbox is `Mailbox<ActorMsg<M, I>>` where `M` is the actor-specific
+message type and `I` is the actor-specific info detail type (defaults to `()`).
 
 ```rust
-pub enum ActorMsg<M> {
-    Info(Reply<ActorInfo>),   // generic, handled by every actor
-    Inner(M),                  // actor-specific
+pub enum ActorMsg<M, I: Send = ()> {
+    /// Typed info request — reply carries ActorStatus<I> with the full detail.
+    Info(Reply<ActorStatus<I>>),
+    /// Type-erased info request from the process registry — reply carries
+    /// ActorStatus<ErasedInfo> so callers can display detail without knowing I.
+    ErasedInfo(Reply<ActorStatus<ErasedInfo>>),
+    /// An actor-specific message.
+    Inner(M),
 }
 ```
 
-`ActorMsg::Info` is answered uniformly: every actor replies with
-`ActorInfo { name }`.  Actor-specific messages travel as `ActorMsg::Inner(m)`.
+`ActorStatus<I>` is the response to both info variants:
+
+```rust
+pub struct ActorStatus<I = ()> {
+    pub name:    &'static str,
+    pub running: bool,   // always true when the actor is responding
+    pub info:    I,      // actor-specific detail
+}
+```
+
+`ErasedInfo` is a type alias for the boxed detail used in type-erased queries:
+
+```rust
+pub type ErasedInfo = Box<dyn core::fmt::Debug + Send>;
+```
 
 ### `ask` — the request/response pattern
 
@@ -100,6 +118,11 @@ response.  Because a closed mailbox drops incoming messages (and their
 `Reply`s), `ask` on a stopped actor returns `None` immediately rather than
 hanging.
 
+**Self-query deadlock**: an actor must never use `ask` (or `registry::ask_info`)
+to query its own mailbox from within a message handler — it cannot `recv()` the
+response while blocked executing the current message.  Detect self-queries by
+comparing names and respond directly instead.
+
 ---
 
 ## Driver Lifecycle — `devices::task_driver`
@@ -109,14 +132,18 @@ hanging.
 ```rust
 pub trait DriverTask: Send + Sync + 'static {
     type Message: Send;
+    type Info:    Send + 'static;
     fn name(&self) -> &'static str;
     fn run(
         handle: Arc<Self>,
         stop:   StopToken,
-        inbox:  Arc<Mailbox<ActorMsg<Self::Message>>>,
+        inbox:  Arc<Mailbox<ActorMsg<Self::Message, Self::Info>>>,
     ) -> impl Future<Output = ()> + Send;
 }
 ```
+
+`type Info` is the actor-specific detail returned by `#[on_info]`.  Use `()`
+if the actor has no custom info.
 
 The `run` future is `'static` because all state is accessed through `Arc<Self>`.
 `StopToken` can be polled between messages for cooperative stop, though most
@@ -132,7 +159,7 @@ is closed by `stop()`).
 | `task` | `Arc<T>` | actor state, shared with the run future |
 | `running` | `Arc<AtomicBool>` | set true on start, false when run exits |
 | `stop_flag` | `Arc<AtomicBool>` | `StopToken` reads this |
-| `inbox` | `Arc<Mailbox<ActorMsg<T::Message>>>` | message channel |
+| `inbox` | `Arc<Mailbox<ActorMsg<T::Message, T::Info>>>` | message channel |
 
 **Lifecycle:**
 
@@ -153,7 +180,7 @@ stop()
   running = false
 ```
 
-`TaskDriver::new` returns `(TaskDriver<T>, Arc<Mailbox<ActorMsg<T::Message>>>)`.
+`TaskDriver::new` returns `(TaskDriver<T>, Arc<Mailbox<ActorMsg<T::Message, T::Info>>>)`.
 The caller holds onto the `Arc<Mailbox>` to send actor-specific messages and
 registers it in the process registry (see below).
 
@@ -165,17 +192,29 @@ The macro generates a complete `DriverTask` implementation from an annotated
 `impl` block, eliminating the run-loop boilerplate.
 
 ```rust
+#[derive(Debug)]
+pub struct DummyInfo {
+    pub interval_secs: u64,
+}
+
 pub enum DummyMsg {
     SetInterval(u64),
 }
 
-pub struct Dummy;
+pub struct Dummy {
+    interval_secs: AtomicU64,
+}
 
 #[actor("dummy", DummyMsg)]
 impl Dummy {
+    #[on_info]
+    async fn on_info(&self) -> DummyInfo {
+        DummyInfo { interval_secs: self.interval_secs.load(Ordering::Relaxed) }
+    }
+
     #[on_message(SetInterval)]
     async fn set_interval(&self, secs: u64) {
-        info!("[dummy] interval set to {}s", secs);
+        self.interval_secs.store(secs, Ordering::Relaxed);
     }
 }
 ```
@@ -183,23 +222,32 @@ impl Dummy {
 The macro generates:
 
 ```rust
-// Inherent impl with the handler methods (stripped of #[on_message]):
+// Inherent impl with the handler methods (attributes stripped):
 impl Dummy {
+    async fn on_info(&self) -> DummyInfo { ... }
     async fn set_interval(&self, secs: u64) { ... }
 }
 
 // DriverTask impl with the generated run loop:
 impl DriverTask for Dummy {
     type Message = DummyMsg;
+    type Info    = DummyInfo;
     fn name(&self) -> &'static str { "dummy" }
 
     async fn run(handle: Arc<Self>, _stop: StopToken,
-                 inbox: Arc<Mailbox<ActorMsg<DummyMsg>>>) {
+                 inbox: Arc<Mailbox<ActorMsg<DummyMsg, DummyInfo>>>) {
         log::info!("[dummy] started");
         while let Some(msg) = inbox.recv().await {
             match msg {
                 ActorMsg::Info(reply) => {
-                    reply.send(ActorInfo { name: "dummy" });
+                    reply.send(ActorStatus {
+                        name: "dummy", running: true,
+                        info: handle.on_info().await,
+                    });
+                }
+                ActorMsg::ErasedInfo(reply) => {
+                    let info: Box<dyn Debug + Send> = Box::new(handle.on_info().await);
+                    reply.send(ActorStatus { name: "dummy", running: true, info });
                 }
                 ActorMsg::Inner(msg) => match msg {
                     DummyMsg::SetInterval(secs) => handle.set_interval(secs).await,
@@ -214,8 +262,22 @@ impl DriverTask for Dummy {
 pub type DummyDriver = TaskDriver<Dummy>;
 ```
 
-`ActorMsg::Info` is always handled automatically — actor authors only write
-handlers for their own `Inner` variants.
+### `#[on_info]` — custom actor info
+
+Without `#[on_info]`, the generated `Info` and `ErasedInfo` arms respond with
+`info: ()`.  Annotate one method with `#[on_info]` to provide actor-specific
+detail:
+
+```rust
+#[on_info]
+async fn on_info(&self) -> MyInfo {
+    MyInfo { /* fields populated from self */ }
+}
+```
+
+The return type must implement `Debug + Send` (for boxing into `ErasedInfo`).
+`#[derive(Debug)]` is sufficient.  The macro sets `type Info = MyInfo` and
+generates both arms automatically.
 
 ---
 
@@ -228,13 +290,14 @@ messages to a named actor without holding a direct reference.
 // Registration (at init time, in main.rs):
 registry::register("dummy", dummy_inbox.clone());
 
-// Typed lookup (when the caller knows the inner message type):
-let inbox: Arc<Mailbox<ActorMsg<DummyMsg>>> = registry::get::<DummyMsg>("dummy")?;
+// Typed lookup (when the caller knows both message and info types):
+let inbox: Arc<Mailbox<ActorMsg<DummyMsg, DummyInfo>>> =
+    registry::get::<DummyMsg, DummyInfo>("dummy")?;
 inbox.send(ActorMsg::Inner(DummyMsg::SetInterval(5)));
 
-// Generic info query (no knowledge of inner type needed):
-if let Some(info) = registry::ask_info("dummy").await {
-    println!("actor name: {}", info.name);
+// Type-erased info query (no knowledge of M or I needed):
+if let Some(status) = registry::ask_info("dummy").await {
+    println!("name: {}  running: {}  info: {:?}", status.name, status.running, status.info);
 }
 ```
 
@@ -242,17 +305,21 @@ Each registry entry stores two representations of the same mailbox:
 
 | Field | Type | Used for |
 |---|---|---|
-| `mailbox` | `Arc<dyn Any + Send + Sync>` | typed downcast via `get<M>` |
-| `informable` | `Arc<dyn Informable>` | generic `Info` query via `ask_info` |
+| `mailbox` | `Arc<dyn Any + Send + Sync>` | typed downcast via `get<M, I>` |
+| `informable` | `Arc<dyn Informable>` | type-erased `ErasedInfo` query via `ask_info` |
 
 `Informable` is a simple object-safe trait:
 
 ```rust
 pub trait Informable: Send + Sync {
-    fn send_info(&self, reply: Reply<ActorInfo>);
+    fn send_info(&self, reply: Reply<ActorStatus<ErasedInfo>>);
 }
 // Blanket impl for all actor mailboxes:
-impl<M: Send> Informable for Mailbox<ActorMsg<M>> { ... }
+impl<M: Send, I: Send + 'static> Informable for Mailbox<ActorMsg<M, I>> {
+    fn send_info(&self, reply: Reply<ActorStatus<ErasedInfo>>) {
+        self.send(ActorMsg::ErasedInfo(reply));
+    }
+}
 ```
 
 `ask_info` clones the `Arc<dyn Informable>` while holding the registry lock,
@@ -278,7 +345,8 @@ keyboard_task (free async fn)
                           ↓
 Shell actor (DriverTask)
   inbox.recv().await
-  ActorMsg::Info(reply)              → reply.send(ActorInfo { name: "shell" })
+  ActorMsg::Info(reply)              → reply.send(ActorStatus { name: "shell", ... })
+  ActorMsg::ErasedInfo(reply)        → reply.send(ActorStatus { name: "shell", ... })
   ActorMsg::Inner(KeyLine(line, r))  → execute_command(&line).await
                                        r dropped on return
                                        → keyboard_task's ask().await unblocks
@@ -303,6 +371,26 @@ When the shell actor is stopped (`inbox.close()`), the keyboard task's next
 `ask`).  The keyboard task continues running and buffering characters; it will
 simply not dispatch commands until the shell actor is restarted.
 
+### Self-query avoidance
+
+The `driver info shell` command would normally call `registry::ask_info("shell")`,
+which sends `ErasedInfo` to the shell's own mailbox.  But the shell cannot
+`recv()` that message while it is blocked executing the command — deadlock.
+
+The shell detects this by comparing the requested name against `self.name()` and
+responds directly without going through the registry:
+
+```rust
+} else if name == self.name() {
+    // Respond directly — querying our own mailbox would deadlock.
+    println!("  name:    {}", self.name());
+    println!("  running: true");
+}
+```
+
+Any actor that exposes a command interface and may be asked about itself must
+apply the same pattern.
+
 ---
 
 ## Startup Sequence
@@ -311,7 +399,7 @@ simply not dispatch commands until the shell actor is restarted.
 // main.rs (abridged)
 
 // Dummy driver
-let (dummy_driver, dummy_inbox) = DummyDriver::new(Dummy);
+let (dummy_driver, dummy_inbox) = DummyDriver::new(Dummy::new());
 devices::driver::register(Box::new(dummy_driver));
 registry::register("dummy", dummy_inbox);         // mailbox starts closed
 
@@ -334,10 +422,10 @@ mailbox and spawns its run loop.
 
 | Path | Role |
 |---|---|
-| `libkernel/src/task/mailbox.rs` | `Mailbox<M>`, `Reply<T>`, `ActorMsg<M>`, `ActorInfo` |
+| `libkernel/src/task/mailbox.rs` | `Mailbox<M>`, `Reply<T>`, `ActorMsg<M,I>`, `ActorStatus<I>`, `ErasedInfo` |
 | `libkernel/src/task/registry.rs` | process registry, `Informable`, `ask_info` |
 | `devices/src/task_driver.rs` | `DriverTask` trait, `TaskDriver<T>`, `StopToken` |
 | `devices/src/driver.rs` | `Driver` trait, driver registry (`start/stop/list`) |
-| `devices-macros/src/lib.rs` | `#[actor]` and `#[on_message]` proc macros |
-| `devices/src/dummy.rs` | example `#[actor]`-generated driver |
+| `devices-macros/src/lib.rs` | `#[actor]`, `#[on_message]`, `#[on_info]` proc macros |
+| `devices/src/dummy.rs` | example `#[actor]`-generated driver with `#[on_info]` |
 | `kernel/src/shell.rs` | manually-implemented actor + `keyboard_task` |
