@@ -1,5 +1,7 @@
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use core::fmt;
 use core::future::Future;
 use futures_util::task::AtomicWaker;
 use core::pin::Pin;
@@ -9,19 +11,37 @@ use spin::Mutex;
 // ---------------------------------------------------------------------------
 // ActorMsg — generic envelope for all actor mailboxes
 
-/// Generic response to an [`ActorMsg::Info`] request.
-pub struct ActorInfo {
+/// Response to an [`ActorMsg::Info`] or [`ActorMsg::ErasedInfo`] request.
+///
+/// `I` is the actor-specific detail type returned by `#[on_info]`.  For
+/// type-erased registry queries ([`ActorMsg::ErasedInfo`]) `I` is `()`.
+pub struct ActorStatus<I = ()> {
+    /// Static name registered with the driver framework.
     pub name: &'static str,
+    /// Always `true` when returned — the actor is running if it responds.
+    pub running: bool,
+    /// Actor-specific detail, populated by `#[on_info]`.
+    pub info: I,
 }
 
 /// Envelope type for actor mailboxes.
 ///
-/// Every actor's `Mailbox` is parameterised over `ActorMsg<M>` where `M` is
-/// the actor-specific message type.  The `Info` variant is handled uniformly
-/// by the driver framework; `Inner(m)` carries actor-specific messages.
-pub enum ActorMsg<M> {
-    /// Request generic actor info; the framework responds automatically.
-    Info(Reply<ActorInfo>),
+/// Every actor's `Mailbox` is parameterised over `ActorMsg<M, I>` where `M`
+/// is the actor-specific message type and `I` is the info detail type.
+/// Type alias for the erased info carried by [`ActorMsg::ErasedInfo`].
+///
+/// Any concrete info type that implements [`fmt::Display`] can be boxed into
+/// this type, preserving displayability without exposing the concrete type to
+/// callers that don't know the actor's `Info` type.
+pub type ErasedInfo = Box<dyn fmt::Debug + Send>;
+
+pub enum ActorMsg<M, I: Send = ()> {
+    /// Typed info request — reply carries the full [`ActorStatus<I>`].
+    Info(Reply<ActorStatus<I>>),
+    /// Type-erased info request used by the process registry — reply carries
+    /// [`ActorStatus<ErasedInfo>`] so callers can display the detail without
+    /// knowing the concrete info type.
+    ErasedInfo(Reply<ActorStatus<ErasedInfo>>),
     /// An actor-specific message.
     Inner(M),
 }

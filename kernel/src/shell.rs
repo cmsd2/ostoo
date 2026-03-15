@@ -6,7 +6,7 @@ use core::future::Future;
 use futures_util::stream::StreamExt;
 use libkernel::task::keyboard::{Key, KeyStream};
 use libkernel::task::{executor, scheduler, timer};
-use libkernel::task::mailbox::{ActorInfo, ActorMsg, Mailbox, Reply};
+use libkernel::task::mailbox::{ActorMsg, ActorStatus, ErasedInfo, Mailbox, Reply};
 use libkernel::task::registry;
 use libkernel::{print, println};
 use devices::task_driver::{DriverTask, StopToken};
@@ -35,13 +35,14 @@ pub type ShellDriver = devices::task_driver::TaskDriver<Shell>;
 
 impl DriverTask for Shell {
     type Message = ShellMsg;
+    type Info    = ();
 
     fn name(&self) -> &'static str { "shell" }
 
     fn run(
         handle: Arc<Self>,
         _stop:  StopToken,
-        inbox:  Arc<Mailbox<ActorMsg<ShellMsg>>>,
+        inbox:  Arc<Mailbox<ActorMsg<ShellMsg, ()>>>,
     ) -> impl Future<Output = ()> + Send
     where Self: Sized {
         async move {
@@ -49,7 +50,13 @@ impl DriverTask for Shell {
             while let Some(msg) = inbox.recv().await {
                 match msg {
                     ActorMsg::Info(reply) => {
-                        reply.send(ActorInfo { name: "shell" });
+                        reply.send(ActorStatus { name: "shell", running: true, info: () });
+                    }
+                    ActorMsg::ErasedInfo(reply) => {
+                        reply.send(ActorStatus {
+                            name: "shell", running: true,
+                            info: alloc::boxed::Box::new(()) as ErasedInfo,
+                        });
                     }
                     ActorMsg::Inner(ShellMsg::KeyLine(line, _reply)) => {
                         handle.execute_command(&line).await;
@@ -182,8 +189,12 @@ impl Shell {
                     println!("usage: driver info <name>");
                 } else {
                     match registry::ask_info(name).await {
-                        Some(info) => println!("  name: {}", info.name),
-                        None       => println!("error: '{}' not found or not responding", name),
+                        Some(s) => {
+                            println!("  name:    {}", s.name);
+                            println!("  running: {}", s.running);
+                            println!("  info:    {:?}", s.info);
+                        }
+                        None => println!("error: '{}' not found or not responding", name),
                     }
                 }
             }

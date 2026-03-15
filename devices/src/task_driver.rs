@@ -21,19 +21,20 @@ impl StopToken {
 /// `run` is a static method (not `&self`) so the future can be `'static`:
 /// the driver's own state is reachable via the `Arc<Self>` handle.
 ///
-/// `Message` is the actor-specific inner message type.  The mailbox is
-/// parameterised over [`ActorMsg<Self::Message>`], which adds the generic
-/// `Info` variant handled by the framework.  Use `()` if the driver does not
-/// need actor-specific runtime messages.
+/// `Message` is the actor-specific inner message type.  `Info` is the
+/// actor-specific detail type returned by the `#[on_info]` handler (use `()`
+/// if the driver has no custom info).  The mailbox is parameterised over
+/// [`ActorMsg<Self::Message, Self::Info>`].
 pub trait DriverTask: Send + Sync + 'static {
     type Message: Send;
+    type Info: Send + 'static;
 
     fn name(&self) -> &'static str;
 
     fn run(
         handle: Arc<Self>,
         stop:   StopToken,
-        inbox:  Arc<Mailbox<ActorMsg<Self::Message>>>,
+        inbox:  Arc<Mailbox<ActorMsg<Self::Message, Self::Info>>>,
     ) -> impl Future<Output = ()> + Send
     where Self: Sized;
 }
@@ -44,23 +45,23 @@ pub trait DriverTask: Send + Sync + 'static {
 /// an `Arc`, and the driver's [`Mailbox`].
 ///
 /// Construct with [`TaskDriver::new`], which returns `(TaskDriver<T>,
-/// Arc<Mailbox<ActorMsg<T::Message>>>)`.  Hold onto the `Arc<Mailbox>` to
-/// send typed messages to the running driver task.
+/// Arc<Mailbox<ActorMsg<T::Message, T::Info>>>)`.  Hold onto the `Arc<Mailbox>`
+/// to send typed messages to the running driver task.
 pub struct TaskDriver<T: DriverTask> {
     task:      Arc<T>,
     running:   Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
-    inbox:     Arc<Mailbox<ActorMsg<T::Message>>>,
+    inbox:     Arc<Mailbox<ActorMsg<T::Message, T::Info>>>,
 }
 
 impl<T: DriverTask> TaskDriver<T> {
     /// Create a new driver and return both the driver and a sender handle.
     ///
-    /// The caller should keep the `Arc<Mailbox<ActorMsg<T::Message>>>` to send
-    /// messages to the driver once it is started.  The `Driver` registry only
-    /// holds the lifecycle-level `Box<dyn Driver>`; typed messaging stays
-    /// out-of-band.
-    pub fn new(task: T) -> (Self, Arc<Mailbox<ActorMsg<T::Message>>>) {
+    /// The caller should keep the `Arc<Mailbox<ActorMsg<T::Message, T::Info>>>`
+    /// to send messages to the driver once it is started.  The `Driver`
+    /// registry only holds the lifecycle-level `Box<dyn Driver>`; typed
+    /// messaging stays out-of-band.
+    pub fn new(task: T) -> (Self, Arc<Mailbox<ActorMsg<T::Message, T::Info>>>) {
         let inbox = Mailbox::new(16);
         inbox.close(); // starts closed; opened by start() via reopen()
         let driver = TaskDriver {

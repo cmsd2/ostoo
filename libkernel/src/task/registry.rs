@@ -4,14 +4,14 @@
 //! ```ignore
 //! registry::register("dummy", dummy_inbox.clone());
 //! ```
-//! Any code that knows the message type can retrieve it:
+//! Any code that knows the message and info types can retrieve it:
 //! ```ignore
-//! let inbox = registry::get::<DummyMsg>("dummy"); // Option<Arc<Mailbox<ActorMsg<DummyMsg>>>>
+//! let inbox = registry::get::<DummyMsg, DummyInfo>("dummy");
 //! ```
 //! For generic info queries (no inner message type needed):
 //! ```ignore
-//! if let Some(info) = registry::ask_info("dummy").await {
-//!     println!("name: {}", info.name);
+//! if let Some(status) = registry::ask_info("dummy").await {
+//!     println!("name: {}  running: {}", status.name, status.running);
 //! }
 //! ```
 
@@ -20,20 +20,20 @@ use alloc::vec::Vec;
 use core::any::Any;
 use spin::Mutex;
 use lazy_static::lazy_static;
-use super::mailbox::{ActorInfo, ActorMsg, Mailbox, Reply};
+use super::mailbox::{ActorMsg, ActorStatus, ErasedInfo, Mailbox, Reply};
 
 // ---------------------------------------------------------------------------
-// Informable — type-erased handle for generic Info queries
+// Informable — type-erased handle for generic ErasedInfo queries
 
-/// Implemented by any `Mailbox<ActorMsg<M>>` so that the registry can forward
-/// `Info` queries without knowing `M`.
+/// Implemented by any `Mailbox<ActorMsg<M, I>>` so that the registry can
+/// forward type-erased `ErasedInfo` queries without knowing `M` or `I`.
 pub trait Informable: Send + Sync {
-    fn send_info(&self, reply: Reply<ActorInfo>);
+    fn send_info(&self, reply: Reply<ActorStatus<ErasedInfo>>);
 }
 
-impl<M: Send> Informable for Mailbox<ActorMsg<M>> {
-    fn send_info(&self, reply: Reply<ActorInfo>) {
-        self.send(ActorMsg::Info(reply));
+impl<M: Send, I: Send + 'static> Informable for Mailbox<ActorMsg<M, I>> {
+    fn send_info(&self, reply: Reply<ActorStatus<ErasedInfo>>) {
+        self.send(ActorMsg::ErasedInfo(reply));
     }
 }
 
@@ -42,9 +42,9 @@ impl<M: Send> Informable for Mailbox<ActorMsg<M>> {
 
 struct Entry {
     name:       &'static str,
-    /// Type-erased `Arc<Mailbox<ActorMsg<M>>>` for typed downcasting.
+    /// Type-erased `Arc<Mailbox<ActorMsg<M, I>>>` for typed downcasting.
     mailbox:    Arc<dyn Any + Send + Sync>,
-    /// Type-erased handle for sending `Info` without knowing `M`.
+    /// Type-erased handle for sending `ErasedInfo` without knowing `M` or `I`.
     informable: Arc<dyn Informable>,
 }
 
@@ -59,7 +59,10 @@ lazy_static! {
 ///
 /// If an entry already exists for that name it is replaced, so callers can
 /// re-register after a driver restart.
-pub fn register<M: Send + 'static>(name: &'static str, inbox: Arc<Mailbox<ActorMsg<M>>>) {
+pub fn register<M: Send + 'static, I: Send + 'static>(
+    name: &'static str,
+    inbox: Arc<Mailbox<ActorMsg<M, I>>>,
+) {
     let mailbox:    Arc<dyn Any + Send + Sync> = inbox.clone();
     let informable: Arc<dyn Informable>        = inbox;
     let mut reg = REGISTRY.lock();
@@ -73,21 +76,23 @@ pub fn register<M: Send + 'static>(name: &'static str, inbox: Arc<Mailbox<ActorM
 
 /// Look up the typed mailbox registered under `name`.
 ///
-/// Returns `None` if no entry exists or the stored inner message type does
-/// not match `M`.
-pub fn get<M: Send + 'static>(name: &str) -> Option<Arc<Mailbox<ActorMsg<M>>>> {
+/// Returns `None` if no entry exists or the stored type does not match
+/// `(M, I)`.
+pub fn get<M: Send + 'static, I: Send + 'static>(
+    name: &str,
+) -> Option<Arc<Mailbox<ActorMsg<M, I>>>> {
     let reg = REGISTRY.lock();
     reg.iter()
         .find(|e| e.name == name)
-        .and_then(|e| e.mailbox.clone().downcast::<Mailbox<ActorMsg<M>>>().ok())
+        .and_then(|e| e.mailbox.clone().downcast::<Mailbox<ActorMsg<M, I>>>().ok())
 }
 
-/// Send a generic `Info` query to the actor registered under `name` and await
-/// the response.
+/// Send a type-erased `ErasedInfo` query to the actor registered under `name`
+/// and await the response.
 ///
 /// Returns `None` if no entry exists for the name, or if the actor dropped the
 /// reply without responding (e.g. it was stopped mid-flight).
-pub async fn ask_info(name: &str) -> Option<ActorInfo> {
+pub async fn ask_info(name: &str) -> Option<ActorStatus<ErasedInfo>> {
     // Clone the trait object while holding the lock, then drop the lock before
     // awaiting so we don't hold a mutex across an await point.
     let informable = {

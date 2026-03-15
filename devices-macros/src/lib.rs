@@ -25,6 +25,29 @@ pub fn on_message(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
+/// Override the default `ActorMsg::Info` handler inside an [`actor`] impl block.
+///
+/// Without this attribute every actor responds to `Info` with
+/// `ActorInfo { name }` automatically.  Annotate one method with `#[on_info]`
+/// to supply custom behaviour instead:
+///
+/// ```ignore
+/// #[on_info]
+/// async fn on_info(&self) -> MyInfo {
+///     MyInfo { /* actor-specific fields */ }
+/// }
+/// ```
+///
+/// The method takes no arguments beyond `&self` and returns an actor-specific
+/// info struct (which must implement [`core::fmt::Debug`] so it can be boxed
+/// into [`ErasedInfo`] for type-erased registry queries).
+/// The macro generates the `reply.send(...)` call automatically.
+/// This attribute has no effect when used outside an `#[actor]` block.
+#[proc_macro_attribute]
+pub fn on_info(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
 // ---------------------------------------------------------------------------
 // #[actor] — the main actor macro.
 
@@ -55,8 +78,10 @@ impl Parse for ActorArgs {
 ///
 /// # The generated `run` loop
 /// Calls `inbox.recv().await` in a loop and dispatches each message:
-/// - `ActorMsg::Info(reply)` → replies with `ActorInfo { name }` automatically.
-/// - `ActorMsg::Inner(m)` → dispatches `m` to the corresponding handler.
+/// - `ActorMsg::Info(reply)` → replies with `ActorStatus { name, running: true, info }`;
+///   `info` is `()` by default, or the return value of the `#[on_info]` method.
+/// - `ActorMsg::ErasedInfo(reply)` → same but boxes `info` as `Box<dyn Debug + Send>`.
+/// - `ActorMsg::Inner(m)` → dispatches `m` to the corresponding `#[on_message]` handler.
 /// The loop exits when the inbox is closed (i.e. when [`Driver::stop`] is
 /// called on the owning [`TaskDriver`]).
 ///
@@ -106,15 +131,26 @@ fn actor_expand(
         _ => return Err(syn::Error::new_spanned(self_ty, "#[actor] requires a named type")),
     };
 
-    // Separate items: methods with #[on_message] become handlers; everything
-    // else stays in the DriverTask impl.
+    // Separate items: methods with #[on_message] become inner handlers;
+    // a method with #[on_info] overrides the Info arm; everything else stays
+    // in the DriverTask impl.
     let mut handler_methods: Vec<HandlerMethod> = Vec::new();
-    let mut trait_items:     Vec<&ImplItem>     = Vec::new();
+    let mut info_override:   Option<InfoOverride> = None;
+    let mut trait_items:     Vec<&ImplItem>       = Vec::new();
 
     for item in &input.items {
         if let ImplItem::Fn(method) = item {
             if let Some(variant) = on_message_variant(method)? {
                 handler_methods.push(HandlerMethod::new(method, variant)?);
+                continue;
+            }
+            if has_on_info(method) {
+                if info_override.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        method, "only one #[on_info] method is allowed per actor",
+                    ));
+                }
+                info_override = Some(InfoOverride::new(method)?);
                 continue;
             }
         }
@@ -136,8 +172,68 @@ fn actor_expand(
         }
     });
 
-    // Handler methods go into a plain inherent impl (not the trait impl).
-    let inherent_fns = handler_methods.iter().map(|h| &h.clean_method);
+    // Compute the Info detail type from the #[on_info] return type, or ().
+    let info_type: syn::Type = if let Some(ref ov) = info_override {
+        ov.info_type.clone()
+    } else {
+        syn::parse_quote! { () }
+    };
+
+    // Typed Info arm: returns ActorStatus<I> with the full detail.
+    let info_arm = if let Some(ref ov) = info_override {
+        let method_name = &ov.method_name;
+        quote! {
+            ::libkernel::task::mailbox::ActorMsg::Info(reply) => {
+                reply.send(::libkernel::task::mailbox::ActorStatus {
+                    name: #driver_name,
+                    running: true,
+                    info: handle.#method_name().await,
+                });
+            }
+        }
+    } else {
+        quote! {
+            ::libkernel::task::mailbox::ActorMsg::Info(reply) => {
+                reply.send(::libkernel::task::mailbox::ActorStatus {
+                    name: #driver_name,
+                    running: true,
+                    info: (),
+                });
+            }
+        }
+    };
+
+    // Type-erased ErasedInfo arm: boxes the info behind dyn Debug + Send.
+    // Actors with #[on_info] box their typed detail (requires Debug + Send).
+    // Actors without #[on_info] box () as a placeholder.
+    let erased_info_arm = if let Some(ref ov) = info_override {
+        let method_name = &ov.method_name;
+        quote! {
+            ::libkernel::task::mailbox::ActorMsg::ErasedInfo(reply) => {
+                let info: ::alloc::boxed::Box<dyn ::core::fmt::Debug + Send> =
+                    ::alloc::boxed::Box::new(handle.#method_name().await);
+                reply.send(::libkernel::task::mailbox::ActorStatus {
+                    name: #driver_name,
+                    running: true,
+                    info,
+                });
+            }
+        }
+    } else {
+        quote! {
+            ::libkernel::task::mailbox::ActorMsg::ErasedInfo(reply) => {
+                reply.send(::libkernel::task::mailbox::ActorStatus {
+                    name: #driver_name,
+                    running: true,
+                    info: ::alloc::boxed::Box::new(""),
+                });
+            }
+        }
+    };
+
+    // All extracted methods go into the inherent impl.
+    let inherent_fns = handler_methods.iter().map(|h| &h.clean_method)
+        .chain(info_override.iter().map(|ov| &ov.clean_method));
 
     let name_str = driver_name.value();
 
@@ -148,6 +244,7 @@ fn actor_expand(
 
         impl crate::task_driver::DriverTask for #self_ty {
             type Message = #msg_type;
+            type Info    = #info_type;
 
             fn name(&self) -> &'static str { #driver_name }
 
@@ -158,18 +255,15 @@ fn actor_expand(
                 _stop:  crate::task_driver::StopToken,
                 inbox:  ::alloc::sync::Arc<
                     ::libkernel::task::mailbox::Mailbox<
-                        ::libkernel::task::mailbox::ActorMsg<#msg_type>
+                        ::libkernel::task::mailbox::ActorMsg<#msg_type, #info_type>
                     >
                 >,
             ) {
                 ::log::info!("[{}] started", #name_str);
                 while let ::core::option::Option::Some(_msg) = inbox.recv().await {
                     match _msg {
-                        ::libkernel::task::mailbox::ActorMsg::Info(reply) => {
-                            reply.send(::libkernel::task::mailbox::ActorInfo {
-                                name: #driver_name,
-                            });
-                        }
+                        #info_arm
+                        #erased_info_arm
                         ::libkernel::task::mailbox::ActorMsg::Inner(_msg) => match _msg {
                             #(#inner_arms)*
                         }
@@ -228,4 +322,33 @@ fn on_message_variant(method: &ImplItemFn) -> syn::Result<Option<syn::Ident>> {
         }
     }
     Ok(None)
+}
+
+/// Return `true` if the method has `#[on_info]`.
+fn has_on_info(method: &ImplItemFn) -> bool {
+    method.attrs.iter().any(|a| a.path().is_ident("on_info"))
+}
+
+struct InfoOverride {
+    method_name:  syn::Ident,
+    clean_method: ImplItemFn,
+    info_type:    syn::Type,
+}
+
+impl InfoOverride {
+    fn new(method: &ImplItemFn) -> syn::Result<Self> {
+        let method_name = method.sig.ident.clone();
+        let info_type = match &method.sig.output {
+            syn::ReturnType::Type(_, ty) => *ty.clone(),
+            syn::ReturnType::Default => {
+                return Err(syn::Error::new_spanned(
+                    method,
+                    "#[on_info] method must return an info type, e.g. `-> MyInfo`",
+                ));
+            }
+        };
+        let mut clean = method.clone();
+        clean.attrs.retain(|a| !a.path().is_ident("on_info"));
+        Ok(InfoOverride { method_name, clean_method: clean, info_type })
+    }
 }

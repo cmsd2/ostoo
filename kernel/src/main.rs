@@ -106,7 +106,7 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
 
     devices::pci::init();
     let (dummy_driver, dummy_inbox) =
-        devices::dummy::DummyDriver::new(devices::dummy::Dummy);
+        devices::dummy::DummyDriver::new(devices::dummy::Dummy::new());
     devices::driver::register(Box::new(dummy_driver));
     libkernel::task::registry::register("dummy", dummy_inbox);
 
