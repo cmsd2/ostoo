@@ -1,3 +1,4 @@
+use spin::Mutex;
 use x86_64::{VirtAddr, PhysAddr};
 use x86_64::structures::paging::{
     Page,
@@ -16,6 +17,58 @@ pub mod vmem_allocator;
 pub use frame_allocator::BootInfoFrameAllocator;
 pub use vmem_allocator::VmemAllocator;
 pub use vmem_allocator::DumbVmemAllocator;
+
+// ---------------------------------------------------------------------------
+// Global memory services
+
+/// Combined mapper and frame allocator, accessible via [`with_memory`].
+///
+/// For libraries that require the two components separately (e.g. `apic::init`)
+/// destructure with `mem.mapper` / `mem.frame_allocator`.
+pub struct MemoryServices {
+    pub mapper: OffsetPageTable<'static>,
+    pub frame_allocator: BootInfoFrameAllocator,
+}
+
+impl MemoryServices {
+    /// Map a single 4 KiB page at `page` to the physical address `addr`.
+    pub fn map_page(&mut self, page: Page, addr: PhysAddr, flags: PageTableFlags) -> VirtAddr {
+        map_page(page, addr, &mut self.mapper, &mut self.frame_allocator, flags)
+    }
+}
+
+// Safety: OffsetPageTable contains raw pointers (*mut PageTable) which are
+// !Send by default.  Access is always serialised through the Mutex, and the
+// lock is never held across interrupt boundaries (see with_memory docs).
+unsafe impl Send for MemoryServices {}
+
+static MEMORY: Mutex<Option<MemoryServices>> = Mutex::new(None);
+
+/// Store the mapper and frame allocator in global state.
+///
+/// Call exactly once, after the heap is initialised and before any driver
+/// needs to map memory.
+pub fn init_services(
+    mapper: OffsetPageTable<'static>,
+    frame_allocator: BootInfoFrameAllocator,
+) {
+    let mut m = MEMORY.lock();
+    assert!(m.is_none(), "memory::init_services called more than once");
+    *m = Some(MemoryServices { mapper, frame_allocator });
+}
+
+/// Run `f` with exclusive access to the kernel memory services.
+///
+/// Must not be called from interrupt context — the lock is a plain spinlock
+/// and is not ISR-safe.
+pub fn with_memory<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut MemoryServices) -> R,
+{
+    let mut guard = MEMORY.lock();
+    let svc = guard.as_mut().expect("memory::init_services not yet called");
+    f(svc)
+}
 
 /// Initialize a new OffsetPageTable.
 ///

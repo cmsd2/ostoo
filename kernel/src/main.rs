@@ -64,6 +64,10 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     allocator::init_heap(&mut mapper, &mut frame_allocator)
         .expect("heap initialization failed");
 
+    // Hand ownership to the global memory services so drivers can map memory
+    // at runtime via libkernel::memory::with_memory().
+    libkernel::memory::init_services(mapper, frame_allocator);
+
     let heap_value = Box::new(41);
     println!("heap_value at {:p}", heap_value);
 
@@ -89,7 +93,9 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
 
     if let InterruptModel::Apic(_) = interrupt_model {
         info!("[kernel] init configuring apic");
-        apic::init(&interrupt_model, VirtAddr::new(APIC_BASE), &mut mapper, &mut frame_allocator);
+        libkernel::memory::with_memory(|mem| {
+            apic::init(&interrupt_model, VirtAddr::new(APIC_BASE), &mut mem.mapper, &mut mem.frame_allocator);
+        });
         libkernel::interrupts::disable_pic();
         apic::calibrate_and_start_lapic_timer();
     } else {

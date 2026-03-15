@@ -11,6 +11,81 @@ use crate::{gdt, println, task};
 
 static LAPIC_EOI_ADDR: AtomicU64 = AtomicU64::new(0);
 
+// ---------------------------------------------------------------------------
+// Dynamic interrupt handler table (vectors 0x40 – 0x4F)
+
+/// First vector in the dynamic range.
+pub const DYNAMIC_BASE: u8 = 0x40;
+/// Number of dynamically allocatable vectors.
+pub const DYNAMIC_COUNT: usize = 16;
+
+static DYNAMIC_HANDLERS: spin::Mutex<[Option<fn()>; DYNAMIC_COUNT]> =
+    spin::Mutex::new([None; DYNAMIC_COUNT]);
+
+fn dispatch_dynamic(idx: usize) {
+    // Copy the fn pointer out before calling so the lock is released first.
+    let handler = DYNAMIC_HANDLERS.lock()[idx];
+    if let Some(f) = handler {
+        f();
+    }
+    send_eoi(DYNAMIC_BASE + idx as u8);
+}
+
+macro_rules! dyn_handler {
+    ($name:ident, $idx:literal) => {
+        extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
+            dispatch_dynamic($idx);
+        }
+    };
+}
+
+dyn_handler!(dyn_handler_0,   0); dyn_handler!(dyn_handler_1,   1);
+dyn_handler!(dyn_handler_2,   2); dyn_handler!(dyn_handler_3,   3);
+dyn_handler!(dyn_handler_4,   4); dyn_handler!(dyn_handler_5,   5);
+dyn_handler!(dyn_handler_6,   6); dyn_handler!(dyn_handler_7,   7);
+dyn_handler!(dyn_handler_8,   8); dyn_handler!(dyn_handler_9,   9);
+dyn_handler!(dyn_handler_10, 10); dyn_handler!(dyn_handler_11, 11);
+dyn_handler!(dyn_handler_12, 12); dyn_handler!(dyn_handler_13, 13);
+dyn_handler!(dyn_handler_14, 14); dyn_handler!(dyn_handler_15, 15);
+
+type IrqTrampoline = extern "x86-interrupt" fn(InterruptStackFrame);
+const DYN_TRAMPOLINES: [IrqTrampoline; DYNAMIC_COUNT] = [
+    dyn_handler_0,  dyn_handler_1,  dyn_handler_2,  dyn_handler_3,
+    dyn_handler_4,  dyn_handler_5,  dyn_handler_6,  dyn_handler_7,
+    dyn_handler_8,  dyn_handler_9,  dyn_handler_10, dyn_handler_11,
+    dyn_handler_12, dyn_handler_13, dyn_handler_14, dyn_handler_15,
+];
+
+/// Register an interrupt handler for the next free dynamic vector (0x40–0x4F).
+///
+/// Returns the assigned vector number, or `None` if all 16 are in use.
+/// Safe to call from any kernel thread; disables interrupts while updating
+/// the table to avoid deadlock with the ISR dispatcher.
+pub fn register_handler(handler: fn()) -> Option<u8> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut handlers = DYNAMIC_HANDLERS.lock();
+        for (i, slot) in handlers.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(handler);
+                return Some(DYNAMIC_BASE + i as u8);
+            }
+        }
+        None
+    })
+}
+
+/// Release a previously assigned dynamic interrupt vector.
+pub fn free_vector(vector: u8) {
+    if (vector < DYNAMIC_BASE)
+        || (vector as usize >= DYNAMIC_BASE as usize + DYNAMIC_COUNT)
+    {
+        return;
+    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        DYNAMIC_HANDLERS.lock()[(vector - DYNAMIC_BASE) as usize] = None;
+    });
+}
+
 pub fn set_local_apic_eoi_addr(addr: u64) {
     LAPIC_EOI_ADDR.store(addr, Ordering::Relaxed);
 }
@@ -93,6 +168,10 @@ lazy_static! {
         idt[InterruptIndex::Keyboard.as_u8()]
             .set_handler_fn(keyboard_interrupt_handler);
         idt[0xFF_u8].set_handler_fn(spurious_interrupt_handler);
+        // Dynamic vectors 0x40–0x4F
+        for (i, &trampoline) in DYN_TRAMPOLINES.iter().enumerate() {
+            idt[DYNAMIC_BASE + i as u8].set_handler_fn(trampoline);
+        }
         idt
     };
 }
