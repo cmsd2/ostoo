@@ -187,6 +187,11 @@ impl Shell {
             "info" => {
                 if name.is_empty() {
                     println!("usage: driver info <name>");
+                } else if name == self.name() {
+                    // Sending ErasedInfo to our own mailbox would deadlock —
+                    // we can't recv() while blocked executing this command.
+                    println!("  name:    {}", self.name());
+                    println!("  running: true");
                 } else {
                     match registry::ask_info(name).await {
                         Some(s) => {
