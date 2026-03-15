@@ -147,10 +147,12 @@ are present, racing all event sources in a single future.
 - A separate crate for APIC initialisation, mapped at `0x5555_5555_0000`.
 - `apic/src/local_apic/` — Local APIC register access via MMIO and MSR.
 - `apic/src/io_apic/` — I/O APIC register access via MMIO.
-- `apic::init()` maps both the local APIC and all I/O APICs from the ACPI
-  table into virtual memory, then calls `init()` on each.
-- **Status: written but not yet wired in** — the call in `main.rs` is
-  commented out. The 8259 PIC is still active.
+- `apic::init()` maps the Local APIC and all I/O APICs from the ACPI table,
+  routes ISA IRQs 0 (timer) and 1 (keyboard) through the I/O APIC to IDT
+  vectors 0x20 and 0x21, then disables the 8259 PIC.
+- `apic::calibrate_and_start_lapic_timer()` uses the PIT as a reference to
+  measure the LAPIC bus frequency, starts the LAPIC timer in periodic mode
+  at 1000 Hz, then masks the PIT's I/O APIC entry so it no longer fires.
 
 ### Logging
 - `libkernel/src/logger.rs` wraps the VGA `println!` macro as a `log::Log`
@@ -184,13 +186,6 @@ breaking changes since:
 `UnusedPhysFrame::new(frame)` which was removed from `x86_64` after 0.11.
 Any dependency update must address this.
 
-### APIC Not Wired In
-The `apic::init()` call is commented out in `kernel/src/main.rs`. Before
-enabling it:
-- The 8259 PIC should be masked/disabled after APIC is initialised.
-- IRQ routing via the I/O APIC redirection table needs to be configured.
-- The IDT needs entries for APIC interrupt vectors.
-
 ### Two Versions of x86_64
 `libkernel` uses `x86_64 = "0.9.6"` and `apic` uses `x86_64 = "0.7.5"`. Cargo
 will resolve these separately but it is a source of confusion. They should be
@@ -204,11 +199,7 @@ to grow for any real subsystem work.
 
 ## Possible Next Steps
 
-1. **Finish APIC initialisation** — uncomment `apic::init`, configure I/O APIC
-   redirection table entries for keyboard (IRQ 1) and timer (IRQ 0), then disable
-   the 8259 PIC.
-
-2. **Update dependencies** — modernise `bootloader`, `x86_64`, `acpi`, etc.
+1. **Update dependencies** — modernise `bootloader`, `x86_64`, `acpi`, etc.
    The `bootloader` 0.9+ series and current `x86_64` crate are much cleaner.
 
 3. **Process / scheduling** — the async executor is cooperative. A preemptive
