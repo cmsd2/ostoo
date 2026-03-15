@@ -5,6 +5,23 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::boxed::Box;
 
 pub mod executor;
+
+/// Poll a [`Stream`] for its next item without requiring `StreamExt` in scope.
+///
+/// Used by the `#[actor]` macro's generated run loop so that crates using the
+/// macro do not need a direct `futures_util` dependency.
+///
+/// [`Stream`]: futures_util::stream::Stream
+pub fn poll_stream_next<S>(
+    stream: &mut S,
+    cx:     &mut core::task::Context<'_>,
+) -> core::task::Poll<core::option::Option<S::Item>>
+where
+    S: futures_util::stream::Stream + core::marker::Unpin,
+{
+    use futures_util::stream::StreamExt;
+    stream.poll_next_unpin(cx)
+}
 pub mod simple_executor;
 pub mod keyboard;
 pub mod mailbox;

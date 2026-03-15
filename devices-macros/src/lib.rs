@@ -6,9 +6,6 @@ use syn::{parse_macro_input, ImplItem, ImplItemFn, ItemImpl, LitStr, Token, Type
 
 // ---------------------------------------------------------------------------
 // #[on_message] — helper attribute consumed by #[actor].
-//
-// Registering it as a proc macro makes it a recognised attribute, giving
-// better IDE support and a clear error if used outside an #[actor] block.
 
 /// Marker attribute for message handlers inside an [`actor`] impl block.
 ///
@@ -34,10 +31,10 @@ pub fn on_message(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// async fn heartbeat(&self) { log::info!("tick"); }
 /// ```
 ///
-/// When `#[on_tick]` is present `#[actor]` replaces `inbox.recv()` with
-/// `inbox.recv_timeout(handle.tick_interval_ticks())` and calls the annotated
-/// method on every elapsed interval.  The actor struct must also provide a
-/// plain `tick_interval_ticks(&self) -> u64` method (no attribute needed).
+/// When `#[on_tick]` is present `#[actor]` includes a `Delay` in the unified
+/// `poll_fn` run loop and calls the annotated method on every elapsed interval.
+/// The actor struct must also provide a plain `tick_interval_ticks(&self) -> u64`
+/// method (no attribute needed).
 /// This attribute has no effect when used outside an `#[actor]` block.
 #[proc_macro_attribute]
 pub fn on_tick(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -67,6 +64,26 @@ pub fn on_info(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
+/// Registers an async `Stream` event source inside an [`actor`] impl block.
+///
+/// ```ignore
+/// // A plain method returning the stream — called once when the actor starts.
+/// fn my_stream(&self) -> impl Stream<Item = MyItem> + Unpin { ... }
+///
+/// // Handler called for each item produced by that stream.
+/// #[on_stream(my_stream)]
+/// async fn on_my_item(&self, item: MyItem) { ... }
+/// ```
+///
+/// `#[actor]` includes the stream in the unified `poll_fn` run loop alongside
+/// the inbox.  The stream factory method lands in the inherent impl unchanged;
+/// the handler method has its `#[on_stream]` attribute stripped.
+/// This attribute has no effect when used outside an `#[actor]` block.
+#[proc_macro_attribute]
+pub fn on_stream(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
 // ---------------------------------------------------------------------------
 // #[actor] — the main actor macro.
 
@@ -88,21 +105,23 @@ impl Parse for ActorArgs {
 /// annotated `impl` block.
 ///
 /// # What it generates
-/// - An inherent `impl StructName` containing all methods annotated with
-///   [`on_message`], with the `#[on_message]` attribute stripped.
+/// - An inherent `impl StructName` containing all handler methods (attributes
+///   stripped) and all other items from the block.
 /// - `impl DriverTask for StructName` with `type Message`, `fn name`, and a
-///   generated `run` loop that handles both the generic `ActorMsg::Info`
-///   variant and actor-specific `ActorMsg::Inner(m)` variants.
+///   generated `run` loop.
 /// - `pub type StructNameDriver = TaskDriver<StructName>`
 ///
 /// # The generated `run` loop
-/// Calls `inbox.recv().await` in a loop and dispatches each message:
-/// - `ActorMsg::Info(reply)` → replies with `ActorStatus { name, running: true, info }`;
-///   `info` is `()` by default, or the return value of the `#[on_info]` method.
-/// - `ActorMsg::ErasedInfo(reply)` → same but boxes `info` as `Box<dyn Debug + Send>`.
-/// - `ActorMsg::Inner(m)` → dispatches `m` to the corresponding `#[on_message]` handler.
-/// The loop exits when the inbox is closed (i.e. when [`Driver::stop`] is
-/// called on the owning [`TaskDriver`]).
+///
+/// **Pure message actors** (no `#[on_tick]` or `#[on_stream]`):
+/// ```ignore
+/// while let Some(msg) = inbox.recv().await { match msg { ... } }
+/// ```
+///
+/// **Actors with external event sources** (`#[on_tick]` and/or `#[on_stream]`):
+/// A unified `poll_fn` loop is generated that races all sources — streams,
+/// the inbox, and the timer (if `#[on_tick]` is present) — in a single
+/// `poll_fn` call.  Whichever source fires first drives the next dispatch.
 ///
 /// # Usage
 /// ```ignore
@@ -112,9 +131,7 @@ impl Parse for ActorArgs {
 /// #[actor("my-actor", MyMsg)]
 /// impl MyActor {
 ///     #[on_message(DoThing)]
-///     async fn do_thing(&self, n: u32) {
-///         log::info!("doing thing {}", n);
-///     }
+///     async fn do_thing(&self, n: u32) { log::info!("doing thing {}", n); }
 /// }
 /// ```
 #[proc_macro_attribute]
@@ -150,14 +167,12 @@ fn actor_expand(
         _ => return Err(syn::Error::new_spanned(self_ty, "#[actor] requires a named type")),
     };
 
-    // Separate items: methods with #[on_message] become inner handlers;
-    // a method with #[on_info] overrides the Info arm; a method with
-    // #[on_tick] becomes the periodic tick handler; everything else goes
-    // into the inherent impl unchanged.
+    // Separate items into their categories.
     let mut handler_methods: Vec<HandlerMethod> = Vec::new();
     let mut info_override:   Option<InfoOverride> = None;
     let mut on_tick:         Option<OnTick>        = None;
-    let mut other_items:     Vec<&ImplItem>        = Vec::new();
+    let mut on_streams:      Vec<OnStream>          = Vec::new();
+    let mut other_items:     Vec<&ImplItem>         = Vec::new();
 
     for item in &input.items {
         if let ImplItem::Fn(method) = item {
@@ -183,11 +198,15 @@ fn actor_expand(
                 on_tick = Some(OnTick::new(method)?);
                 continue;
             }
+            if has_on_stream(method) {
+                on_streams.push(OnStream::new(method)?);
+                continue;
+            }
         }
         other_items.push(item);
     }
 
-    // Build match arms for the inner message dispatch.
+    // Build match arms for inner message dispatch.
     let inner_arms = handler_methods.iter().map(|h| {
         let variant     = &h.variant;
         let method_name = &h.method_name;
@@ -197,26 +216,23 @@ fn actor_expand(
         } else {
             quote! { #msg_type::#variant(#(#params),*) }
         };
-        quote! {
-            #pattern => handle.#method_name(#(#params),*).await,
-        }
+        quote! { #pattern => handle.#method_name(#(#params),*).await, }
     });
 
-    // Compute the Info detail type from the #[on_info] return type, or ().
+    // Compute Info detail type.
     let info_type: syn::Type = if let Some(ref ov) = info_override {
         ov.info_type.clone()
     } else {
         syn::parse_quote! { () }
     };
 
-    // Typed Info arm: returns ActorStatus<I> with the full detail.
+    // Typed Info arm.
     let info_arm = if let Some(ref ov) = info_override {
         let method_name = &ov.method_name;
         quote! {
             ::libkernel::task::mailbox::ActorMsg::Info(reply) => {
                 reply.send(::libkernel::task::mailbox::ActorStatus {
-                    name: #driver_name,
-                    running: true,
+                    name: #driver_name, running: true,
                     info: handle.#method_name().await,
                 });
             }
@@ -225,17 +241,13 @@ fn actor_expand(
         quote! {
             ::libkernel::task::mailbox::ActorMsg::Info(reply) => {
                 reply.send(::libkernel::task::mailbox::ActorStatus {
-                    name: #driver_name,
-                    running: true,
-                    info: (),
+                    name: #driver_name, running: true, info: (),
                 });
             }
         }
     };
 
-    // Type-erased ErasedInfo arm: boxes the info behind dyn Debug + Send.
-    // Actors with #[on_info] box their typed detail (requires Debug + Send).
-    // Actors without #[on_info] box () as a placeholder.
+    // Type-erased ErasedInfo arm.
     let erased_info_arm = if let Some(ref ov) = info_override {
         let method_name = &ov.method_name;
         quote! {
@@ -243,9 +255,7 @@ fn actor_expand(
                 let info: ::alloc::boxed::Box<dyn ::core::fmt::Debug + Send> =
                     ::alloc::boxed::Box::new(handle.#method_name().await);
                 reply.send(::libkernel::task::mailbox::ActorStatus {
-                    name: #driver_name,
-                    running: true,
-                    info,
+                    name: #driver_name, running: true, info,
                 });
             }
         }
@@ -253,42 +263,35 @@ fn actor_expand(
         quote! {
             ::libkernel::task::mailbox::ActorMsg::ErasedInfo(reply) => {
                 reply.send(::libkernel::task::mailbox::ActorStatus {
-                    name: #driver_name,
-                    running: true,
+                    name: #driver_name, running: true,
                     info: ::alloc::boxed::Box::new(""),
                 });
             }
         }
     };
 
-    // All extracted methods + plain other_items go into the inherent impl.
+    // All extracted methods + other items go into the inherent impl.
     let inherent_fns = handler_methods.iter().map(|h| &h.clean_method)
         .chain(info_override.iter().map(|ov| &ov.clean_method))
-        .chain(on_tick.iter().map(|ot| &ot.clean_method));
+        .chain(on_tick.iter().map(|ot| &ot.clean_method))
+        .chain(on_streams.iter().map(|os| &os.clean_method));
 
     let name_str = driver_name.value();
 
-    // Generate the run loop body — with or without tick support.
-    let run_loop = if let Some(ref ot) = on_tick {
-        let tick_method = &ot.method_name;
-        quote! {
-            loop {
-                match inbox.recv_timeout(handle.tick_interval_ticks()).await {
-                    ::libkernel::task::mailbox::RecvTimeout::Message(_msg) => match _msg {
-                        #info_arm
-                        #erased_info_arm
-                        ::libkernel::task::mailbox::ActorMsg::Inner(_msg) => match _msg {
-                            #(#inner_arms)*
-                        }
-                    }
-                    ::libkernel::task::mailbox::RecvTimeout::Closed => break,
-                    ::libkernel::task::mailbox::RecvTimeout::Elapsed => {
-                        handle.#tick_method().await;
-                    }
-                }
-            }
-        }
-    } else {
+    // ── Run loop generation ────────────────────────────────────────────────
+    //
+    // Pure message actors → simple `while let Some(msg) = inbox.recv().await`.
+    //
+    // Actors with external event sources (streams and/or tick) → a unified
+    // `poll_fn` loop that races all sources in one future.  The wakers for
+    // every source (mailbox AtomicWaker, stream AtomicWaker, timer WAKERS)
+    // all point at the same task, so whichever fires first reschedules it.
+    // ──────────────────────────────────────────────────────────────────────
+
+    let has_external = !on_streams.is_empty() || on_tick.is_some();
+
+    let run_loop = if !has_external {
+        // ── Simple loop ────────────────────────────────────────────────────
         quote! {
             while let ::core::option::Option::Some(_msg) = inbox.recv().await {
                 match _msg {
@@ -297,6 +300,136 @@ fn actor_expand(
                     ::libkernel::task::mailbox::ActorMsg::Inner(_msg) => match _msg {
                         #(#inner_arms)*
                     }
+                }
+            }
+        }
+    } else {
+        // ── Unified poll_fn loop ────────────────────────────────────────────
+
+        // One local per stream, initialised once before the loop.
+        let stream_locals: Vec<TokenStream2> = on_streams.iter().enumerate()
+            .map(|(i, s)| {
+                let factory = &s.factory;
+                let var     = format_ident!("_stream_{}", i);
+                quote! { let mut #var = handle.#factory(); }
+            })
+            .collect();
+
+        // Delay local for tick (reset after each tick event).
+        let delay_init: TokenStream2 = if on_tick.is_some() {
+            quote! {
+                let mut _delay =
+                    ::libkernel::task::timer::Delay::new(handle.tick_interval_ticks());
+            }
+        } else {
+            quote! {}
+        };
+
+        // _Event enum variants: one per stream, optional Tick, always Stopped.
+        let stream_variants: Vec<TokenStream2> = on_streams.iter().enumerate()
+            .map(|(i, s)| {
+                let variant = format_ident!("_Stream{}", i);
+                let ty      = &s.param_ty;
+                quote! { #variant(#ty), }
+            })
+            .collect();
+        let tick_variant: TokenStream2 = if on_tick.is_some() {
+            quote! { _Tick, }
+        } else {
+            quote! {}
+        };
+
+        // poll_fn arms: streams polled first (interrupt-driven, fast path).
+        let stream_poll_arms: Vec<TokenStream2> = on_streams.iter().enumerate()
+            .map(|(i, _)| {
+                let var     = format_ident!("_stream_{}", i);
+                let variant = format_ident!("_Stream{}", i);
+                quote! {
+                    match ::libkernel::task::poll_stream_next(&mut #var, cx) {
+                        ::core::task::Poll::Ready(::core::option::Option::Some(_item)) =>
+                            return ::core::task::Poll::Ready(_Event::#variant(_item)),
+                        ::core::task::Poll::Ready(::core::option::Option::None) =>
+                            return ::core::task::Poll::Ready(_Event::_Stopped),
+                        ::core::task::Poll::Pending => {}
+                    }
+                }
+            })
+            .collect();
+        let tick_poll_arm: TokenStream2 = if on_tick.is_some() {
+            quote! {
+                if let ::core::task::Poll::Ready(()) =
+                    ::core::pin::Pin::new(&mut _delay).poll(cx)
+                {
+                    return ::core::task::Poll::Ready(_Event::_Tick);
+                }
+            }
+        } else {
+            quote! {}
+        };
+
+        // match arms in the event loop.
+        let stream_match_arms: Vec<TokenStream2> = on_streams.iter().enumerate()
+            .map(|(i, s)| {
+                let variant = format_ident!("_Stream{}", i);
+                let method  = &s.method_name;
+                let param   = &s.param;
+                quote! { _Event::#variant(#param) => handle.#method(#param).await, }
+            })
+            .collect();
+        let tick_match_arm: TokenStream2 = if let Some(ref ot) = on_tick {
+            let method = &ot.method_name;
+            quote! {
+                _Event::_Tick => {
+                    handle.#method().await;
+                    _delay = ::libkernel::task::timer::Delay::new(
+                        handle.tick_interval_ticks()
+                    );
+                }
+            }
+        } else {
+            quote! {}
+        };
+
+        quote! {
+            #(#stream_locals)*
+            #delay_init
+            loop {
+                // Local enum: _Inbox, one _StreamN per source, optional _Tick,
+                // _Stopped.  Defined inside the loop so types are always fresh.
+                enum _Event {
+                    _Inbox(::libkernel::task::mailbox::ActorMsg<#msg_type, #info_type>),
+                    #(#stream_variants)*
+                    #tick_variant
+                    _Stopped,
+                }
+                let mut _recv = inbox.recv();
+                let _ev = ::core::future::poll_fn(|cx| {
+                    // Streams first — interrupt-driven, expected to be lowest
+                    // latency.
+                    #(#stream_poll_arms)*
+                    // Inbox — control messages and stop signal.
+                    match ::core::pin::Pin::new(&mut _recv).poll(cx) {
+                        ::core::task::Poll::Ready(::core::option::Option::Some(_msg)) =>
+                            return ::core::task::Poll::Ready(_Event::_Inbox(_msg)),
+                        ::core::task::Poll::Ready(::core::option::Option::None) =>
+                            return ::core::task::Poll::Ready(_Event::_Stopped),
+                        ::core::task::Poll::Pending => {}
+                    }
+                    // Tick timer (lowest priority).
+                    #tick_poll_arm
+                    ::core::task::Poll::Pending
+                }).await;
+                match _ev {
+                    _Event::_Stopped => break,
+                    _Event::_Inbox(_msg) => match _msg {
+                        #info_arm
+                        #erased_info_arm
+                        ::libkernel::task::mailbox::ActorMsg::Inner(_msg) => match _msg {
+                            #(#inner_arms)*
+                        }
+                    }
+                    #(#stream_match_arms)*
+                    #tick_match_arm
                 }
             }
         }
@@ -323,6 +456,8 @@ fn actor_expand(
                     >
                 >,
             ) {
+                #[allow(unused_imports)]
+                use ::core::future::Future as _;
                 ::log::info!("[{}] started", #name_str);
                 #run_loop
                 ::log::info!("[{}] stopped", #name_str);
@@ -359,8 +494,6 @@ impl HandlerMethod {
             })
             .collect();
 
-        // Strip #[on_message] from the method before placing it in the
-        // inherent impl so the compiler doesn't see an unknown attribute.
         let mut clean = method.clone();
         clean.attrs.retain(|a| !a.path().is_ident("on_message"));
 
@@ -368,8 +501,6 @@ impl HandlerMethod {
     }
 }
 
-/// Extract the variant ident from `#[on_message(VariantName)]`, or return
-/// `None` if the method has no such attribute.
 fn on_message_variant(method: &ImplItemFn) -> syn::Result<Option<syn::Ident>> {
     for attr in &method.attrs {
         if attr.path().is_ident("on_message") {
@@ -380,7 +511,6 @@ fn on_message_variant(method: &ImplItemFn) -> syn::Result<Option<syn::Ident>> {
     Ok(None)
 }
 
-/// Return `true` if the method has `#[on_info]`.
 fn has_on_info(method: &ImplItemFn) -> bool {
     method.attrs.iter().any(|a| a.path().is_ident("on_info"))
 }
@@ -425,4 +555,50 @@ impl OnTick {
 
 fn has_on_tick(method: &ImplItemFn) -> bool {
     method.attrs.iter().any(|a| a.path().is_ident("on_tick"))
+}
+
+struct OnStream {
+    factory:      syn::Ident,
+    method_name:  syn::Ident,
+    param:        syn::Ident,
+    param_ty:     syn::Type,
+    clean_method: ImplItemFn,
+}
+
+impl OnStream {
+    fn new(method: &ImplItemFn) -> syn::Result<Self> {
+        let factory = method.attrs.iter()
+            .find(|a| a.path().is_ident("on_stream"))
+            .unwrap()
+            .parse_args::<syn::Ident>()?;
+
+        let method_name = method.sig.ident.clone();
+
+        let param_arg = method.sig.inputs.iter()
+            .filter_map(|a| match a { syn::FnArg::Typed(pt) => Some(pt), _ => None })
+            .next()
+            .ok_or_else(|| syn::Error::new_spanned(
+                method,
+                "#[on_stream] handler must take exactly one non-self parameter",
+            ))?;
+
+        let param = match param_arg.pat.as_ref() {
+            syn::Pat::Ident(pi) => pi.ident.clone(),
+            other => return Err(syn::Error::new_spanned(
+                other,
+                "#[on_stream] parameter must be a simple identifier",
+            )),
+        };
+
+        let param_ty = *param_arg.ty.clone();
+
+        let mut clean = method.clone();
+        clean.attrs.retain(|a| !a.path().is_ident("on_stream"));
+
+        Ok(OnStream { factory, method_name, param, param_ty, clean_method: clean })
+    }
+}
+
+fn has_on_stream(method: &ImplItemFn) -> bool {
+    method.attrs.iter().any(|a| a.path().is_ident("on_stream"))
 }

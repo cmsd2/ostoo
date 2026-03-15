@@ -20,6 +20,10 @@ use x86_64::VirtAddr;
 use log::{debug, info, warn, error};
 use acpi::platform::interrupt::InterruptModel;
 
+// Expose task_driver at crate root so #[actor]-generated code
+// (`crate::task_driver::...`) resolves in modules outside `devices`.
+pub mod task_driver;
+
 mod kernel_acpi;
 mod keyboard_actor;
 mod shell;
@@ -118,7 +122,7 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     devices::driver::start_driver("shell").ok();
 
     let (kb_driver, kb_inbox) =
-        keyboard_actor::KeyboardDriver::new(keyboard_actor::KeyboardActor::new());
+        keyboard_actor::KeyboardActorDriver::new(keyboard_actor::KeyboardActor::new());
     devices::driver::register(Box::new(kb_driver));
     libkernel::task::registry::register("keyboard", kb_inbox);
     devices::driver::start_driver("keyboard").ok();
