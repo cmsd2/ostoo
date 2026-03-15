@@ -106,6 +106,27 @@ pub struct ActorStatus<I = ()> {
 pub type ErasedInfo = Box<dyn core::fmt::Debug + Send>;
 ```
 
+### `RecvTimeout<M>` — timed receive
+
+`recv_timeout` races the inbox against a `Delay`, returning whichever fires first:
+
+```rust
+pub enum RecvTimeout<M> {
+    Message(M),  // a message arrived before the deadline
+    Closed,      // mailbox was closed (actor should exit)
+    Elapsed,     // timer fired before any message
+}
+
+// Usage:
+match inbox.recv_timeout(ticks).await {
+    RecvTimeout::Message(msg) => { /* handle */ }
+    RecvTimeout::Closed       => break,
+    RecvTimeout::Elapsed      => { /* periodic work */ }
+}
+```
+
+Used internally by the `#[on_tick]` generated run loop.
+
 ### `ask` — the request/response pattern
 
 ```rust
@@ -189,21 +210,18 @@ registers it in the process registry (see below).
 ## The `#[actor]` Macro — `devices_macros`
 
 The macro generates a complete `DriverTask` implementation from an annotated
-`impl` block, eliminating the run-loop boilerplate.
+`impl` block, eliminating the run-loop boilerplate.  All attributes are
+passthrough no-ops when used outside an `#[actor]` block.
+
+### Basic usage — pure message actor
 
 ```rust
+pub enum DummyMsg { SetInterval(u64) }
+
 #[derive(Debug)]
-pub struct DummyInfo {
-    pub interval_secs: u64,
-}
+pub struct DummyInfo { pub interval_secs: u64 }
 
-pub enum DummyMsg {
-    SetInterval(u64),
-}
-
-pub struct Dummy {
-    interval_secs: AtomicU64,
-}
+pub struct Dummy { interval_secs: AtomicU64 }
 
 #[actor("dummy", DummyMsg)]
 impl Dummy {
@@ -219,10 +237,10 @@ impl Dummy {
 }
 ```
 
-The macro generates:
+**What the macro generates:**
 
 ```rust
-// Inherent impl with the handler methods (attributes stripped):
+// Inherent impl with handler methods (attributes stripped):
 impl Dummy {
     async fn on_info(&self) -> DummyInfo { ... }
     async fn set_interval(&self, secs: u64) { ... }
@@ -239,16 +257,12 @@ impl DriverTask for Dummy {
         log::info!("[dummy] started");
         while let Some(msg) = inbox.recv().await {
             match msg {
-                ActorMsg::Info(reply) => {
-                    reply.send(ActorStatus {
-                        name: "dummy", running: true,
-                        info: handle.on_info().await,
-                    });
-                }
-                ActorMsg::ErasedInfo(reply) => {
-                    let info: Box<dyn Debug + Send> = Box::new(handle.on_info().await);
-                    reply.send(ActorStatus { name: "dummy", running: true, info });
-                }
+                ActorMsg::Info(reply) =>
+                    reply.send(ActorStatus { name: "dummy", running: true,
+                                            info: handle.on_info().await }),
+                ActorMsg::ErasedInfo(reply) =>
+                    reply.send(ActorStatus { name: "dummy", running: true,
+                                            info: Box::new(handle.on_info().await) }),
                 ActorMsg::Inner(msg) => match msg {
                     DummyMsg::SetInterval(secs) => handle.set_interval(secs).await,
                 }
@@ -258,26 +272,170 @@ impl DriverTask for Dummy {
     }
 }
 
-// Convenience type alias:
+// Convenience type alias (struct name + "Driver"):
 pub type DummyDriver = TaskDriver<Dummy>;
 ```
 
+Any methods in the `#[actor]` block that have no actor attribute are emitted
+unchanged in the inherent impl and are callable from handler methods.
+
+### `#[on_start]` — actor startup hook
+
+Called once, after the `[actor] started` log line and before the message loop:
+
+```rust
+#[on_start]
+async fn on_start(&self) {
+    println!();
+    print!("myactor> ");
+}
+```
+
+Only one `#[on_start]` method is allowed per actor.
+
 ### `#[on_info]` — custom actor info
 
-Without `#[on_info]`, the generated `Info` and `ErasedInfo` arms respond with
-`info: ()`.  Annotate one method with `#[on_info]` to provide actor-specific
-detail:
+Without `#[on_info]`, `Info` and `ErasedInfo` reply with `info: ()`.  Annotate
+one method to provide actor-specific detail:
 
 ```rust
 #[on_info]
 async fn on_info(&self) -> MyInfo {
-    MyInfo { /* fields populated from self */ }
+    MyInfo { /* fields from self */ }
 }
 ```
 
-The return type must implement `Debug + Send` (for boxing into `ErasedInfo`).
-`#[derive(Debug)]` is sufficient.  The macro sets `type Info = MyInfo` and
-generates both arms automatically.
+The return type must implement `Debug + Send`.  The macro infers `type Info =
+MyInfo` and generates both `Info` and `ErasedInfo` arms automatically.
+
+### `#[on_message(Variant)]` — inner message handler
+
+Maps one enum variant of the actor's message type to an async handler:
+
+```rust
+#[on_message(DoThing)]
+async fn do_thing(&self, n: u32) { ... }
+```
+
+The generated match arm is:
+
+```rust
+ActorMsg::Inner(MyMsg::DoThing(n)) => handle.do_thing(n).await,
+```
+
+Multiple `#[on_message]` methods are allowed, one per variant.
+
+### `#[on_tick]` — periodic callback
+
+When present, the macro switches to a **unified `poll_fn` loop** (see below)
+that races the inbox against a `Delay`.  The actor must also provide a plain
+`tick_interval_ticks(&self) -> u64` method (no attribute needed):
+
+```rust
+fn tick_interval_ticks(&self) -> u64 {
+    self.interval_secs.load(Ordering::Relaxed) * TICKS_PER_SECOND
+}
+
+#[on_tick]
+async fn heartbeat(&self) {
+    log::info!("[myactor] tick");
+}
+```
+
+Only one `#[on_tick]` method is allowed per actor.  The delay is reset after
+each tick so `tick_interval_ticks` can change dynamically.
+
+### `#[on_stream(factory)]` — interrupt/hardware stream source
+
+Actors that need to react to hardware events (interrupts, async streams) use
+`#[on_stream]`.  The `factory` argument names a plain method that returns a
+`Stream + Unpin`; the handler is called for each item:
+
+```rust
+// Factory — called once when the actor starts:
+fn key_stream(&self) -> KeyStream { KeyStream::new() }
+
+// Handler — called for each item from the stream:
+#[on_stream(key_stream)]
+async fn on_key(&self, key: Key) {
+    // process key event
+}
+```
+
+Multiple `#[on_stream]` methods are allowed, one per stream.
+
+### The unified `poll_fn` loop
+
+When one or more `#[on_stream]` or `#[on_tick]` attributes are present the
+macro generates a loop that races **all event sources in a single `poll_fn`**:
+
+```rust
+// Streams initialised once before the loop:
+let mut _stream_0 = handle.key_stream();
+// Timer initialised if #[on_tick] is present:
+let mut _delay = Delay::new(handle.tick_interval_ticks());
+
+loop {
+    enum _Event {
+        _Inbox(ActorMsg<KeyboardMsg, KeyboardInfo>),
+        _Stream0(Key),   // one variant per #[on_stream]
+        _Tick,           // present if #[on_tick]
+        _Stopped,
+    }
+    let mut _recv = inbox.recv();
+    let _ev = poll_fn(|cx| {
+        // Streams polled first — interrupt-driven, lowest latency:
+        match poll_stream_next(&mut _stream_0, cx) {
+            Poll::Ready(Some(item)) => return Poll::Ready(_Event::_Stream0(item)),
+            Poll::Ready(None)       => return Poll::Ready(_Event::_Stopped),
+            Poll::Pending           => {}
+        }
+        // Inbox — control messages and stop signal:
+        match Pin::new(&mut _recv).poll(cx) {
+            Poll::Ready(Some(msg)) => return Poll::Ready(_Event::_Inbox(msg)),
+            Poll::Ready(None)      => return Poll::Ready(_Event::_Stopped),
+            Poll::Pending          => {}
+        }
+        // Timer (lowest priority):
+        if let Poll::Ready(()) = Pin::new(&mut _delay).poll(cx) {
+            return Poll::Ready(_Event::_Tick);
+        }
+        Poll::Pending
+    }).await;
+
+    match _ev {
+        _Event::_Stopped         => break,
+        _Event::_Inbox(msg)      => match msg { /* Info, ErasedInfo, Inner arms */ }
+        _Event::_Stream0(key)    => handle.on_key(key).await,
+        _Event::_Tick            => {
+            handle.heartbeat().await;
+            _delay = Delay::new(handle.tick_interval_ticks());
+        }
+    }
+}
+```
+
+All wakers (mailbox `AtomicWaker`, stream `AtomicWaker`, timer `WAKERS` slot)
+register the **same** task waker, so whichever source fires first reschedules
+the task.  No extra task or thread is needed.
+
+### Using `#[actor]` outside the `devices` crate
+
+The macro generates `impl crate::task_driver::DriverTask for …` and
+`pub type XDriver = crate::task_driver::TaskDriver<X>;`.  In the `devices` crate
+this resolves naturally.  For crates that use `devices` as a dependency (e.g.
+`kernel`), expose `task_driver` at the crate root:
+
+```rust
+// kernel/src/task_driver.rs
+pub use devices::task_driver::*;
+
+// kernel/src/main.rs
+pub mod task_driver;   // makes crate::task_driver resolve for #[actor] expansions
+```
+
+The generated type alias uses the struct name suffixed with `Driver`:
+`KeyboardActor` → `KeyboardActorDriver`, `Shell` → `ShellDriver`.
 
 ---
 
@@ -328,68 +486,103 @@ held across an `await`.
 
 ---
 
-## Manual Actor Implementation — the Shell
+## Actors in Practice
 
-Actors that need async command dispatch or other patterns the macro does not
-support implement `DriverTask` directly.  The shell is the canonical example.
-
-### Two-task split
-
-The shell separates keyboard reading from command execution:
-
-```
-keyboard_task (free async fn)
-  KeyStream → buffers characters
-  on Enter: inbox.ask(|r| ActorMsg::Inner(ShellMsg::KeyLine(line, r))).await
-  (suspended here until the shell actor finishes the command)
-                          ↓
-Shell actor (DriverTask)
-  inbox.recv().await
-  ActorMsg::Info(reply)              → reply.send(ActorStatus { name: "shell", ... })
-  ActorMsg::ErasedInfo(reply)        → reply.send(ActorStatus { name: "shell", ... })
-  ActorMsg::Inner(KeyLine(line, r))  → execute_command(&line).await
-                                       r dropped on return
-                                       → keyboard_task's ask().await unblocks
-                                       → prompt reprinted
-```
-
-`ShellMsg::KeyLine` carries a `Reply<()>` as a **completion signal**, not a
-data reply.  When the shell's handler returns, `_reply` is dropped, which calls
-`Reply::drop` → `close()` on the reply mailbox → `keyboard_task`'s
-`ask().await` returns.  This backpressure ensures only one command runs at a
-time and the prompt is printed only after the command finishes.
-
-The keyboard task is a plain `async fn`, not a `DriverTask`.  It is spawned
-once at startup and runs for the lifetime of the kernel.  The shell actor can
-be stopped and restarted independently via `driver stop/start shell`.
-
-### Closed-mailbox behaviour for the shell
-
-When the shell actor is stopped (`inbox.close()`), the keyboard task's next
-`ask()` will find the mailbox closed and return `None` immediately (the
-`ShellMsg::KeyLine` message is dropped, dropping `Reply<()>`, unblocking the
-`ask`).  The keyboard task continues running and buffering characters; it will
-simply not dispatch commands until the shell actor is restarted.
-
-### Self-query avoidance
-
-The `driver info shell` command would normally call `registry::ask_info("shell")`,
-which sends `ErasedInfo` to the shell's own mailbox.  But the shell cannot
-`recv()` that message while it is blocked executing the command — deadlock.
-
-The shell detects this by comparing the requested name against `self.name()` and
-responds directly without going through the registry:
+### Shell — pure message actor with startup hook
 
 ```rust
-} else if name == self.name() {
-    // Respond directly — querying our own mailbox would deadlock.
-    println!("  name:    {}", self.name());
-    println!("  running: true");
+pub enum ShellMsg { KeyLine(String) }
+pub struct Shell;
+
+#[actor("shell", ShellMsg)]
+impl Shell {
+    #[on_start]
+    async fn on_start(&self) {
+        println!();
+        print!("ostoo> ");
+    }
+
+    #[on_message(KeyLine)]
+    async fn on_key_line(&self, line: String) {
+        self.execute_command(&line).await;
+        print!("ostoo> ");
+    }
+
+    // Plain helpers — land in the inherent impl:
+    async fn execute_command(&self, line: &str) { ... }
+    async fn cmd_driver(&self, rest: &str) { ... }
 }
 ```
 
-Any actor that exposes a command interface and may be asked about itself must
-apply the same pattern.
+The shell prints its prompt in `#[on_start]` (once, when the actor starts) and
+again after each command in `#[on_message(KeyLine)]`.
+
+**Fire-and-forget dispatch**: the keyboard actor sends `ShellMsg::KeyLine` with
+`mailbox.send()` (no reply), so it never blocks waiting for the shell.  The
+shell processes one command at a time; new lines queue in the mailbox.
+
+**Self-query avoidance**: `driver info shell` from within a shell command would
+deadlock if it sent `ErasedInfo` to the shell's own mailbox (the shell is busy
+executing the command and cannot recv).  The handler detects the name `"shell"`
+and responds directly without going through the registry.
+
+### Keyboard — stream actor
+
+```rust
+pub struct KeyboardActor {
+    keys_processed:   AtomicU64,
+    lines_dispatched: AtomicU64,
+    line:             spin::Mutex<LineBuf>,
+}
+
+#[actor("keyboard", KeyboardMsg)]
+impl KeyboardActor {
+    fn key_stream(&self) -> KeyStream { KeyStream::new() }
+
+    #[on_stream(key_stream)]
+    async fn on_key(&self, key: Key) {
+        // buffer characters; dispatch complete lines to shell via send()
+    }
+
+    #[on_info]
+    async fn on_info(&self) -> KeyboardInfo { ... }
+}
+```
+
+`KeyStream` is interrupt-driven: every PS/2 scancode IRQ pushes into a lock-free
+queue and wakes an `AtomicWaker`.  Because both the stream waker and the inbox
+waker register the same task waker, the actor sleeps in a single `poll_fn` and
+wakes on whichever event arrives first.
+
+The line buffer lives in the actor struct behind a `spin::Mutex<LineBuf>` so it
+is accessible from the `&self` reference in `on_key`.  The mutex is never held
+across an `.await`.
+
+### Dummy — tick actor (example / test driver)
+
+```rust
+#[actor("dummy", DummyMsg)]
+impl Dummy {
+    fn tick_interval_ticks(&self) -> u64 {
+        self.interval_secs.load(Ordering::Relaxed) * TICKS_PER_SECOND
+    }
+
+    #[on_tick]
+    async fn heartbeat(&self) {
+        log::info!("[dummy] heartbeat");
+    }
+
+    #[on_info]
+    async fn on_info(&self) -> DummyInfo { ... }
+
+    #[on_message(SetInterval)]
+    async fn set_interval(&self, secs: u64) { ... }
+}
+```
+
+Starts stopped.  `driver start dummy` from the shell opens its mailbox and
+spawns the run loop.  `driver dummy set-interval 3` sends `SetInterval(3)` and
+changes the heartbeat rate at runtime.
 
 ---
 
@@ -398,23 +591,24 @@ apply the same pattern.
 ```rust
 // main.rs (abridged)
 
-// Dummy driver
+// Dummy driver — starts stopped, user can start it from the shell
 let (dummy_driver, dummy_inbox) = DummyDriver::new(Dummy::new());
 devices::driver::register(Box::new(dummy_driver));
-registry::register("dummy", dummy_inbox);         // mailbox starts closed
+registry::register("dummy", dummy_inbox);
 
-// Shell actor
+// Shell actor — started immediately
 let (shell_driver, shell_inbox) = ShellDriver::new(Shell::new());
 devices::driver::register(Box::new(shell_driver));
-registry::register("shell", shell_inbox.clone()); // mailbox starts closed
-devices::driver::start_driver("shell").ok();      // reopen + spawn run loop
+registry::register("shell", shell_inbox.clone());
+devices::driver::start_driver("shell").ok();   // reopen + spawn run loop
 
-// Keyboard feeder (not a DriverTask, runs forever)
-executor::spawn(Task::new(shell::keyboard_task(shell_inbox)));
+// Keyboard actor — started immediately, stream-driven by PS/2 IRQs
+let (kb_driver, kb_inbox) =
+    KeyboardActorDriver::new(KeyboardActor::new());
+devices::driver::register(Box::new(kb_driver));
+registry::register("keyboard", kb_inbox);
+devices::driver::start_driver("keyboard").ok();
 ```
-
-The dummy driver starts stopped.  `driver start dummy` from the shell opens its
-mailbox and spawns its run loop.
 
 ---
 
@@ -422,10 +616,13 @@ mailbox and spawns its run loop.
 
 | Path | Role |
 |---|---|
-| `libkernel/src/task/mailbox.rs` | `Mailbox<M>`, `Reply<T>`, `ActorMsg<M,I>`, `ActorStatus<I>`, `ErasedInfo` |
+| `libkernel/src/task/mailbox.rs` | `Mailbox<M>`, `Reply<T>`, `ActorMsg<M,I>`, `ActorStatus<I>`, `ErasedInfo`, `RecvTimeout<M>` |
+| `libkernel/src/task/mod.rs` | `poll_stream_next` helper used by macro-generated code |
 | `libkernel/src/task/registry.rs` | process registry, `Informable`, `ask_info` |
 | `devices/src/task_driver.rs` | `DriverTask` trait, `TaskDriver<T>`, `StopToken` |
 | `devices/src/driver.rs` | `Driver` trait, driver registry (`start/stop/list`) |
-| `devices-macros/src/lib.rs` | `#[actor]`, `#[on_message]`, `#[on_info]` proc macros |
-| `devices/src/dummy.rs` | example `#[actor]`-generated driver with `#[on_info]` |
-| `kernel/src/shell.rs` | manually-implemented actor + `keyboard_task` |
+| `devices-macros/src/lib.rs` | `#[actor]`, `#[on_message]`, `#[on_info]`, `#[on_start]`, `#[on_tick]`, `#[on_stream]` |
+| `devices/src/dummy.rs` | tick + message actor (`#[on_tick]`, `#[on_message]`, `#[on_info]`) |
+| `kernel/src/shell.rs` | shell actor (`#[on_start]`, `#[on_message]`) |
+| `kernel/src/keyboard_actor.rs` | keyboard actor (`#[on_stream]`, `#[on_info]`) |
+| `kernel/src/task_driver.rs` | `pub use devices::task_driver::*` shim for `crate::task_driver` path |
