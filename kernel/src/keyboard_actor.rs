@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::Poll;
 use futures_util::stream::StreamExt;
 use libkernel::task::keyboard::{Key, KeyStream};
-use libkernel::task::mailbox::{ActorMsg, ActorStatus, Mailbox};
+use libkernel::task::mailbox::{ActorMsg, ActorStatus, Mailbox, Reply};
 use libkernel::task::registry;
 use libkernel::{print, println};
 use devices::task_driver::{DriverTask, StopToken};
@@ -62,6 +62,35 @@ impl KeyboardActor {
 pub type KeyboardDriver = devices::task_driver::TaskDriver<KeyboardActor>;
 
 // ---------------------------------------------------------------------------
+// Inbox message handler — used from both the main loop and the dispatch-wait
+// loop so that the actor stays responsive during shell command execution.
+
+fn handle_inbox_msg(
+    handle: &KeyboardActor,
+    msg:    ActorMsg<KeyboardMsg, KeyboardInfo>,
+) {
+    match msg {
+        ActorMsg::Info(reply) => {
+            reply.send(ActorStatus {
+                name:    "keyboard",
+                running: true,
+                info:    handle.info(),
+            });
+        }
+        ActorMsg::ErasedInfo(reply) => {
+            reply.send(ActorStatus {
+                name:    "keyboard",
+                running: true,
+                info:    alloc::boxed::Box::new(handle.info()),
+            });
+        }
+        ActorMsg::Inner(_msg) => match _msg {
+            // No messages defined yet — exhaustive match over empty enum.
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DriverTask — manual impl because the run loop races two event sources
 
 impl DriverTask for KeyboardActor {
@@ -87,7 +116,7 @@ impl DriverTask for KeyboardActor {
             println!();
             print!("{}", PROMPT);
 
-            loop {
+            'run: loop {
                 // ── The core interrupt-driven actor pattern ────────────────
                 //
                 // The keyboard actor has two independent event sources:
@@ -99,12 +128,12 @@ impl DriverTask for KeyboardActor {
                 //      Waker: AtomicWaker in Mailbox::waker
                 //
                 // poll_fn polls both on every task wakeup and returns
-                // whichever is ready.  Both AtomicWakers register the *same*
-                // task waker, so the task is rescheduled by either source.
+                // whichever is ready first.  Both AtomicWakers register the
+                // *same* task waker, so the task is rescheduled by either.
                 //
-                // inbox.recv() is created fresh each iteration.  That is
-                // intentional: MailboxRecv re-registers the waker on every
-                // poll, so no wakeups are lost.
+                // inbox.recv() is created fresh each iteration — MailboxRecv
+                // re-registers the waker on every poll, so no messages are
+                // lost between iterations.
                 // ──────────────────────────────────────────────────────────
 
                 enum Event {
@@ -116,15 +145,13 @@ impl DriverTask for KeyboardActor {
                 let mut recv = inbox.recv();
 
                 let event = core::future::poll_fn(|cx| {
-                    // Interrupt path — fires when an IRQ pushes a scancode.
-                    // KeyStream is Unpin so poll_next_unpin avoids Pin::new.
+                    // Interrupt path: fires when an IRQ delivers a scancode.
                     match keys.poll_next_unpin(cx) {
                         Poll::Ready(Some(key)) => return Poll::Ready(Event::Key(key)),
                         Poll::Ready(None)      => return Poll::Ready(Event::Stopped),
                         Poll::Pending          => {}
                     }
-                    // Message path — fires when another actor sends a message
-                    // or when stop() closes the mailbox.
+                    // Message path: fires on a control message or stop().
                     match Pin::new(&mut recv).poll(cx) {
                         Poll::Ready(Some(msg)) => return Poll::Ready(Event::Msg(msg)),
                         Poll::Ready(None)      => return Poll::Ready(Event::Stopped),
@@ -134,7 +161,9 @@ impl DriverTask for KeyboardActor {
                 }).await;
 
                 match event {
-                    Event::Stopped => break,
+                    Event::Stopped => break 'run,
+
+                    Event::Msg(msg) => handle_inbox_msg(&handle, msg),
 
                     Event::Key(key) => {
                         handle.keys_processed.fetch_add(1, Ordering::Relaxed);
@@ -145,13 +174,58 @@ impl DriverTask for KeyboardActor {
                                     .unwrap_or("").trim();
                                 if !line.is_empty() {
                                     let line_string = alloc::string::String::from(line);
-                                    // Look up the shell dynamically so the
-                                    // keyboard actor doesn't hold a direct Arc
-                                    // reference to the shell mailbox.
                                     if let Some(shell) = registry::get::<ShellMsg, ()>("shell") {
-                                        shell.ask(|r| ActorMsg::Inner(
-                                            ShellMsg::KeyLine(line_string, r),
-                                        )).await;
+                                        // ── Deadlock-safe shell dispatch ──────────────
+                                        //
+                                        // A plain shell.ask().await would suspend the
+                                        // keyboard actor while the shell runs the command.
+                                        // If that command is "driver info keyboard", the
+                                        // shell sends ErasedInfo to our inbox — but we
+                                        // can't recv() it while suspended at ask().await.
+                                        // Deadlock.
+                                        //
+                                        // Solution: send the line manually, then race the
+                                        // shell's reply channel against our own inbox.
+                                        // Any inbox message that arrives during command
+                                        // execution is handled immediately.
+                                        // ─────────────────────────────────────────────
+                                        let (reply_tx, reply_rx) = Reply::new();
+                                        shell.send(ActorMsg::Inner(
+                                            ShellMsg::KeyLine(line_string, reply_tx),
+                                        ));
+
+                                        'dispatch: loop {
+                                            let mut shell_recv = reply_rx.recv();
+                                            let mut kb_recv    = inbox.recv();
+
+                                            enum DispEv {
+                                                ShellDone,
+                                                InboxMsg(ActorMsg<KeyboardMsg, KeyboardInfo>),
+                                                InboxClosed,
+                                            }
+
+                                            let dev = core::future::poll_fn(|cx| {
+                                                if let Poll::Ready(_) =
+                                                    Pin::new(&mut shell_recv).poll(cx)
+                                                {
+                                                    return Poll::Ready(DispEv::ShellDone);
+                                                }
+                                                match Pin::new(&mut kb_recv).poll(cx) {
+                                                    Poll::Ready(Some(m)) =>
+                                                        return Poll::Ready(DispEv::InboxMsg(m)),
+                                                    Poll::Ready(None) =>
+                                                        return Poll::Ready(DispEv::InboxClosed),
+                                                    Poll::Pending => {}
+                                                }
+                                                Poll::Pending
+                                            }).await;
+
+                                            match dev {
+                                                DispEv::ShellDone    => break 'dispatch,
+                                                DispEv::InboxClosed  => break 'run,
+                                                DispEv::InboxMsg(m)  => handle_inbox_msg(&handle, m),
+                                            }
+                                        }
                                     }
                                     handle.lines_dispatched.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -175,26 +249,6 @@ impl DriverTask for KeyboardActor {
                             }
 
                             _ => {}
-                        }
-                    }
-
-                    Event::Msg(msg) => match msg {
-                        ActorMsg::Info(reply) => {
-                            reply.send(ActorStatus {
-                                name:    "keyboard",
-                                running: true,
-                                info:    handle.info(),
-                            });
-                        }
-                        ActorMsg::ErasedInfo(reply) => {
-                            reply.send(ActorStatus {
-                                name:    "keyboard",
-                                running: true,
-                                info:    alloc::boxed::Box::new(handle.info()),
-                            });
-                        }
-                        ActorMsg::Inner(msg) => match msg {
-                            // No messages yet — exhaustive match over empty enum
                         }
                     }
                 }
