@@ -22,12 +22,9 @@ pub use vmem_allocator::DumbVmemAllocator;
 // Global memory services
 
 /// Combined mapper and frame allocator, accessible via [`with_memory`].
-///
-/// For libraries that require the two components separately (e.g. `apic::init`)
-/// destructure with `mem.mapper` / `mem.frame_allocator`.
 pub struct MemoryServices {
-    pub mapper: OffsetPageTable<'static>,
-    pub frame_allocator: BootInfoFrameAllocator,
+    mapper: OffsetPageTable<'static>,
+    frame_allocator: BootInfoFrameAllocator,
 }
 
 impl MemoryServices {

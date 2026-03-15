@@ -29,10 +29,7 @@ use libkernel;
 use libkernel::memory::MemoryServices;
 use x86_64::{PhysAddr, VirtAddr};
 use x86_64::structures::paging::{
-    Page,
     PageSize,
-    PhysFrame,
-    Mapper,
     Size4KiB,
 };
 use local_apic::MappedLocalApic;
@@ -104,9 +101,9 @@ fn route_isa_irq(io_apics: &[MappedIoApic], isa_irq: u8, vector: u8, lapic_id: u
 }
 
 fn init_io_apic(io_apic: &AcpiIoApic, remap_addr: VirtAddr, mem: &mut MemoryServices) -> MappedIoApic {
-    let (frame, page) = map(remap_addr, PhysAddr::new(io_apic.address as u64), mem);
+    map(remap_addr, PhysAddr::new(io_apic.address as u64), mem);
 
-    info!("[apic] init mapped {:?} from {:?} to {:?}", io_apic, frame, page);
+    info!("[apic] init mapped {:?} phys={:#x} virt={:#x}", io_apic, io_apic.address, remap_addr);
 
     let mapped_io_apic = MappedIoApic {
         id: io_apic.id,
@@ -124,9 +121,9 @@ pub fn init_local(remap_addr: VirtAddr, mem: &mut MemoryServices) {
         MappedLocalApic::get_base_phys_addr()
     };
 
-    let (frame, page) = map(remap_addr, phys_addr, mem);
+    map(remap_addr, phys_addr, mem);
 
-    info!("[apic] init mapped local apic from {:?} to {:?}", frame, page);
+    info!("[apic] init mapped local apic phys={:#x} virt={:#x}", phys_addr, remap_addr);
 
     let mapped_apic = MappedLocalApic::new(remap_addr);
     unsafe {
@@ -201,20 +198,12 @@ pub fn calibrate_and_start_lapic_timer() {
     }
 }
 
-fn map(remap_addr: VirtAddr, phys_addr: PhysAddr, mem: &mut MemoryServices) -> (PhysFrame, Page) {
-    use x86_64::structures::paging::page_table::PageTableFlags as Flags;
+fn map(remap_addr: VirtAddr, phys_addr: PhysAddr, mem: &mut MemoryServices) {
+    use x86_64::structures::paging::{Page, PageTableFlags as Flags};
 
     let page = Page::from_start_address(remap_addr).expect("remap apic page");
-    let frame = PhysFrame::from_start_address(phys_addr).expect("non-0 frame offset");
     let flags = Flags::PRESENT | Flags::WRITABLE | Flags::NO_CACHE;
-
-    let map_to_result = unsafe {
-        mem.mapper.map_to(page, frame, flags, &mut mem.frame_allocator)
-    };
-
-    map_to_result.expect("map_to failed").flush();
-
-    (frame, page)
+    mem.map_page(page, phys_addr, flags);
 }
 
 #[cfg(test)]
