@@ -116,6 +116,7 @@ fn run_command(line: &str) {
             println!("  lapic             Local APIC state and timer configuration");
             println!("  ioapic            IO APIC redirection table");
             println!("  idt               IDT vector assignments");
+            println!("  pci               list PCI devices");
         }
         "clear" => {
             libkernel::vga_buffer::clear_content();
@@ -148,6 +149,7 @@ fn run_command(line: &str) {
         "lapic" => cmd_lapic(),
         "ioapic" => cmd_ioapic(),
         "idt" => cmd_idt(),
+        "pci" => cmd_pci(),
         other => {
             println!("unknown command: '{}'  (try 'help')", other);
         }
@@ -543,5 +545,21 @@ fn cmd_idt() {
                 println!("    {:#04x}  [in use]", DYNAMIC_BASE as usize + i);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pci — list enumerated PCI devices
+
+fn cmd_pci() {
+    let devs = devices::pci::PCI_DEVICES.lock();
+    println!("PCI devices ({}):", devs.len());
+    println!("  Bus:Dev.Fn  Vendor  Device  Rev  Class     Description");
+    for d in devs.iter() {
+        println!("  {:02x}:{:02x}.{}   {:04x}    {:04x}   {:02x}   {:02x}:{:02x}    {}",
+            d.bus, d.device, d.function,
+            d.vendor_id, d.device_id, d.revision,
+            d.class, d.subclass,
+            devices::pci::class_name(d.class, d.subclass));
     }
 }

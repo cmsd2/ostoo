@@ -33,6 +33,7 @@ harness = false
 
 [dependencies]
 apic                  = { workspace = true }
+devices               = { workspace = true }
 libkernel             = { workspace = true }
 acpi                  = { workspace = true }
 bootloader            = { workspace = true }

@@ -104,6 +104,8 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
         info!("[kernel] init configuring pic");
     }
 
+    devices::pci::init();
+
     #[cfg(test)]
     test_main();
 

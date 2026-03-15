@@ -3,11 +3,13 @@ members = [
     "kernel",
     "libkernel",
     "apic",
+    "devices",
 ]
 
 [workspace.dependencies]
 # workspace-local crates
 apic      = { path = "apic" }
+devices   = { path = "devices" }
 libkernel = { path = "libkernel" }
 
 # external crates shared across two or more members
