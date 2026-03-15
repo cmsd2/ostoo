@@ -29,6 +29,7 @@ pub enum KeyboardMsg {}
 // Info
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct KeyboardInfo {
     pub keys_processed:   u64,
     pub lines_dispatched: u64,
