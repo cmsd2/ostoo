@@ -117,9 +117,11 @@ The macro generates a unified `poll_fn` loop when `#[on_tick]` or `#[on_stream]`
 are present, racing all event sources in a single future.
 
 ### Shell (`kernel/src/shell.rs`)
-- `#[actor]`-based shell actor; registered as `"shell"`.
-- Commands: `help`, `echo`, `driver <start|stop|info|list|...>`.
-- Output pager for long command output (press any key to scroll).
+- `#[actor]`-based shell actor with persistent CWD state (`spin::Mutex<String>`).
+- Prompt includes CWD: `ostoo:/path> `.
+- `resolve_path` / `normalize_path` handle relative paths and `..` components.
+- Commands: `help`, `echo`, `driver <start|stop|info>`, `blk <info|read|ls|cat>`,
+  `ls`, `cat`, `pwd`, `cd`.
 
 ### Keyboard Actor (`kernel/src/keyboard_actor.rs`)
 - `#[actor]` + `#[on_stream(key_stream)]`; registered as `"keyboard"`.
@@ -130,6 +132,31 @@ are present, racing all event sources in a single future.
   - History: ↑↓ / Ctrl+P/N, 50-entry `VecDeque`, live-buffer save/restore
   - Ctrl+C clears the line; Ctrl+L clears the screen
 - Dispatches complete lines to the shell via `ShellMsg::KeyLine`.
+
+### virtio-blk Block Device (`devices/src/virtio/`)
+- `virtio-drivers` 0.7 crate provides the virtio protocol; the kernel supplies
+  `KernelHal` implementing `Hal` for DMA allocation, MMIO mapping, and
+  virtual→physical address translation.
+- QEMU Q35 machine; PCIe ECAM at physical `0xB000_0000` mapped at boot via
+  `MemoryServices::map_mmio_region`.
+- `VirtioBlkActor` actor: handles `Read` and `Write` messages using the
+  non-blocking virtio-drivers API (`read_blocks_nb` / `complete_read_blocks`,
+  etc.) with a busy-poll `CompletionFuture` for MVP.
+- `KernelHal::share` performs a full page-table walk (`translate_virt`) so that
+  heap-allocated `BlkReq`/`BlkResp`/data buffers produce correct physical
+  addresses for the device.
+- Shell commands: `blk info`, `blk read <sector>`.
+- See [`docs/virtio-blk.md`](virtio-blk.md) for full details.
+
+### exFAT Filesystem (`devices/src/virtio/exfat.rs`)
+- Read-only exFAT driver with no external dependencies.
+- Auto-detects bare exFAT, MBR-partitioned, and GPT-partitioned disk images.
+- Implements: boot sector parsing, FAT chain traversal, directory entry set
+  parsing (File / Stream Extension / File Name entries), and recursive path
+  walking with case-insensitive ASCII matching.
+- Shell commands: `ls [path]`, `cat <path>`, `pwd`, `cd [path]`.
+- File reads capped at 16 KiB; peak heap usage during `ls` ≈ 5 KiB.
+- See [`docs/exfat.md`](exfat.md) for full details.
 
 ### Dummy Driver (`devices/src/dummy.rs`)
 - Example actor with `#[on_tick]` heartbeat, `#[on_message(SetInterval)]`,
@@ -205,8 +232,5 @@ to grow for any real subsystem work.
 3. **Process / scheduling** — the async executor is cooperative. A preemptive
    scheduler on top of the timer interrupt would be the natural next step.
 
-4. **Filesystem / block device** — QEMU's `virtio-blk` or an ATA PIO driver
-   would enable persistent storage.
-
-5. **Heap growth** — a demand-paged heap that grows on fault rather than a
+4. **Heap growth** — a demand-paged heap that grows on fault rather than a
    fixed 100 KiB allocation.

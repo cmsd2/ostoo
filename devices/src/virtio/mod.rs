@@ -8,6 +8,9 @@ use virtio_drivers::transport::pci::PciTransport;
 use libkernel::memory;
 
 pub mod blk;
+pub mod exfat;
+pub use exfat::{BlkInbox, DirEntry, ExfatError, ExfatVol,
+                open_exfat, list_dir, read_file};
 
 // ---------------------------------------------------------------------------
 // Physical-memory offset cache (mirrors the one in libkernel::memory)

@@ -12,18 +12,22 @@ use crate::shell::ShellMsg;
 // ---------------------------------------------------------------------------
 // Layout constants
 
-const PROMPT: &str     = "ostoo> ";
-const PROMPT_COL: usize = 7;              // len("ostoo> ")
-const MAX_LINE: usize   = 80 - PROMPT_COL - 1;
+/// Buffer size for the current input line.  Must fit in an 80-column terminal
+/// even for the longest reasonable prompt; the actual insertion limit is
+/// computed at runtime from the stored prompt length.
+const MAX_LINE: usize    = 72;
 const MAX_HISTORY: usize = 50;
 
 // ---------------------------------------------------------------------------
 // Messages
 
 /// Control messages for the keyboard actor.
-///
-/// Currently empty — the actor is purely interrupt-driven.
-pub enum KeyboardMsg {}
+pub enum KeyboardMsg {
+    /// Update the stored prompt string.  The shell sends this each time the
+    /// prompt changes (e.g. after `cd`) so the actor can reprint it correctly
+    /// on Ctrl+C / Ctrl+L and position the hardware cursor accurately.
+    SetPrompt(alloc::string::String),
+}
 
 // ---------------------------------------------------------------------------
 // Info
@@ -93,6 +97,8 @@ pub struct KeyboardActor {
     keys_processed:   AtomicU64,
     lines_dispatched: AtomicU64,
     line:             spin::Mutex<LineState>,
+    /// Current prompt string, kept in sync with the shell via `SetPrompt`.
+    prompt:           spin::Mutex<alloc::string::String>,
 }
 
 impl KeyboardActor {
@@ -101,6 +107,8 @@ impl KeyboardActor {
             keys_processed:   AtomicU64::new(0),
             lines_dispatched: AtomicU64::new(0),
             line:             spin::Mutex::new(LineState::new()),
+            // Initial value matches Shell::new() CWD = "/".
+            prompt:           spin::Mutex::new(alloc::string::String::from("ostoo:/> ")),
         }
     }
 }
@@ -114,6 +122,11 @@ impl KeyboardActor {
     #[on_stream(key_stream)]
     async fn on_key(&self, key: Key) {
         self.keys_processed.fetch_add(1, Ordering::Relaxed);
+
+        // Read the prompt length before acquiring the line lock so we never
+        // hold two locks simultaneously.
+        let prompt_col = self.prompt.lock().len();
+        let max_input  = (80usize.saturating_sub(prompt_col + 1)).min(MAX_LINE);
 
         let action = {
             let mut st = self.line.lock();
@@ -271,7 +284,7 @@ impl KeyboardActor {
 
                 // ── Printable ASCII (with insertion) ─────────────────
                 Key::Unicode(c) if c.is_ascii() && !c.is_control() => {
-                    if st.len < MAX_LINE {
+                    if st.len < max_input {
                         let b = c as u8;
                         let cur = st.cursor;
                         let end = st.len;
@@ -301,20 +314,28 @@ impl KeyboardActor {
             }
             Action::Redraw => {
                 let st = self.line.lock();
-                libkernel::vga_buffer::redraw_line(PROMPT_COL, &st.buf, st.len, st.cursor);
+                libkernel::vga_buffer::redraw_line(prompt_col, &st.buf, st.len, st.cursor);
             }
             Action::ClearScreen => {
                 libkernel::vga_buffer::clear_content();
-                print!("{}", PROMPT);
+                let prompt_str = self.prompt.lock().clone();
+                print!("{}", prompt_str);
                 let st = self.line.lock();
-                libkernel::vga_buffer::redraw_line(PROMPT_COL, &st.buf, st.len, st.cursor);
+                libkernel::vga_buffer::redraw_line(prompt_str.len(), &st.buf, st.len, st.cursor);
             }
             Action::Interrupt => {
                 libkernel::println!("^C");
-                print!("{}", PROMPT);
+                let prompt_str = self.prompt.lock().clone();
+                print!("{}", prompt_str);
             }
             Action::Ignore => {}
         }
+    }
+
+    // ── SetPrompt message ─────────────────────────────────────────────────
+    #[on_message(SetPrompt)]
+    async fn on_set_prompt(&self, prompt: alloc::string::String) {
+        *self.prompt.lock() = prompt;
     }
 
     // ── Info query ────────────────────────────────────────────────────────

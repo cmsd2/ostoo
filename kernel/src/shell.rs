@@ -1,11 +1,10 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::string::ToString;
 use libkernel::task::{executor, scheduler, timer};
 use libkernel::task::registry;
 use libkernel::{print, println};
-
-const PROMPT: &str = "ostoo> ";
 
 // ---------------------------------------------------------------------------
 // Messages
@@ -18,10 +17,55 @@ pub enum ShellMsg {
 // ---------------------------------------------------------------------------
 // Shell actor
 
-pub struct Shell;
+pub struct Shell {
+    cwd: spin::Mutex<String>,
+}
 
 impl Shell {
-    pub fn new() -> Self { Shell }
+    pub fn new() -> Self {
+        Shell { cwd: spin::Mutex::new("/".to_string()) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path helpers
+
+/// Resolve `path` against `cwd`: absolute paths pass through; relative paths
+/// are joined to `cwd`.  The result is then normalised (`.` and `..` removed).
+fn resolve_path(cwd: &str, path: &str) -> String {
+    let raw = if path.starts_with('/') {
+        path.to_string()
+    } else if path.is_empty() {
+        cwd.to_string()
+    } else {
+        let mut base = cwd.to_string();
+        if !base.ends_with('/') { base.push('/'); }
+        base.push_str(path);
+        base
+    };
+    normalize_path(&raw)
+}
+
+/// Collapse `.` and `..` components, return a canonical absolute path.
+fn normalize_path(path: &str) -> String {
+    let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => { parts.pop(); }
+            s    => parts.push(s),
+        }
+    }
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        let mut out = String::new();
+        for p in &parts {
+            out.push('/');
+            out.push_str(p);
+        }
+        out
+    }
 }
 
 #[devices::actor("shell", ShellMsg)]
@@ -29,18 +73,32 @@ impl Shell {
     // ── Startup ──────────────────────────────────────────────────────────
     #[on_start]
     async fn on_start(&self) {
-        // The shell owns the prompt: print it on start and after every
-        // command.  The keyboard actor fire-and-forgets complete lines —
-        // no reply needed.
         println!();
-        print!("{}", PROMPT);
+        self.print_prompt();
     }
 
     // ── Message handler ───────────────────────────────────────────────────
     #[on_message(KeyLine)]
     async fn on_key_line(&self, line: String) {
         self.execute_command(&line).await;
-        print!("{}", PROMPT);
+        self.print_prompt();
+    }
+
+    fn print_prompt(&self) {
+        use libkernel::task::mailbox::ActorMsg;
+        use crate::keyboard_actor::{KeyboardMsg, KeyboardInfo};
+
+        let cwd = self.cwd.lock().clone();
+        let mut prompt = String::from("ostoo:");
+        prompt.push_str(&cwd);
+        prompt.push_str("> ");
+
+        // Notify the keyboard actor so it uses the correct column for cursor
+        // positioning and can reprint the prompt on Ctrl+C / Ctrl+L.
+        if let Some(kb) = libkernel::task::registry::get::<KeyboardMsg, KeyboardInfo>("keyboard") {
+            kb.send(ActorMsg::Inner(KeyboardMsg::SetPrompt(prompt.clone())));
+        }
+        print!("{}", prompt);
     }
 
     // ── Command dispatch ──────────────────────────────────────────────────
@@ -82,6 +140,10 @@ impl Shell {
             "drivers" => cmd_drivers(),
             "driver"  => self.cmd_driver(rest).await,
             "blk"     => self.cmd_blk(rest).await,
+            "ls"      => self.cmd_blk_ls(rest).await,
+            "cat"     => self.cmd_blk_cat(rest).await,
+            "pwd"     => self.cmd_pwd(),
+            "cd"      => self.cmd_cd(rest).await,
             other     => println!("unknown command: '{}'  (try 'help')", other),
         }
     }
@@ -97,6 +159,8 @@ impl Shell {
         };
 
         match sub {
+            "ls"  => self.cmd_blk_ls(arg).await,
+            "cat" => self.cmd_blk_cat(arg).await,
             "info" => {
                 match libkernel::task::registry::ask_info("virtio-blk").await {
                     Some(s) => {
@@ -134,7 +198,118 @@ impl Shell {
                     None          => println!("virtio-blk: no response"),
                 }
             }
-            _ => println!("usage: blk <info|read <sector>>"),
+            _ => println!("usage: blk <ls [path]|cat <path>|info|read <sector>>"),
+        }
+    }
+
+    // ── pwd ───────────────────────────────────────────────────────────────────
+    fn cmd_pwd(&self) {
+        println!("{}", self.cwd.lock().clone());
+    }
+
+    // ── cd ────────────────────────────────────────────────────────────────────
+    async fn cmd_cd(&self, path: &str) {
+        use devices::virtio::blk::{VirtioBlkMsg, VirtioBlkInfo};
+        use devices::virtio::exfat;
+
+        let cwd    = self.cwd.lock().clone();
+        let target = resolve_path(&cwd, if path.is_empty() { "/" } else { path });
+
+        let inbox = match libkernel::task::registry::get::<VirtioBlkMsg, VirtioBlkInfo>(
+            "virtio-blk"
+        ) {
+            Some(mb) => mb,
+            None => { println!("virtio-blk: driver not found"); return; }
+        };
+
+        let vol = match exfat::open_exfat(&inbox).await {
+            Ok(v)  => v,
+            Err(e) => { println!("exfat open: {:?}", e); return; }
+        };
+
+        match exfat::list_dir(&vol, &inbox, target.as_str()).await {
+            Ok(_)                                  => *self.cwd.lock() = target,
+            Err(exfat::ExfatError::PathNotFound)   => println!("cd: not found: {}", target),
+            Err(exfat::ExfatError::NotADirectory)  => println!("cd: not a directory: {}", target),
+            Err(e)                                 => println!("cd: {:?}", e),
+        }
+    }
+
+    // ── blk ls ────────────────────────────────────────────────────────────────
+    async fn cmd_blk_ls(&self, path: &str) {
+        use devices::virtio::blk::{VirtioBlkMsg, VirtioBlkInfo};
+        use devices::virtio::exfat;
+
+        let cwd  = self.cwd.lock().clone();
+        let path = resolve_path(&cwd, path);
+
+        let inbox = match libkernel::task::registry::get::<VirtioBlkMsg, VirtioBlkInfo>(
+            "virtio-blk"
+        ) {
+            Some(mb) => mb,
+            None => { println!("virtio-blk: driver not found"); return; }
+        };
+
+        let vol = match exfat::open_exfat(&inbox).await {
+            Ok(v)  => v,
+            Err(e) => { println!("exfat open: {:?}", e); return; }
+        };
+
+        match exfat::list_dir(&vol, &inbox, &path).await {
+            Ok(entries) => {
+                if entries.is_empty() {
+                    println!("  (empty)");
+                } else {
+                    for e in &entries {
+                        if e.is_dir {
+                            println!("  [DIR]        {}", e.name);
+                        } else {
+                            println!("  [FILE {:5}]  {}", e.size, e.name);
+                        }
+                    }
+                }
+            }
+            Err(e) => println!("error: {:?}", e),
+        }
+    }
+
+    // ── blk cat ───────────────────────────────────────────────────────────────
+    async fn cmd_blk_cat(&self, path: &str) {
+        use devices::virtio::blk::{VirtioBlkMsg, VirtioBlkInfo};
+        use devices::virtio::exfat;
+
+        if path.is_empty() {
+            println!("usage: cat <path>");
+            return;
+        }
+
+        let cwd  = self.cwd.lock().clone();
+        let path = resolve_path(&cwd, path);
+
+        let inbox = match libkernel::task::registry::get::<VirtioBlkMsg, VirtioBlkInfo>(
+            "virtio-blk"
+        ) {
+            Some(mb) => mb,
+            None => { println!("virtio-blk: driver not found"); return; }
+        };
+
+        let vol = match exfat::open_exfat(&inbox).await {
+            Ok(v)  => v,
+            Err(e) => { println!("exfat open: {:?}", e); return; }
+        };
+
+        match exfat::read_file(&vol, &inbox, &path).await {
+            Ok(data) => {
+                for &b in &data {
+                    if (0x20..0x7F).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
+                        print!("{}", b as char);
+                    } else {
+                        print!(".");
+                    }
+                }
+                println!();
+            }
+            Err(e) => println!("error: {:?}", e),
         }
     }
 
@@ -213,6 +388,12 @@ fn cmd_help() {
     println!("  driver info <n>   query driver info");
     println!("  blk info          virtio-blk device info");
     println!("  blk read <n>      hex-dump sector N from virtio-blk");
+    println!("  blk ls [path]     list exFAT directory (default: /)");
+    println!("  blk cat <path>    print exFAT file as text");
+    println!("  ls [path]         alias for blk ls");
+    println!("  cat <path>        alias for blk cat");
+    println!("  pwd               print working directory");
+    println!("  cd [path]         change working directory");
 }
 
 // ---------------------------------------------------------------------------
