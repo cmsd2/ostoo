@@ -228,6 +228,8 @@ impl Writer {
                     color_code,
                 });
                 self.column_position += 1;
+                let hw_col = self.column_position.min(BUFFER_WIDTH - 1);
+                unsafe { set_hw_cursor(((BUFFER_HEIGHT - 1) * BUFFER_WIDTH + hw_col) as u16); }
             }
         }
     }
@@ -242,6 +244,7 @@ impl Writer {
         }
         self.clear_row(BUFFER_HEIGHT - 1);
         self.column_position = 0;
+        unsafe { set_hw_cursor(((BUFFER_HEIGHT - 1) * BUFFER_WIDTH) as u16); }
     }
 
     /// Erase the last character on the current line (if any).
