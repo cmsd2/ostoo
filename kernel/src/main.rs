@@ -68,7 +68,7 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
 
     // Hand ownership to the global memory services so drivers can map memory
     // at runtime via libkernel::memory::with_memory().
-    libkernel::memory::init_services(mapper, frame_allocator);
+    libkernel::memory::init_services(mapper, frame_allocator, phys_mem_offset, &boot_info.memory_map);
 
     let heap_value = Box::new(41);
     println!("heap_value at {:p}", heap_value);

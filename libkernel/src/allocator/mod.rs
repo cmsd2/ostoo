@@ -69,6 +69,12 @@ pub fn init_heap(
     Ok(())
 }
 
+/// Returns `(used_bytes, free_bytes)` for the kernel heap.
+pub fn heap_stats() -> (usize, usize) {
+    let heap = crate::ALLOCATOR.lock();
+    (heap.used(), heap.free())
+}
+
 pub struct Dummy;
 
 unsafe impl GlobalAlloc for Dummy {

@@ -26,6 +26,16 @@ impl BootInfoFrameAllocator {
         }
     }
 
+    /// Number of frames that have been handed out by `allocate_frame`.
+    pub fn frames_allocated(&self) -> usize {
+        self.next
+    }
+
+    /// Total number of usable (free-at-boot) frames in the memory map.
+    pub fn total_usable_frames(&self) -> usize {
+        self.usable_frames().count()
+    }
+
     /// Returns an iterator over the usable frames specified in the memory map.
     fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
         let regions = self.memory_map.iter();

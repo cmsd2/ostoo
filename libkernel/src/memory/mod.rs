@@ -10,6 +10,7 @@ use x86_64::structures::paging::{
     FrameAllocator,
     OffsetPageTable
 };
+use bootloader::bootinfo::{MemoryMap, MemoryRegion};
 
 pub mod frame_allocator;
 pub mod vmem_allocator;
@@ -25,12 +26,32 @@ pub use vmem_allocator::DumbVmemAllocator;
 pub struct MemoryServices {
     mapper: OffsetPageTable<'static>,
     frame_allocator: BootInfoFrameAllocator,
+    phys_mem_offset: VirtAddr,
+    memory_map: &'static MemoryMap,
 }
 
 impl MemoryServices {
     /// Map a single 4 KiB page at `page` to the physical address `addr`.
     pub fn map_page(&mut self, page: Page, addr: PhysAddr, flags: PageTableFlags) -> VirtAddr {
         map_page(page, addr, &mut self.mapper, &mut self.frame_allocator, flags)
+    }
+
+    /// Virtual address at which all physical memory is linearly mapped.
+    pub fn phys_mem_offset(&self) -> VirtAddr {
+        self.phys_mem_offset
+    }
+
+    /// Iterate over every region in the bootloader memory map.
+    pub fn iter_memory_regions(&self) -> impl Iterator<Item = &MemoryRegion> {
+        self.memory_map.iter()
+    }
+
+    /// `(frames_allocated, total_usable_frames)` since boot.
+    pub fn frame_stats(&self) -> (usize, usize) {
+        (
+            self.frame_allocator.frames_allocated(),
+            self.frame_allocator.total_usable_frames(),
+        )
     }
 }
 
@@ -48,10 +69,12 @@ static MEMORY: Mutex<Option<MemoryServices>> = Mutex::new(None);
 pub fn init_services(
     mapper: OffsetPageTable<'static>,
     frame_allocator: BootInfoFrameAllocator,
+    phys_mem_offset: VirtAddr,
+    memory_map: &'static MemoryMap,
 ) {
     let mut m = MEMORY.lock();
     assert!(m.is_none(), "memory::init_services called more than once");
-    *m = Some(MemoryServices { mapper, frame_allocator });
+    *m = Some(MemoryServices { mapper, frame_allocator, phys_mem_offset, memory_map });
 }
 
 /// Run `f` with exclusive access to the kernel memory services.
