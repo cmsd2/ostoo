@@ -33,6 +33,16 @@ impl MappedIoApic {
         VersionRegister.read(self).max_redirect_entry()
     }
 
+    /// Raw IO APIC Version register (bits 0–7 = version, 16–23 = max redir entry).
+    pub unsafe fn read_version_raw(&self) -> u32 {
+        self.read_reg_32(IoApic32BitRegisterIndex::Version)
+    }
+
+    /// Read a single 64-bit redirection entry. `gsi_offset` = gsi − `self.interrupt_base`.
+    pub unsafe fn read_redirect_entry(&self, gsi_offset: u32) -> u64 {
+        self.read_reg_64(IoApic64BitRegisterIndex::RedirectionEntry(gsi_offset))
+    }
+
     pub unsafe fn mask_all(&self) {
         let max = self.max_redirect_entries();
         for i in 0..=max {

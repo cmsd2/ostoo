@@ -74,6 +74,21 @@ pub fn register_handler(handler: fn()) -> Option<u8> {
     })
 }
 
+/// Returns a bitmask of which dynamic vector slots (0x40–0x4F) are in use.
+/// Bit `i` is set when vector `DYNAMIC_BASE + i` has a registered handler.
+pub fn dynamic_slots_mask() -> u16 {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let handlers = DYNAMIC_HANDLERS.lock();
+        let mut mask = 0u16;
+        for (i, slot) in handlers.iter().enumerate() {
+            if slot.is_some() {
+                mask |= 1 << i;
+            }
+        }
+        mask
+    })
+}
+
 /// Release a previously assigned dynamic interrupt vector.
 pub fn free_vector(vector: u8) {
     if (vector < DYNAMIC_BASE)

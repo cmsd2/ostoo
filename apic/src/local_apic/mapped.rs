@@ -98,6 +98,22 @@ impl MappedLocalApic {
         self.read_reg_32(LocalApicRegisterIndex::TimerCurrentCount)
     }
 
+    /// Raw LVT Timer register (bits 0–7 = vector, 16 = mask, 17–18 = mode).
+    pub unsafe fn read_lvt_timer(&self) -> u32 {
+        self.read_reg_32(LocalApicRegisterIndex::LvtTimer)
+    }
+
+    /// Timer initial count register.
+    pub unsafe fn read_timer_initial_count(&self) -> u32 {
+        self.read_reg_32(LocalApicRegisterIndex::TimerInitialCount)
+    }
+
+    /// Raw LAPIC Version register (bits 0–7 = version, 16–23 = max LVT entry).
+    pub unsafe fn read_version_raw(&self) -> u32 {
+        // Version register is at LAPIC MMIO offset 0x030.
+        *(self.base_addr.as_ptr::<u8>().add(0x030) as *const u32)
+    }
+
     pub unsafe fn init(&self) {
         info!("[apic] init phys_addr={:?} enabled={}", Self::get_base_phys_addr(), self.is_global_enabled());
 

@@ -69,6 +69,10 @@ fn execute(line: &str) {
             println!("  memmap            physical memory regions (bootloader map)");
             println!("  meminfo           heap usage, frame stats, virtual layout");
             println!("  pmap              page table walk (coalesced 2 MiB view)");
+            println!("  cpuinfo           CPU vendor, family/model, control registers");
+            println!("  lapic             Local APIC state and timer configuration");
+            println!("  ioapic            IO APIC redirection table");
+            println!("  idt               IDT vector assignments");
         }
         "clear" => {
             libkernel::vga_buffer::clear_content();
@@ -97,6 +101,10 @@ fn execute(line: &str) {
         "memmap" => cmd_memmap(),
         "meminfo" => cmd_meminfo(),
         "pmap" => cmd_pmap(),
+        "cpuinfo" => cmd_cpuinfo(),
+        "lapic" => cmd_lapic(),
+        "ioapic" => cmd_ioapic(),
+        "idt" => cmd_idt(),
         other => {
             println!("unknown command: '{}'  (try 'help')", other);
         }
@@ -313,4 +321,184 @@ fn fmt_flags(flags: x86_64::structures::paging::PageTableFlags) -> [u8; 4] {
 /// Sign-extend bit 47 of a virtual address to produce a canonical address.
 fn sign_extend(addr: u64) -> u64 {
     if addr & (1 << 47) != 0 { addr | 0xffff_0000_0000_0000 } else { addr }
+}
+
+// ---------------------------------------------------------------------------
+// cpuinfo — CPU identity and key control-register flags
+
+fn cmd_cpuinfo() {
+    use x86_64::registers::control::{Cr0, Cr4};
+    use x86_64::registers::model_specific::Efer;
+    use x86_64::registers::rflags;
+
+    // CPUID
+    let family   = libkernel::cpuid::family().unwrap_or(0);
+    let model    = libkernel::cpuid::model().unwrap_or(0);
+    let stepping = libkernel::cpuid::stepping().unwrap_or(0);
+    let mut vbuf = [0u8; 12];
+    let vlen = libkernel::cpuid::vendor_into(&mut vbuf);
+    let vendor = core::str::from_utf8(&vbuf[..vlen]).unwrap_or("?");
+    println!("CPU: {}  family={:#x} model={:#x} stepping={}", vendor, family, model, stepping);
+
+    // CR0 — key protection/paging flags
+    let cr0 = Cr0::read().bits();
+    print!("  CR0: {:#010x}", cr0);
+    for (bit, name) in [(0, "PE"), (1, "MP"), (2, "EM"), (3, "TS"),
+                        (5, "NE"), (16, "WP"), (31, "PG")] {
+        if cr0 & (1 << bit) != 0 { print!(" {}", name); }
+    }
+    println!();
+
+    // CR4 — paging / extension flags
+    let cr4 = Cr4::read().bits();
+    print!("  CR4: {:#010x}", cr4);
+    for (bit, name) in [(5, "PAE"), (7, "PGE"), (9, "OSFXSR"),
+                        (10, "OSXMMEXCPT"), (13, "VMXE"), (20, "SMEP")] {
+        if cr4 & (1 << bit) != 0 { print!(" {}", name); }
+    }
+    println!();
+
+    // EFER MSR — long-mode / NX bits
+    let efer = Efer::read().bits();
+    print!("  EFER:{:#010x}", efer);
+    for (bit, name) in [(0, "SCE"), (8, "LME"), (10, "LMA"), (11, "NXE")] {
+        if efer & (1 << bit) != 0 { print!(" {}", name); }
+    }
+    println!();
+
+    // RFLAGS — interrupt enable etc.
+    let rf = rflags::read().bits();
+    println!("  RFLAGS: {:#018x}  IF={} IOPL={}", rf,
+        (rf >> 9) & 1, (rf >> 12) & 3);
+}
+
+// ---------------------------------------------------------------------------
+// lapic — Local APIC state and timer configuration
+
+fn cmd_lapic() {
+    let guard = apic::LOCAL_APIC.lock();
+    let Some(lapic) = guard.as_ref() else {
+        println!("Local APIC not initialised");
+        return;
+    };
+    unsafe {
+        let id       = lapic.id();
+        let phys     = apic::local_apic::MappedLocalApic::get_base_phys_addr();
+        let enabled  = lapic.is_global_enabled();
+        let ver_raw  = lapic.read_version_raw();
+        let ver_byte = ver_raw as u8;
+        let max_lvt  = (ver_raw >> 16) as u8 & 0xFF;
+
+        println!("Local APIC:");
+        println!("  ID: {}  phys={:#x}  globally enabled: {}",
+            id, phys.as_u64(), enabled);
+        println!("  Version: {:#04x}  Max LVT: {}",
+            ver_byte, max_lvt);
+
+        let lvt   = lapic.read_lvt_timer();
+        let vector = lvt as u8;
+        let masked = (lvt >> 16) & 1 != 0;
+        let mode   = match (lvt >> 17) & 3 {
+            0 => "one-shot",
+            1 => "periodic",
+            2 => "TSC-deadline",
+            _ => "unknown",
+        };
+        let init_cnt = lapic.read_timer_initial_count();
+        let curr_cnt = lapic.read_current_count();
+        println!("  Timer: {}  vec={:#04x}  {}  initial={} current={}",
+            mode, vector, if masked { "[MASKED]" } else { "" },
+            init_cnt, curr_cnt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ioapic — IO APIC redirection table
+
+fn cmd_ioapic() {
+    let io_apics = apic::IO_APICS.lock();
+    if io_apics.is_empty() {
+        println!("No IO APICs found");
+        return;
+    }
+    for apic in io_apics.iter() {
+        let (max_entries, ver) = unsafe {
+            let ver_raw = apic.read_version_raw();
+            ((ver_raw >> 16) as u8 + 1, ver_raw as u8)
+        };
+        println!("IO APIC {}:  gsi_base={}  version={:#04x}  entries={}",
+            apic.id, apic.interrupt_base, ver, max_entries);
+        println!("  GSI  Flags    Vec   Delivery  Trigger  Polarity  Dest");
+        for i in 0..max_entries as u32 {
+            let entry = unsafe { apic.read_redirect_entry(i) };
+            let vector    = (entry & 0xFF) as u8;
+            let delivery  = (entry >> 8) & 0x7;
+            let dest_mode = (entry >> 11) & 1;  // 0=physical, 1=logical
+            let polarity  = (entry >> 13) & 1;  // 0=high, 1=low
+            let trigger   = (entry >> 15) & 1;  // 0=edge, 1=level
+            let masked    = (entry >> 16) & 1 != 0;
+            let dest      = (entry >> 56) as u8;
+
+            let delivery_str = match delivery {
+                0 => "fixed",
+                1 => "low-pri",
+                2 => "SMI",
+                4 => "NMI",
+                5 => "INIT",
+                7 => "ExtINT",
+                _ => "?",
+            };
+            println!("  {:3}  {:7}  {:#04x}  {:8}  {:5}    {:8}  {} ({})",
+                apic.interrupt_base + i,
+                if masked { "[MASKED]" } else { "" },
+                vector,
+                delivery_str,
+                if trigger == 0 { "edge" } else { "level" },
+                if polarity == 0 { "hi" } else { "lo" },
+                dest,
+                if dest_mode == 0 { "phys" } else { "log" });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// idt — IDT vector assignments
+
+fn cmd_idt() {
+    use libkernel::interrupts::{DYNAMIC_BASE, DYNAMIC_COUNT, LAPIC_TIMER_VECTOR,
+                                PIC_1_OFFSET, PIC_2_OFFSET};
+
+    println!("IDT vector assignments:");
+
+    // CPU exceptions — just note which have handlers installed
+    println!("  0x00-0x1f  CPU exceptions");
+    println!("    0x03  Breakpoint         [handler]");
+    println!("    0x08  Double Fault       [handler, IST{}]",
+        libkernel::gdt::DOUBLE_FAULT_IST_INDEX);
+    println!("    0x0e  Page Fault         [handler]");
+
+    // PIC-routed IRQs
+    println!("  PIC  (master offset={:#04x}, slave offset={:#04x})",
+        PIC_1_OFFSET, PIC_2_OFFSET);
+    println!("    {:#04x}  PIT Timer          (IRQ 0)", PIC_1_OFFSET);
+    println!("    {:#04x}  PS/2 Keyboard      (IRQ 1)", PIC_1_OFFSET + 1);
+
+    // LAPIC
+    println!("  LAPIC");
+    println!("    {:#04x}  Timer (preempt stub)", LAPIC_TIMER_VECTOR);
+    println!("    0xff  Spurious           [handler]");
+
+    // Dynamic range
+    let mask = libkernel::interrupts::dynamic_slots_mask();
+    let used = mask.count_ones();
+    println!("  Dynamic {:#04x}-{:#04x}  ({}/{} in use)",
+        DYNAMIC_BASE, DYNAMIC_BASE + DYNAMIC_COUNT as u8 - 1,
+        used, DYNAMIC_COUNT);
+    if used > 0 {
+        for i in 0..DYNAMIC_COUNT {
+            if mask & (1 << i) != 0 {
+                println!("    {:#04x}  [in use]", DYNAMIC_BASE as usize + i);
+            }
+        }
+    }
 }
