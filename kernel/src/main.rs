@@ -94,7 +94,7 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     if let InterruptModel::Apic(_) = interrupt_model {
         info!("[kernel] init configuring apic");
         libkernel::memory::with_memory(|mem| {
-            apic::init(&interrupt_model, VirtAddr::new(APIC_BASE), &mut mem.mapper, &mut mem.frame_allocator);
+            apic::init(&interrupt_model, VirtAddr::new(APIC_BASE), mem);
         });
         libkernel::interrupts::disable_pic();
         apic::calibrate_and_start_lapic_timer();

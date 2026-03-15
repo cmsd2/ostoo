@@ -26,6 +26,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use spin::Mutex;
 use lazy_static::lazy_static;
 use libkernel;
+use libkernel::memory::MemoryServices;
 use x86_64::{PhysAddr, VirtAddr};
 use x86_64::structures::paging::{
     Page,
@@ -33,7 +34,6 @@ use x86_64::structures::paging::{
     PhysFrame,
     Mapper,
     Size4KiB,
-    FrameAllocator,
 };
 use local_apic::MappedLocalApic;
 use io_apic::MappedIoApic;
@@ -51,16 +51,16 @@ lazy_static! {
     pub static ref IO_APICS: Mutex<Vec<MappedIoApic>> = Mutex::new(Vec::new());
 }
 
-pub fn init(interrupt_model: &InterruptModel, remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
+pub fn init(interrupt_model: &InterruptModel, remap_addr: VirtAddr, mem: &mut MemoryServices) {
     if let InterruptModel::Apic(apic_info) = interrupt_model {
-        init_local(remap_addr, mapper, frame_allocator);
-        init_io(&apic_info.io_apics, &apic_info.interrupt_source_overrides, remap_addr + Size4KiB::SIZE, mapper, frame_allocator);
+        init_local(remap_addr, mem);
+        init_io(&apic_info.io_apics, &apic_info.interrupt_source_overrides, remap_addr + Size4KiB::SIZE, mem);
     }
 }
 
-pub fn init_io(io_apics: &[AcpiIoApic], overrides: &[InterruptSourceOverride], mut remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
+pub fn init_io(io_apics: &[AcpiIoApic], overrides: &[InterruptSourceOverride], mut remap_addr: VirtAddr, mem: &mut MemoryServices) {
     let mapped_io_apics: Vec<MappedIoApic> = io_apics.iter().map(|io_apic| {
-        let mapped_io_apic = init_io_apic(io_apic, remap_addr, mapper, frame_allocator);
+        let mapped_io_apic = init_io_apic(io_apic, remap_addr, mem);
         remap_addr = remap_addr + Size4KiB::SIZE;
         mapped_io_apic
     }).collect();
@@ -103,8 +103,8 @@ fn route_isa_irq(io_apics: &[MappedIoApic], isa_irq: u8, vector: u8, lapic_id: u
     warn!("[apic] route_isa_irq: no IO APIC found for gsi={}", gsi);
 }
 
-fn init_io_apic(io_apic: &AcpiIoApic, remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> MappedIoApic {
-    let (frame, page) = map(remap_addr, PhysAddr::new(io_apic.address as u64), mapper, frame_allocator);
+fn init_io_apic(io_apic: &AcpiIoApic, remap_addr: VirtAddr, mem: &mut MemoryServices) -> MappedIoApic {
+    let (frame, page) = map(remap_addr, PhysAddr::new(io_apic.address as u64), mem);
 
     info!("[apic] init mapped {:?} from {:?} to {:?}", io_apic, frame, page);
 
@@ -119,12 +119,12 @@ fn init_io_apic(io_apic: &AcpiIoApic, remap_addr: VirtAddr, mapper: &mut impl Ma
     mapped_io_apic
 }
 
-pub fn init_local(remap_addr: VirtAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
+pub fn init_local(remap_addr: VirtAddr, mem: &mut MemoryServices) {
     let phys_addr = unsafe {
         MappedLocalApic::get_base_phys_addr()
     };
 
-    let (frame, page) = map(remap_addr, phys_addr, mapper, frame_allocator);
+    let (frame, page) = map(remap_addr, phys_addr, mem);
 
     info!("[apic] init mapped local apic from {:?} to {:?}", frame, page);
 
@@ -201,7 +201,7 @@ pub fn calibrate_and_start_lapic_timer() {
     }
 }
 
-fn map(remap_addr: VirtAddr, phys_addr: PhysAddr, mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> (PhysFrame, Page) {
+fn map(remap_addr: VirtAddr, phys_addr: PhysAddr, mem: &mut MemoryServices) -> (PhysFrame, Page) {
     use x86_64::structures::paging::page_table::PageTableFlags as Flags;
 
     let page = Page::from_start_address(remap_addr).expect("remap apic page");
@@ -209,7 +209,7 @@ fn map(remap_addr: VirtAddr, phys_addr: PhysAddr, mapper: &mut impl Mapper<Size4
     let flags = Flags::PRESENT | Flags::WRITABLE | Flags::NO_CACHE;
 
     let map_to_result = unsafe {
-        mapper.map_to(page, frame, flags, frame_allocator)
+        mem.mapper.map_to(page, frame, flags, &mut mem.frame_allocator)
     };
 
     map_to_result.expect("map_to failed").flush();
