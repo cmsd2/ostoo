@@ -4,16 +4,19 @@ use alloc::sync::Arc;
 use alloc::string::String;
 use core::future::Future;
 use libkernel::task::{executor, scheduler, timer};
-use libkernel::task::mailbox::{ActorMsg, ActorStatus, ErasedInfo, Mailbox, Reply};
+use libkernel::task::mailbox::{ActorMsg, ActorStatus, ErasedInfo, Mailbox};
 use libkernel::task::registry;
 use libkernel::{print, println};
 use devices::task_driver::{DriverTask, StopToken};
+
+const PROMPT: &str = "ostoo> ";
 
 // ---------------------------------------------------------------------------
 // Messages
 
 pub enum ShellMsg {
-    KeyLine(String, Reply<()>),
+    /// A complete line of input from the keyboard actor.
+    KeyLine(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -41,6 +44,11 @@ impl DriverTask for Shell {
     where Self: Sized {
         async move {
             log::info!("[shell] started");
+            // The shell owns the prompt: print it on start and after every
+            // command.  The keyboard actor just echoes characters and
+            // fire-and-forgets complete lines — no reply needed.
+            println!();
+            print!("{}", PROMPT);
             while let Some(msg) = inbox.recv().await {
                 match msg {
                     ActorMsg::Info(reply) => {
@@ -52,9 +60,9 @@ impl DriverTask for Shell {
                             info: alloc::boxed::Box::new(()) as ErasedInfo,
                         });
                     }
-                    ActorMsg::Inner(ShellMsg::KeyLine(line, _reply)) => {
+                    ActorMsg::Inner(ShellMsg::KeyLine(line)) => {
                         handle.execute_command(&line).await;
-                        // _reply dropped here → keyboard_task's ask().await returns
+                        print!("{}", PROMPT);
                     }
                 }
             }

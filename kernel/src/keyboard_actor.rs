@@ -7,14 +7,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::Poll;
 use futures_util::stream::StreamExt;
 use libkernel::task::keyboard::{Key, KeyStream};
-use libkernel::task::mailbox::{ActorMsg, ActorStatus, Mailbox, Reply};
+use libkernel::task::mailbox::{ActorMsg, ActorStatus, Mailbox};
 use libkernel::task::registry;
-use libkernel::{print, println};
+use libkernel::print;
 use devices::task_driver::{DriverTask, StopToken};
 
 use crate::shell::ShellMsg;
 
-const PROMPT:   &str = "ostoo> ";
 const MAX_LINE: usize = 80 - 7 - 1; // 80 cols − len("ostoo> ") − safety margin
 
 // ---------------------------------------------------------------------------
@@ -62,35 +61,6 @@ impl KeyboardActor {
 pub type KeyboardDriver = devices::task_driver::TaskDriver<KeyboardActor>;
 
 // ---------------------------------------------------------------------------
-// Inbox message handler — used from both the main loop and the dispatch-wait
-// loop so that the actor stays responsive during shell command execution.
-
-fn handle_inbox_msg(
-    handle: &KeyboardActor,
-    msg:    ActorMsg<KeyboardMsg, KeyboardInfo>,
-) {
-    match msg {
-        ActorMsg::Info(reply) => {
-            reply.send(ActorStatus {
-                name:    "keyboard",
-                running: true,
-                info:    handle.info(),
-            });
-        }
-        ActorMsg::ErasedInfo(reply) => {
-            reply.send(ActorStatus {
-                name:    "keyboard",
-                running: true,
-                info:    alloc::boxed::Box::new(handle.info()),
-            });
-        }
-        ActorMsg::Inner(_msg) => match _msg {
-            // No messages defined yet — exhaustive match over empty enum.
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // DriverTask — manual impl because the run loop races two event sources
 
 impl DriverTask for KeyboardActor {
@@ -113,10 +83,7 @@ impl DriverTask for KeyboardActor {
             let mut buf  = [0u8; MAX_LINE];
             let mut len  = 0usize;
 
-            println!();
-            print!("{}", PROMPT);
-
-            'run: loop {
+            loop {
                 // ── The core interrupt-driven actor pattern ────────────────
                 //
                 // The keyboard actor has two independent event sources:
@@ -130,10 +97,6 @@ impl DriverTask for KeyboardActor {
                 // poll_fn polls both on every task wakeup and returns
                 // whichever is ready first.  Both AtomicWakers register the
                 // *same* task waker, so the task is rescheduled by either.
-                //
-                // inbox.recv() is created fresh each iteration — MailboxRecv
-                // re-registers the waker on every poll, so no messages are
-                // lost between iterations.
                 // ──────────────────────────────────────────────────────────
 
                 enum Event {
@@ -161,76 +124,48 @@ impl DriverTask for KeyboardActor {
                 }).await;
 
                 match event {
-                    Event::Stopped => break 'run,
+                    Event::Stopped => break,
 
-                    Event::Msg(msg) => handle_inbox_msg(&handle, msg),
+                    Event::Msg(msg) => match msg {
+                        ActorMsg::Info(reply) => {
+                            reply.send(ActorStatus {
+                                name:    "keyboard",
+                                running: true,
+                                info:    handle.info(),
+                            });
+                        }
+                        ActorMsg::ErasedInfo(reply) => {
+                            reply.send(ActorStatus {
+                                name:    "keyboard",
+                                running: true,
+                                info:    alloc::boxed::Box::new(handle.info()),
+                            });
+                        }
+                        ActorMsg::Inner(_msg) => match _msg {
+                            // No messages yet — exhaustive match over empty enum.
+                        }
+                    }
 
                     Event::Key(key) => {
                         handle.keys_processed.fetch_add(1, Ordering::Relaxed);
                         match key {
                             Key::Unicode('\n') | Key::Unicode('\r') => {
-                                println!();
+                                // The shell owns the prompt and output ordering.
+                                // Fire-and-forget: no await, no deadlock possible.
                                 let line = core::str::from_utf8(&buf[..len])
                                     .unwrap_or("").trim();
                                 if !line.is_empty() {
-                                    let line_string = alloc::string::String::from(line);
                                     if let Some(shell) = registry::get::<ShellMsg, ()>("shell") {
-                                        // ── Deadlock-safe shell dispatch ──────────────
-                                        //
-                                        // A plain shell.ask().await would suspend the
-                                        // keyboard actor while the shell runs the command.
-                                        // If that command is "driver info keyboard", the
-                                        // shell sends ErasedInfo to our inbox — but we
-                                        // can't recv() it while suspended at ask().await.
-                                        // Deadlock.
-                                        //
-                                        // Solution: send the line manually, then race the
-                                        // shell's reply channel against our own inbox.
-                                        // Any inbox message that arrives during command
-                                        // execution is handled immediately.
-                                        // ─────────────────────────────────────────────
-                                        let (reply_tx, reply_rx) = Reply::new();
                                         shell.send(ActorMsg::Inner(
-                                            ShellMsg::KeyLine(line_string, reply_tx),
+                                            ShellMsg::KeyLine(alloc::string::String::from(line)),
                                         ));
-
-                                        'dispatch: loop {
-                                            let mut shell_recv = reply_rx.recv();
-                                            let mut kb_recv    = inbox.recv();
-
-                                            enum DispEv {
-                                                ShellDone,
-                                                InboxMsg(ActorMsg<KeyboardMsg, KeyboardInfo>),
-                                                InboxClosed,
-                                            }
-
-                                            let dev = core::future::poll_fn(|cx| {
-                                                if let Poll::Ready(_) =
-                                                    Pin::new(&mut shell_recv).poll(cx)
-                                                {
-                                                    return Poll::Ready(DispEv::ShellDone);
-                                                }
-                                                match Pin::new(&mut kb_recv).poll(cx) {
-                                                    Poll::Ready(Some(m)) =>
-                                                        return Poll::Ready(DispEv::InboxMsg(m)),
-                                                    Poll::Ready(None) =>
-                                                        return Poll::Ready(DispEv::InboxClosed),
-                                                    Poll::Pending => {}
-                                                }
-                                                Poll::Pending
-                                            }).await;
-
-                                            match dev {
-                                                DispEv::ShellDone    => break 'dispatch,
-                                                DispEv::InboxClosed  => break 'run,
-                                                DispEv::InboxMsg(m)  => handle_inbox_msg(&handle, m),
-                                            }
-                                        }
                                     }
                                     handle.lines_dispatched.fetch_add(1, Ordering::Relaxed);
                                 }
                                 len = 0;
-                                print!("{}", PROMPT);
+                                // Print a blank line to separate echoed input from
+                                // shell output; the shell prints the next prompt.
+                                libkernel::println!();
                             }
 
                             Key::Unicode('\x08') => {
