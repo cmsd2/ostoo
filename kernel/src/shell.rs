@@ -21,7 +21,7 @@ pub async fn run() {
             Key::Unicode('\n') | Key::Unicode('\r') => {
                 println!();
                 let line = core::str::from_utf8(&buf[..len]).unwrap_or("").trim();
-                execute(line);
+                execute(line, &mut keys).await;
                 len = 0;
                 print!("{}", PROMPT);
             }
@@ -49,10 +49,53 @@ pub async fn run() {
     }
 }
 
-fn execute(line: &str) {
-    if line.is_empty() {
-        return;
+/// Lines of content shown per page (23-row content area minus the prompt row).
+const PAGE_HEIGHT: usize = 20;
+
+/// Capture command output, then display it page-by-page if it exceeds
+/// `PAGE_HEIGHT` lines.  The caller's `KeyStream` is borrowed so the pager
+/// can read keypresses without creating a competing waker.
+async fn execute(line: &str, keys: &mut KeyStream) {
+    if line.is_empty() { return; }
+    libkernel::vga_buffer::capture_start();
+    run_command(line);
+    let n = libkernel::vga_buffer::capture_end();
+    page_output(n, keys).await;
+}
+
+/// Show captured lines with an interactive pager.
+/// Displays `PAGE_HEIGHT` lines at a time; press Space/Enter to advance or
+/// `q` to quit early.
+async fn page_output(n: usize, keys: &mut KeyStream) {
+    if n == 0 { return; }
+    let mut start = 0usize;
+    loop {
+        let end = (start + PAGE_HEIGHT).min(n);
+        for i in start..end {
+            libkernel::vga_buffer::capture_print_line(i);
+        }
+        start = end;
+        if start >= n { break; }
+        print!("-- More -- ({}/{}) [space/enter=next  q=quit]", start, n);
+        loop {
+            match keys.next().await {
+                Some(Key::Unicode(' '))
+                | Some(Key::Unicode('\n'))
+                | Some(Key::Unicode('\r')) => {
+                    libkernel::vga_buffer::clear_current_line();
+                    break;
+                }
+                Some(Key::Unicode('q')) | Some(Key::Unicode('Q')) => {
+                    libkernel::vga_buffer::clear_current_line();
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
+}
+
+fn run_command(line: &str) {
     let (cmd, rest) = match line.find(' ') {
         Some(i) => (&line[..i], line[i + 1..].trim()),
         None => (line, ""),

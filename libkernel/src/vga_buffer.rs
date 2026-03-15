@@ -1,5 +1,6 @@
 use volatile::Volatile;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -28,10 +29,120 @@ macro_rules! status_bar {
     ($($arg:tt)*) => ($crate::vga_buffer::print_status_bar(format_args!($($arg)*)));
 }
 
+// ---------------------------------------------------------------------------
+// Output capture (used by the shell pager)
+
+/// Maximum number of lines the capture buffer can hold.
+pub const MAX_CAPTURE_LINES: usize = 256;
+
+struct CaptureBuffer {
+    data:    [[u8; BUFFER_WIDTH]; MAX_CAPTURE_LINES],
+    lens:    [usize; MAX_CAPTURE_LINES],
+    count:   usize,          // completed lines
+    cur:     [u8; BUFFER_WIDTH],
+    cur_len: usize,          // bytes in the current partial line
+}
+
+impl CaptureBuffer {
+    const fn new() -> Self {
+        CaptureBuffer {
+            data:    [[0u8; BUFFER_WIDTH]; MAX_CAPTURE_LINES],
+            lens:    [0usize; MAX_CAPTURE_LINES],
+            count:   0,
+            cur:     [0u8; BUFFER_WIDTH],
+            cur_len: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.count   = 0;
+        self.cur_len = 0;
+    }
+
+    fn push_byte(&mut self, b: u8) {
+        if b == b'\n' {
+            self.commit_line();
+        } else if self.cur_len < BUFFER_WIDTH {
+            self.cur[self.cur_len] = if (0x20..=0x7e).contains(&b) { b } else { b'?' };
+            self.cur_len += 1;
+        }
+    }
+
+    fn commit_line(&mut self) {
+        if self.count < MAX_CAPTURE_LINES {
+            let l = self.cur_len;
+            self.data[self.count][..l].copy_from_slice(&self.cur[..l]);
+            self.lens[self.count] = l;
+            self.count += 1;
+        }
+        self.cur_len = 0;
+    }
+
+    fn flush_partial(&mut self) {
+        if self.cur_len > 0 {
+            self.commit_line();
+        }
+    }
+}
+
+impl fmt::Write for CaptureBuffer {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for b in s.bytes() { self.push_byte(b); }
+        Ok(())
+    }
+}
+
+static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CAPTURE: Mutex<CaptureBuffer> = Mutex::new(CaptureBuffer::new());
+
+/// Begin capturing all `print!`/`println!` output into an internal buffer
+/// instead of writing directly to the VGA screen.
+/// Call [`capture_end`] to stop and retrieve the line count.
+pub fn capture_start() {
+    CAPTURE.lock().reset();
+    CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
+}
+
+/// Stop capturing and return the number of captured lines.
+pub fn capture_end() -> usize {
+    CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
+    let mut c = CAPTURE.lock();
+    c.flush_partial();
+    c.count
+}
+
+/// Write captured line `i` to the VGA display followed by a newline.
+/// No-op if `i` is out of range.
+pub fn capture_print_line(i: usize) {
+    let (data, len) = {
+        let c = CAPTURE.lock();
+        if i >= c.count { return; }
+        let l = c.lens[i];
+        let mut buf = [0u8; BUFFER_WIDTH];
+        buf[..l].copy_from_slice(&c.data[i][..l]);
+        (buf, l)
+    };
+    let mut w = WRITER.lock();
+    for &b in &data[..len] { w.write_byte(b); }
+    w.write_byte(b'\n');
+}
+
+/// Clear the bottom VGA row (the current writing line) and reset the column
+/// to 0.  Used by the pager to erase the `-- More --` prompt after a keypress.
+pub fn clear_current_line() {
+    let mut w = WRITER.lock();
+    w.clear_row(BUFFER_HEIGHT - 1);
+    w.column_position = 0;
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
-    WRITER.lock().write_fmt(args).unwrap();
+    if CAPTURE_ACTIVE.load(Ordering::Relaxed) {
+        CAPTURE.lock().write_fmt(args).unwrap();
+    } else {
+        WRITER.lock().write_fmt(args).unwrap();
+    }
 }
 
 #[allow(dead_code)]
