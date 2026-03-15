@@ -21,6 +21,7 @@ use log::{debug, info, warn, error};
 use acpi::platform::interrupt::InterruptModel;
 
 mod kernel_acpi;
+mod keyboard_actor;
 mod shell;
 
 pub const APIC_BASE: u64 = 0x_5555_5555_0000;
@@ -116,11 +117,16 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     libkernel::task::registry::register("shell", shell_inbox.clone());
     devices::driver::start_driver("shell").ok();
 
+    let (kb_driver, kb_inbox) =
+        keyboard_actor::KeyboardDriver::new(keyboard_actor::KeyboardActor::new());
+    devices::driver::register(Box::new(kb_driver));
+    libkernel::task::registry::register("keyboard", kb_inbox);
+    devices::driver::start_driver("keyboard").ok();
+
     #[cfg(test)]
     test_main();
 
     executor::spawn(Task::new(example_task()));
-    executor::spawn(Task::new(shell::keyboard_task(shell_inbox)));
     executor::spawn(Task::new(timer_task()));
     executor::spawn(Task::new(status_task()));
 

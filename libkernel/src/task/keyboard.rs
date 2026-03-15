@@ -19,8 +19,9 @@ pub struct ScancodeStream {
 
 impl ScancodeStream {
     pub fn new() -> Self {
-        SCANCODE_QUEUE.try_init_once(|| ArrayQueue::new(100))
-            .expect("ScancodeStream::new should only be called once");
+        // Initialise on first call; subsequent calls reuse the same queue so
+        // that a restarted keyboard actor picks up scancodes without panic.
+        let _ = SCANCODE_QUEUE.try_init_once(|| ArrayQueue::new(100));
         ScancodeStream { _private: () }
     }
 }

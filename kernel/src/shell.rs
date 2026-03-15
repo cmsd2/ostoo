@@ -3,17 +3,11 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::string::String;
 use core::future::Future;
-use futures_util::stream::StreamExt;
-use libkernel::task::keyboard::{Key, KeyStream};
 use libkernel::task::{executor, scheduler, timer};
 use libkernel::task::mailbox::{ActorMsg, ActorStatus, ErasedInfo, Mailbox, Reply};
 use libkernel::task::registry;
 use libkernel::{print, println};
 use devices::task_driver::{DriverTask, StopToken};
-
-const PROMPT: &str = "ostoo> ";
-/// Maximum input characters; keeps typed text on a single VGA row.
-const MAX_LINE: usize = 80 - 7 - 1; // 80 cols − len("ostoo> ") − safety margin
 
 // ---------------------------------------------------------------------------
 // Messages
@@ -65,50 +59,6 @@ impl DriverTask for Shell {
                 }
             }
             log::info!("[shell] stopped");
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Keyboard task — free async fn, spawned independently
-
-pub async fn keyboard_task(shell_inbox: Arc<Mailbox<ActorMsg<ShellMsg>>>) {
-    let mut keys = KeyStream::new();
-    let mut buf  = [0u8; MAX_LINE];
-    let mut len  = 0usize;
-
-    println!();
-    print!("{}", PROMPT);
-
-    while let Some(key) = keys.next().await {
-        match key {
-            Key::Unicode('\n') | Key::Unicode('\r') => {
-                println!();
-                let line = core::str::from_utf8(&buf[..len]).unwrap_or("").trim();
-                if !line.is_empty() {
-                    let line_owned = String::from(line);
-                    shell_inbox.ask(|reply| ActorMsg::Inner(ShellMsg::KeyLine(line_owned, reply))).await;
-                }
-                len = 0;
-                print!("{}", PROMPT);
-            }
-
-            Key::Unicode('\x08') => {
-                if len > 0 {
-                    len -= 1;
-                    libkernel::vga_buffer::backspace();
-                }
-            }
-
-            Key::Unicode(c) if c.is_ascii() && !c.is_control() => {
-                if len < MAX_LINE {
-                    buf[len] = c as u8;
-                    len += 1;
-                    print!("{}", c);
-                }
-            }
-
-            _ => {}
         }
     }
 }
