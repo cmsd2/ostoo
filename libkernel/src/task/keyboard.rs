@@ -9,6 +9,7 @@ use crate::print;
 use crate::println;
 
 pub use pc_keyboard::DecodedKey as Key;
+pub use pc_keyboard::KeyCode;
 
 static SCANCODE_QUEUE: OnceCell<ArrayQueue<u8>> = OnceCell::uninit();
 static WAKER: AtomicWaker = AtomicWaker::new();
@@ -59,7 +60,7 @@ impl KeyStream {
     pub fn new() -> Self {
         KeyStream {
             scancodes: ScancodeStream::new(),
-            keyboard: Keyboard::new(layouts::Us104Key, ScancodeSet1, HandleControl::Ignore),
+            keyboard: Keyboard::new(layouts::Us104Key, ScancodeSet1, HandleControl::MapLettersToUnicode),
         }
     }
 }

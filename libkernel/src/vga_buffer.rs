@@ -318,6 +318,37 @@ pub fn backspace() {
     WRITER.lock().do_backspace();
 }
 
+/// Move the VGA hardware text cursor to `pos` (linear cell index: row*80+col).
+unsafe fn set_hw_cursor(pos: u16) {
+    use x86_64::instructions::port::Port;
+    let mut idx: Port<u8> = Port::new(0x3D4);
+    let mut dat: Port<u8> = Port::new(0x3D5);
+    idx.write(0x0E);
+    dat.write((pos >> 8) as u8);
+    idx.write(0x0F);
+    dat.write(pos as u8);
+}
+
+/// Redraw the input region of the bottom row starting at `start_col`, filling
+/// it with `buf[..len]` and blanking the rest.  Moves the hardware cursor to
+/// `start_col + cursor`.
+pub fn redraw_line(start_col: usize, buf: &[u8], len: usize, cursor: usize) {
+    let mut w = WRITER.lock();
+    let row = BUFFER_HEIGHT - 1;
+    let color = w.color_code;
+    for i in 0..(BUFFER_WIDTH - start_col) {
+        let byte = if i < len { buf[i] } else { b' ' };
+        w.buffer.chars[row][start_col + i].write(ScreenChar {
+            ascii_character: byte,
+            color_code: color,
+        });
+    }
+    let new_col = (start_col + cursor).min(BUFFER_WIDTH - 1);
+    w.column_position = new_col + 1;
+    let hw_pos = (row * BUFFER_WIDTH + new_col) as u16;
+    unsafe { set_hw_cursor(hw_pos); }
+}
+
 /// Clear all content rows (2–24), reset cursor to column 0.
 pub fn clear_content() {
     let mut w = WRITER.lock();

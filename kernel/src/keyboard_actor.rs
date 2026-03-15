@@ -1,22 +1,28 @@
 extern crate alloc;
 
+use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
-use libkernel::task::keyboard::{Key, KeyStream};
+use libkernel::task::keyboard::{Key, KeyCode, KeyStream};
 use libkernel::task::mailbox::ActorMsg;
 use libkernel::task::registry;
 use libkernel::print;
 
 use crate::shell::ShellMsg;
 
-const MAX_LINE: usize = 80 - 7 - 1; // 80 cols − len("ostoo> ") − safety margin
+// ---------------------------------------------------------------------------
+// Layout constants
+
+const PROMPT: &str     = "ostoo> ";
+const PROMPT_COL: usize = 7;              // len("ostoo> ")
+const MAX_LINE: usize   = 80 - PROMPT_COL - 1;
+const MAX_HISTORY: usize = 50;
 
 // ---------------------------------------------------------------------------
 // Messages
 
 /// Control messages for the keyboard actor.
 ///
-/// Currently empty — the actor is purely interrupt-driven.  Future variants
-/// could add `SetEcho(bool)`, `SetPrompt(&'static str)`, etc.
+/// Currently empty — the actor is purely interrupt-driven.
 pub enum KeyboardMsg {}
 
 // ---------------------------------------------------------------------------
@@ -29,15 +35,54 @@ pub struct KeyboardInfo {
 }
 
 // ---------------------------------------------------------------------------
-// Line buffer — stored in the actor, protected by spin::Mutex for Send + Sync.
+// Line editor state
 
-struct LineBuf {
-    buf: [u8; MAX_LINE],
-    len: usize,
+struct LineState {
+    buf:       [u8; MAX_LINE],
+    len:       usize,
+    cursor:    usize,
+    history:   VecDeque<alloc::string::String>,  // oldest[0] … newest[last]
+    hist_idx:  Option<usize>,                    // None = live; Some(i) = history[i]
+    saved_buf: [u8; MAX_LINE],
+    saved_len: usize,
 }
 
-impl LineBuf {
-    const fn new() -> Self { LineBuf { buf: [0; MAX_LINE], len: 0 } }
+impl LineState {
+    const fn new() -> Self {
+        LineState {
+            buf:       [0; MAX_LINE],
+            len:       0,
+            cursor:    0,
+            history:   VecDeque::new(),
+            hist_idx:  None,
+            saved_buf: [0; MAX_LINE],
+            saved_len: 0,
+        }
+    }
+
+    fn push_history(&mut self, s: &str) {
+        // Don't duplicate the most-recent entry.
+        if self.history.back().map(|e| e.as_str()) == Some(s) { return; }
+        if self.history.len() == MAX_HISTORY { self.history.pop_front(); }
+        self.history.push_back(alloc::string::String::from(s));
+    }
+
+    fn current_as_string(&self) -> alloc::string::String {
+        alloc::string::String::from(
+            core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Action — computed inside the mutex, executed outside
+
+enum Action {
+    Redraw,
+    Submit(alloc::string::String),
+    ClearScreen,
+    Interrupt,
+    Ignore,
 }
 
 // ---------------------------------------------------------------------------
@@ -46,7 +91,7 @@ impl LineBuf {
 pub struct KeyboardActor {
     keys_processed:   AtomicU64,
     lines_dispatched: AtomicU64,
-    line:             spin::Mutex<LineBuf>,
+    line:             spin::Mutex<LineState>,
 }
 
 impl KeyboardActor {
@@ -54,7 +99,7 @@ impl KeyboardActor {
         KeyboardActor {
             keys_processed:   AtomicU64::new(0),
             lines_dispatched: AtomicU64::new(0),
-            line:             spin::Mutex::new(LineBuf::new()),
+            line:             spin::Mutex::new(LineState::new()),
         }
     }
 }
@@ -62,52 +107,212 @@ impl KeyboardActor {
 #[devices::actor("keyboard", KeyboardMsg)]
 impl KeyboardActor {
     // ── Stream factory ────────────────────────────────────────────────────
-    // Called once by the generated run loop before it enters the event loop.
     fn key_stream(&self) -> KeyStream { KeyStream::new() }
 
     // ── Interrupt stream handler ──────────────────────────────────────────
     #[on_stream(key_stream)]
     async fn on_key(&self, key: Key) {
         self.keys_processed.fetch_add(1, Ordering::Relaxed);
-        match key {
-            Key::Unicode('\n') | Key::Unicode('\r') => {
-                let line_str = {
-                    let lb = self.line.lock();
-                    let s = core::str::from_utf8(&lb.buf[..lb.len]).unwrap_or("").trim();
-                    alloc::string::String::from(s)
-                };
-                if !line_str.is_empty() {
-                    if let Some(shell) = registry::get::<ShellMsg, ()>("shell") {
-                        shell.send(ActorMsg::Inner(
-                            ShellMsg::KeyLine(alloc::string::String::from(line_str)),
-                        ));
+
+        let action = {
+            let mut st = self.line.lock();
+            match key {
+                // ── Submit ───────────────────────────────────────────
+                Key::Unicode('\n') | Key::Unicode('\r') => {
+                    let s = st.current_as_string();
+                    let trimmed = alloc::string::String::from(s.trim());
+                    st.len = 0; st.cursor = 0; st.hist_idx = None;
+                    if !trimmed.is_empty() {
+                        st.push_history(&trimmed);
+                        Action::Submit(trimmed)
+                    } else {
+                        Action::Redraw
                     }
-                    self.lines_dispatched.fetch_add(1, Ordering::Relaxed);
                 }
-                self.line.lock().len = 0;
-                // Print blank line; shell prints the next prompt.
+
+                // ── Backspace / Ctrl+H ───────────────────────────────
+                Key::Unicode('\x08') => {
+                    if st.cursor > 0 {
+                        let (src, dst) = (st.cursor, st.cursor - 1);
+                        let end = st.len;
+                        st.buf.copy_within(src..end, dst);
+                        st.cursor -= 1;
+                        st.len   -= 1;
+                        Action::Redraw
+                    } else { Action::Ignore }
+                }
+
+                // ── Delete (forward) ─────────────────────────────────
+                Key::RawKey(KeyCode::Delete) => {
+                    if st.cursor < st.len {
+                        let (src, dst, end) = (st.cursor + 1, st.cursor, st.len);
+                        st.buf.copy_within(src..end, dst);
+                        st.len -= 1;
+                        Action::Redraw
+                    } else { Action::Ignore }
+                }
+
+                // ── Arrow left / Ctrl+B ──────────────────────────────
+                Key::RawKey(KeyCode::ArrowLeft) | Key::Unicode('\x02') => {
+                    if st.cursor > 0 { st.cursor -= 1; Action::Redraw }
+                    else { Action::Ignore }
+                }
+
+                // ── Arrow right / Ctrl+F ─────────────────────────────
+                Key::RawKey(KeyCode::ArrowRight) | Key::Unicode('\x06') => {
+                    if st.cursor < st.len { st.cursor += 1; Action::Redraw }
+                    else { Action::Ignore }
+                }
+
+                // ── Home / Ctrl+A ────────────────────────────────────
+                Key::RawKey(KeyCode::Home) | Key::Unicode('\x01') => {
+                    st.cursor = 0; Action::Redraw
+                }
+
+                // ── End / Ctrl+E ─────────────────────────────────────
+                Key::RawKey(KeyCode::End) | Key::Unicode('\x05') => {
+                    st.cursor = st.len; Action::Redraw
+                }
+
+                // ── History up / Ctrl+P ──────────────────────────────
+                Key::RawKey(KeyCode::ArrowUp) | Key::Unicode('\x10') => {
+                    let hlen = st.history.len();
+                    if hlen == 0 {
+                        Action::Ignore
+                    } else {
+                        let new_idx = match st.hist_idx {
+                            None => {
+                                st.saved_buf = st.buf;
+                                st.saved_len = st.len;
+                                hlen - 1
+                            }
+                            Some(0)  => 0,
+                            Some(i)  => i - 1,
+                        };
+                        // Copy history entry into a temporary to avoid aliasing.
+                        let mut tmp = [0u8; MAX_LINE];
+                        let n = {
+                            let entry = st.history[new_idx].as_bytes();
+                            let n = entry.len().min(MAX_LINE);
+                            tmp[..n].copy_from_slice(&entry[..n]);
+                            n
+                        };
+                        st.buf[..n].copy_from_slice(&tmp[..n]);
+                        st.len = n; st.cursor = n;
+                        st.hist_idx = Some(new_idx);
+                        Action::Redraw
+                    }
+                }
+
+                // ── History down / Ctrl+N ────────────────────────────
+                Key::RawKey(KeyCode::ArrowDown) | Key::Unicode('\x0E') => {
+                    match st.hist_idx {
+                        None => Action::Ignore,
+                        Some(i) if i + 1 >= st.history.len() => {
+                            st.buf = st.saved_buf;
+                            st.len = st.saved_len;
+                            st.cursor = st.len;
+                            st.hist_idx = None;
+                            Action::Redraw
+                        }
+                        Some(i) => {
+                            let new_idx = i + 1;
+                            let mut tmp = [0u8; MAX_LINE];
+                            let n = {
+                                let entry = st.history[new_idx].as_bytes();
+                                let n = entry.len().min(MAX_LINE);
+                                tmp[..n].copy_from_slice(&entry[..n]);
+                                n
+                            };
+                            st.buf[..n].copy_from_slice(&tmp[..n]);
+                            st.len = n; st.cursor = n;
+                            st.hist_idx = Some(new_idx);
+                            Action::Redraw
+                        }
+                    }
+                }
+
+                // ── Kill to end / Ctrl+K ─────────────────────────────
+                Key::Unicode('\x0B') => {
+                    st.len = st.cursor; Action::Redraw
+                }
+
+                // ── Kill to start / Ctrl+U ───────────────────────────
+                Key::Unicode('\x15') => {
+                    let (src, end) = (st.cursor, st.len);
+                    st.buf.copy_within(src..end, 0);
+                    st.len   -= src;
+                    st.cursor = 0;
+                    Action::Redraw
+                }
+
+                // ── Delete previous word / Ctrl+W ────────────────────
+                Key::Unicode('\x17') => {
+                    let mut i = st.cursor;
+                    while i > 0 && st.buf[i - 1] == b' ' { i -= 1; }
+                    while i > 0 && st.buf[i - 1] != b' ' { i -= 1; }
+                    let removed = st.cursor - i;
+                    let (src, end) = (st.cursor, st.len);
+                    st.buf.copy_within(src..end, i);
+                    st.len   -= removed;
+                    st.cursor = i;
+                    Action::Redraw
+                }
+
+                // ── Ctrl+L (clear screen) ────────────────────────────
+                Key::Unicode('\x0C') => Action::ClearScreen,
+
+                // ── Ctrl+C (interrupt / clear line) ──────────────────
+                Key::Unicode('\x03') => {
+                    st.len = 0; st.cursor = 0; st.hist_idx = None;
+                    Action::Interrupt
+                }
+
+                // ── Printable ASCII (with insertion) ─────────────────
+                Key::Unicode(c) if c.is_ascii() && !c.is_control() => {
+                    if st.len < MAX_LINE {
+                        let b = c as u8;
+                        let cur = st.cursor;
+                        let end = st.len;
+                        if cur < end {
+                            st.buf.copy_within(cur..end, cur + 1);
+                        }
+                        st.buf[cur] = b;
+                        st.cursor += 1;
+                        st.len   += 1;
+                        Action::Redraw
+                    } else { Action::Ignore }
+                }
+
+                _ => Action::Ignore,
+            }
+        }; // mutex released here
+
+        // ── Act outside the mutex ─────────────────────────────────────
+        match action {
+            Action::Submit(line) => {
                 libkernel::println!();
-            }
-
-            Key::Unicode('\x08') => {
-                let mut lb = self.line.lock();
-                if lb.len > 0 {
-                    lb.len -= 1;
-                    libkernel::vga_buffer::backspace();
+                self.lines_dispatched.fetch_add(1, Ordering::Relaxed);
+                if let Some(shell) = registry::get::<ShellMsg, ()>("shell") {
+                    shell.send(ActorMsg::Inner(ShellMsg::KeyLine(line)));
                 }
+                // Shell prints the next prompt after handling the command.
             }
-
-            Key::Unicode(c) if c.is_ascii() && !c.is_control() => {
-                let mut lb = self.line.lock();
-                if lb.len < MAX_LINE {
-                    let idx = lb.len;
-                    lb.buf[idx] = c as u8;
-                    lb.len += 1;
-                    print!("{}", c);
-                }
+            Action::Redraw => {
+                let st = self.line.lock();
+                libkernel::vga_buffer::redraw_line(PROMPT_COL, &st.buf, st.len, st.cursor);
             }
-
-            _ => {}
+            Action::ClearScreen => {
+                libkernel::vga_buffer::clear_content();
+                print!("{}", PROMPT);
+                let st = self.line.lock();
+                libkernel::vga_buffer::redraw_line(PROMPT_COL, &st.buf, st.len, st.cursor);
+            }
+            Action::Interrupt => {
+                libkernel::println!("^C");
+                print!("{}", PROMPT);
+            }
+            Action::Ignore => {}
         }
     }
 
