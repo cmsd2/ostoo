@@ -1,13 +1,9 @@
 extern crate alloc;
 
-use alloc::sync::Arc;
 use alloc::string::String;
-use core::future::Future;
 use libkernel::task::{executor, scheduler, timer};
-use libkernel::task::mailbox::{ActorMsg, ActorStatus, ErasedInfo, Mailbox};
 use libkernel::task::registry;
 use libkernel::{print, println};
-use devices::task_driver::{DriverTask, StopToken};
 
 const PROMPT: &str = "ostoo> ";
 
@@ -28,53 +24,26 @@ impl Shell {
     pub fn new() -> Self { Shell }
 }
 
-pub type ShellDriver = devices::task_driver::TaskDriver<Shell>;
-
-impl DriverTask for Shell {
-    type Message = ShellMsg;
-    type Info    = ();
-
-    fn name(&self) -> &'static str { "shell" }
-
-    fn run(
-        handle: Arc<Self>,
-        _stop:  StopToken,
-        inbox:  Arc<Mailbox<ActorMsg<ShellMsg, ()>>>,
-    ) -> impl Future<Output = ()> + Send
-    where Self: Sized {
-        async move {
-            log::info!("[shell] started");
-            // The shell owns the prompt: print it on start and after every
-            // command.  The keyboard actor just echoes characters and
-            // fire-and-forgets complete lines — no reply needed.
-            println!();
-            print!("{}", PROMPT);
-            while let Some(msg) = inbox.recv().await {
-                match msg {
-                    ActorMsg::Info(reply) => {
-                        reply.send(ActorStatus { name: "shell", running: true, info: () });
-                    }
-                    ActorMsg::ErasedInfo(reply) => {
-                        reply.send(ActorStatus {
-                            name: "shell", running: true,
-                            info: alloc::boxed::Box::new(()) as ErasedInfo,
-                        });
-                    }
-                    ActorMsg::Inner(ShellMsg::KeyLine(line)) => {
-                        handle.execute_command(&line).await;
-                        print!("{}", PROMPT);
-                    }
-                }
-            }
-            log::info!("[shell] stopped");
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Command dispatch — methods on Shell
-
+#[devices::actor("shell", ShellMsg)]
 impl Shell {
+    // ── Startup ──────────────────────────────────────────────────────────
+    #[on_start]
+    async fn on_start(&self) {
+        // The shell owns the prompt: print it on start and after every
+        // command.  The keyboard actor fire-and-forgets complete lines —
+        // no reply needed.
+        println!();
+        print!("{}", PROMPT);
+    }
+
+    // ── Message handler ───────────────────────────────────────────────────
+    #[on_message(KeyLine)]
+    async fn on_key_line(&self, line: String) {
+        self.execute_command(&line).await;
+        print!("{}", PROMPT);
+    }
+
+    // ── Command dispatch ──────────────────────────────────────────────────
     async fn execute_command(&self, line: &str) {
         let (cmd, rest) = match line.find(' ') {
             Some(i) => (&line[..i], line[i + 1..].trim()),
@@ -145,10 +114,10 @@ impl Shell {
             "info" => {
                 if name.is_empty() {
                     println!("usage: driver info <name>");
-                } else if name == self.name() {
+                } else if name == "shell" {
                     // Sending ErasedInfo to our own mailbox would deadlock —
                     // we can't recv() while blocked executing this command.
-                    println!("  name:    {}", self.name());
+                    println!("  name:    shell");
                     println!("  running: true");
                 } else {
                     match registry::ask_info(name).await {
@@ -253,15 +222,12 @@ fn cmd_pmap() {
 
     let phys_off = libkernel::memory::with_memory(|m| m.phys_mem_offset().as_u64());
 
-    // Safety: phys_off + frame_phys is a valid virtual address for any physical
-    // frame, because the bootloader maps all physical memory at phys_off.
     let (pml4_frame, _) = Cr3::read();
     let cr3_phys = pml4_frame.start_address().as_u64();
 
     println!("Page table (CR3={:#x}):", cr3_phys);
     println!("  {:18}  {:12}  {:6}  Flags", "Virtual", "Physical", "Size");
 
-    // State for run coalescing
     let mut run_v    = 0u64;
     let mut run_p    = 0u64;
     let mut run_size = 0u64;
@@ -293,7 +259,6 @@ fn cmd_pmap() {
             let va_pdpt = va_pml4 + ((j as u64) << 30);
 
             if pdpte.flags().contains(F::HUGE_PAGE) {
-                // 1 GiB page
                 push_run(&mut run_v, &mut run_p, &mut run_size, &mut run_flags,
                          &mut line_count, MAX_LINES,
                          va_pdpt, pdpte.addr().as_u64(), 1u64 << 30, pdpte.flags());
@@ -313,7 +278,6 @@ fn cmd_pmap() {
                     continue;
                 }
                 let va_pd = va_pdpt + ((k as u64) << 21);
-                // Treat both huge-2M and sub-page PD entries as 2 MiB regions.
                 let phys = pde.addr().as_u64();
                 push_run(&mut run_v, &mut run_p, &mut run_size, &mut run_flags,
                          &mut line_count, MAX_LINES,
@@ -333,8 +297,6 @@ fn cmd_pmap() {
     }
 }
 
-/// Try to extend the current run; if the new entry doesn't continue it, flush
-/// and start a new run.
 fn push_run(
     run_v: &mut u64, run_p: &mut u64, run_size: &mut u64,
     run_flags: &mut x86_64::structures::paging::PageTableFlags,
@@ -343,10 +305,8 @@ fn push_run(
     flags: x86_64::structures::paging::PageTableFlags,
 ) {
     use x86_64::structures::paging::PageTableFlags as F;
-    // Normalise: only track these flag bits for coalescing.
     let norm = flags & (F::PRESENT | F::WRITABLE | F::USER_ACCESSIBLE
                         | F::NO_EXECUTE | F::NO_CACHE);
-
     if *run_size > 0
         && virt == *run_v + *run_size
         && phys == *run_p + *run_size
@@ -398,7 +358,6 @@ fn fmt_flags(flags: x86_64::structures::paging::PageTableFlags) -> [u8; 4] {
     ]
 }
 
-/// Sign-extend bit 47 of a virtual address to produce a canonical address.
 fn sign_extend(addr: u64) -> u64 {
     if addr & (1 << 47) != 0 { addr | 0xffff_0000_0000_0000 } else { addr }
 }
@@ -411,7 +370,6 @@ fn cmd_cpuinfo() {
     use x86_64::registers::model_specific::Efer;
     use x86_64::registers::rflags;
 
-    // CPUID
     let family   = libkernel::cpuid::family().unwrap_or(0);
     let model    = libkernel::cpuid::model().unwrap_or(0);
     let stepping = libkernel::cpuid::stepping().unwrap_or(0);
@@ -420,7 +378,6 @@ fn cmd_cpuinfo() {
     let vendor = core::str::from_utf8(&vbuf[..vlen]).unwrap_or("?");
     println!("CPU: {}  family={:#x} model={:#x} stepping={}", vendor, family, model, stepping);
 
-    // CR0 — key protection/paging flags
     let cr0 = Cr0::read().bits();
     print!("  CR0: {:#010x}", cr0);
     for (bit, name) in [(0, "PE"), (1, "MP"), (2, "EM"), (3, "TS"),
@@ -429,7 +386,6 @@ fn cmd_cpuinfo() {
     }
     println!();
 
-    // CR4 — paging / extension flags
     let cr4 = Cr4::read().bits();
     print!("  CR4: {:#010x}", cr4);
     for (bit, name) in [(5, "PAE"), (7, "PGE"), (9, "OSFXSR"),
@@ -438,7 +394,6 @@ fn cmd_cpuinfo() {
     }
     println!();
 
-    // EFER MSR — long-mode / NX bits
     let efer = Efer::read().bits();
     print!("  EFER:{:#010x}", efer);
     for (bit, name) in [(0, "SCE"), (8, "LME"), (10, "LMA"), (11, "NXE")] {
@@ -446,7 +401,6 @@ fn cmd_cpuinfo() {
     }
     println!();
 
-    // RFLAGS — interrupt enable etc.
     let rf = rflags::read().bits();
     println!("  RFLAGS: {:#018x}  IF={} IOPL={}", rf,
         (rf >> 9) & 1, (rf >> 12) & 3);
@@ -513,9 +467,9 @@ fn cmd_ioapic() {
             let entry = unsafe { apic.read_redirect_entry(i) };
             let vector    = (entry & 0xFF) as u8;
             let delivery  = (entry >> 8) & 0x7;
-            let dest_mode = (entry >> 11) & 1;  // 0=physical, 1=logical
-            let polarity  = (entry >> 13) & 1;  // 0=high, 1=low
-            let trigger   = (entry >> 15) & 1;  // 0=edge, 1=level
+            let dest_mode = (entry >> 11) & 1;
+            let polarity  = (entry >> 13) & 1;
+            let trigger   = (entry >> 15) & 1;
             let masked    = (entry >> 16) & 1 != 0;
             let dest      = (entry >> 56) as u8;
 
@@ -549,26 +503,19 @@ fn cmd_idt() {
                                 PIC_1_OFFSET, PIC_2_OFFSET};
 
     println!("IDT vector assignments:");
-
-    // CPU exceptions — just note which have handlers installed
     println!("  0x00-0x1f  CPU exceptions");
     println!("    0x03  Breakpoint         [handler]");
     println!("    0x08  Double Fault       [handler, IST{}]",
         libkernel::gdt::DOUBLE_FAULT_IST_INDEX);
     println!("    0x0e  Page Fault         [handler]");
-
-    // PIC-routed IRQs
     println!("  PIC  (master offset={:#04x}, slave offset={:#04x})",
         PIC_1_OFFSET, PIC_2_OFFSET);
     println!("    {:#04x}  PIT Timer          (IRQ 0)", PIC_1_OFFSET);
     println!("    {:#04x}  PS/2 Keyboard      (IRQ 1)", PIC_1_OFFSET + 1);
-
-    // LAPIC
     println!("  LAPIC");
     println!("    {:#04x}  Timer (preempt stub)", LAPIC_TIMER_VECTOR);
     println!("    0xff  Spurious           [handler]");
 
-    // Dynamic range
     let mask = libkernel::interrupts::dynamic_slots_mask();
     let used = mask.count_ones();
     println!("  Dynamic {:#04x}-{:#04x}  ({}/{} in use)",

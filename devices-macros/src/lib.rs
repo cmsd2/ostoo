@@ -64,6 +64,23 @@ pub fn on_info(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
+/// Marks a method to be called once when the actor's run loop starts,
+/// before the first message is received.
+///
+/// ```ignore
+/// #[on_start]
+/// async fn on_start(&self) {
+///     log::info!("actor started");
+/// }
+/// ```
+///
+/// Only one `#[on_start]` method is allowed per actor.
+/// This attribute has no effect when used outside an `#[actor]` block.
+#[proc_macro_attribute]
+pub fn on_start(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
 /// Registers an async `Stream` event source inside an [`actor`] impl block.
 ///
 /// ```ignore
@@ -170,6 +187,7 @@ fn actor_expand(
     // Separate items into their categories.
     let mut handler_methods: Vec<HandlerMethod> = Vec::new();
     let mut info_override:   Option<InfoOverride> = None;
+    let mut on_start:        Option<OnStart>       = None;
     let mut on_tick:         Option<OnTick>        = None;
     let mut on_streams:      Vec<OnStream>          = Vec::new();
     let mut other_items:     Vec<&ImplItem>         = Vec::new();
@@ -187,6 +205,15 @@ fn actor_expand(
                     ));
                 }
                 info_override = Some(InfoOverride::new(method)?);
+                continue;
+            }
+            if has_on_start(method) {
+                if on_start.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        method, "only one #[on_start] method is allowed per actor",
+                    ));
+                }
+                on_start = Some(OnStart::new(method)?);
                 continue;
             }
             if has_on_tick(method) {
@@ -273,8 +300,17 @@ fn actor_expand(
     // All extracted methods + other items go into the inherent impl.
     let inherent_fns = handler_methods.iter().map(|h| &h.clean_method)
         .chain(info_override.iter().map(|ov| &ov.clean_method))
+        .chain(on_start.iter().map(|os| &os.clean_method))
         .chain(on_tick.iter().map(|ot| &ot.clean_method))
         .chain(on_streams.iter().map(|os| &os.clean_method));
+
+    // Optional startup call emitted once before the run loop.
+    let start_call: TokenStream2 = if let Some(ref os) = on_start {
+        let method = &os.method_name;
+        quote! { handle.#method().await; }
+    } else {
+        quote! {}
+    };
 
     let name_str = driver_name.value();
 
@@ -459,6 +495,7 @@ fn actor_expand(
                 #[allow(unused_imports)]
                 use ::core::future::Future as _;
                 ::log::info!("[{}] started", #name_str);
+                #start_call
                 #run_loop
                 ::log::info!("[{}] stopped", #name_str);
             }
@@ -537,6 +574,24 @@ impl InfoOverride {
         clean.attrs.retain(|a| !a.path().is_ident("on_info"));
         Ok(InfoOverride { method_name, clean_method: clean, info_type })
     }
+}
+
+struct OnStart {
+    method_name:  syn::Ident,
+    clean_method: ImplItemFn,
+}
+
+impl OnStart {
+    fn new(method: &ImplItemFn) -> syn::Result<Self> {
+        let method_name = method.sig.ident.clone();
+        let mut clean = method.clone();
+        clean.attrs.retain(|a| !a.path().is_ident("on_start"));
+        Ok(OnStart { method_name, clean_method: clean })
+    }
+}
+
+fn has_on_start(method: &ImplItemFn) -> bool {
+    method.attrs.iter().any(|a| a.path().is_ident("on_start"))
 }
 
 struct OnTick {
