@@ -1,5 +1,6 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::actor;
+use libkernel::task::timer::TICKS_PER_SECOND;
 
 #[derive(Debug)]
 pub struct DummyInfo {
@@ -22,6 +23,16 @@ impl Dummy {
 
 #[actor("dummy", DummyMsg)]
 impl Dummy {
+    fn tick_interval_ticks(&self) -> u64 {
+        self.interval_secs.load(Ordering::Relaxed) * TICKS_PER_SECOND
+    }
+
+    #[on_tick]
+    async fn heartbeat(&self) {
+        info!("[dummy] heartbeat (interval={}s)",
+              self.interval_secs.load(Ordering::Relaxed));
+    }
+
     #[on_info]
     async fn on_info(&self) -> DummyInfo {
         DummyInfo {

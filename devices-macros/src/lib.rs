@@ -25,6 +25,25 @@ pub fn on_message(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
+/// Marks a method as the periodic tick handler inside an [`actor`] impl block.
+///
+/// ```ignore
+/// fn tick_interval_ticks(&self) -> u64 { 1000 }
+///
+/// #[on_tick]
+/// async fn heartbeat(&self) { log::info!("tick"); }
+/// ```
+///
+/// When `#[on_tick]` is present `#[actor]` replaces `inbox.recv()` with
+/// `inbox.recv_timeout(handle.tick_interval_ticks())` and calls the annotated
+/// method on every elapsed interval.  The actor struct must also provide a
+/// plain `tick_interval_ticks(&self) -> u64` method (no attribute needed).
+/// This attribute has no effect when used outside an `#[actor]` block.
+#[proc_macro_attribute]
+pub fn on_tick(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
 /// Override the default `ActorMsg::Info` handler inside an [`actor`] impl block.
 ///
 /// Without this attribute every actor responds to `Info` with
@@ -132,11 +151,13 @@ fn actor_expand(
     };
 
     // Separate items: methods with #[on_message] become inner handlers;
-    // a method with #[on_info] overrides the Info arm; everything else stays
-    // in the DriverTask impl.
+    // a method with #[on_info] overrides the Info arm; a method with
+    // #[on_tick] becomes the periodic tick handler; everything else goes
+    // into the inherent impl unchanged.
     let mut handler_methods: Vec<HandlerMethod> = Vec::new();
     let mut info_override:   Option<InfoOverride> = None;
-    let mut trait_items:     Vec<&ImplItem>       = Vec::new();
+    let mut on_tick:         Option<OnTick>        = None;
+    let mut other_items:     Vec<&ImplItem>        = Vec::new();
 
     for item in &input.items {
         if let ImplItem::Fn(method) = item {
@@ -153,8 +174,17 @@ fn actor_expand(
                 info_override = Some(InfoOverride::new(method)?);
                 continue;
             }
+            if has_on_tick(method) {
+                if on_tick.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        method, "only one #[on_tick] method is allowed per actor",
+                    ));
+                }
+                on_tick = Some(OnTick::new(method)?);
+                continue;
+            }
         }
-        trait_items.push(item);
+        other_items.push(item);
     }
 
     // Build match arms for the inner message dispatch.
@@ -231,15 +261,51 @@ fn actor_expand(
         }
     };
 
-    // All extracted methods go into the inherent impl.
+    // All extracted methods + plain other_items go into the inherent impl.
     let inherent_fns = handler_methods.iter().map(|h| &h.clean_method)
-        .chain(info_override.iter().map(|ov| &ov.clean_method));
+        .chain(info_override.iter().map(|ov| &ov.clean_method))
+        .chain(on_tick.iter().map(|ot| &ot.clean_method));
 
     let name_str = driver_name.value();
+
+    // Generate the run loop body — with or without tick support.
+    let run_loop = if let Some(ref ot) = on_tick {
+        let tick_method = &ot.method_name;
+        quote! {
+            loop {
+                match inbox.recv_timeout(handle.tick_interval_ticks()).await {
+                    ::libkernel::task::mailbox::RecvTimeout::Message(_msg) => match _msg {
+                        #info_arm
+                        #erased_info_arm
+                        ::libkernel::task::mailbox::ActorMsg::Inner(_msg) => match _msg {
+                            #(#inner_arms)*
+                        }
+                    }
+                    ::libkernel::task::mailbox::RecvTimeout::Closed => break,
+                    ::libkernel::task::mailbox::RecvTimeout::Elapsed => {
+                        handle.#tick_method().await;
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            while let ::core::option::Option::Some(_msg) = inbox.recv().await {
+                match _msg {
+                    #info_arm
+                    #erased_info_arm
+                    ::libkernel::task::mailbox::ActorMsg::Inner(_msg) => match _msg {
+                        #(#inner_arms)*
+                    }
+                }
+            }
+        }
+    };
 
     Ok(quote! {
         impl #self_ty {
             #(#inherent_fns)*
+            #(#other_items)*
         }
 
         impl crate::task_driver::DriverTask for #self_ty {
@@ -247,8 +313,6 @@ fn actor_expand(
             type Info    = #info_type;
 
             fn name(&self) -> &'static str { #driver_name }
-
-            #(#trait_items)*
 
             async fn run(
                 handle: ::alloc::sync::Arc<Self>,
@@ -260,15 +324,7 @@ fn actor_expand(
                 >,
             ) {
                 ::log::info!("[{}] started", #name_str);
-                while let ::core::option::Option::Some(_msg) = inbox.recv().await {
-                    match _msg {
-                        #info_arm
-                        #erased_info_arm
-                        ::libkernel::task::mailbox::ActorMsg::Inner(_msg) => match _msg {
-                            #(#inner_arms)*
-                        }
-                    }
-                }
+                #run_loop
                 ::log::info!("[{}] stopped", #name_str);
             }
         }
@@ -351,4 +407,22 @@ impl InfoOverride {
         clean.attrs.retain(|a| !a.path().is_ident("on_info"));
         Ok(InfoOverride { method_name, clean_method: clean, info_type })
     }
+}
+
+struct OnTick {
+    method_name:  syn::Ident,
+    clean_method: ImplItemFn,
+}
+
+impl OnTick {
+    fn new(method: &ImplItemFn) -> syn::Result<Self> {
+        let method_name = method.sig.ident.clone();
+        let mut clean = method.clone();
+        clean.attrs.retain(|a| !a.path().is_ident("on_tick"));
+        Ok(OnTick { method_name, clean_method: clean })
+    }
+}
+
+fn has_on_tick(method: &ImplItemFn) -> bool {
+    method.attrs.iter().any(|a| a.path().is_ident("on_tick"))
 }

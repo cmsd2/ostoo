@@ -47,6 +47,15 @@ pub enum ActorMsg<M, I: Send = ()> {
 }
 
 // ---------------------------------------------------------------------------
+// RecvTimeout — outcome of a timed receive
+
+pub enum RecvTimeout<M> {
+    Message(M),
+    Closed,
+    Elapsed,
+}
+
+// ---------------------------------------------------------------------------
 // Mailbox
 
 struct MailboxInner<M> {
@@ -121,6 +130,28 @@ impl<M: Send> Mailbox<M> {
     /// Return a future that resolves to `Some(msg)` or `None` when closed.
     pub fn recv(&self) -> MailboxRecv<'_, M> {
         MailboxRecv { mailbox: self }
+    }
+
+    /// Return a future that resolves when a message arrives, the mailbox is
+    /// closed, or `ticks` timer ticks have elapsed — whichever comes first.
+    pub fn recv_timeout(&self, ticks: u64)
+        -> impl core::future::Future<Output = RecvTimeout<M>> + '_
+    {
+        use crate::task::timer::Delay;
+        let mut recv  = self.recv();
+        let mut delay = Delay::new(ticks);
+        core::future::poll_fn(move |cx| {
+            if let Poll::Ready(opt) = Pin::new(&mut recv).poll(cx) {
+                return Poll::Ready(match opt {
+                    Some(msg) => RecvTimeout::Message(msg),
+                    None      => RecvTimeout::Closed,
+                });
+            }
+            if let Poll::Ready(()) = Pin::new(&mut delay).poll(cx) {
+                return Poll::Ready(RecvTimeout::Elapsed);
+            }
+            Poll::Pending
+        })
     }
 
     /// Non-blocking dequeue; returns `None` if the queue is empty.
