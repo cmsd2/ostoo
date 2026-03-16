@@ -8,11 +8,6 @@ const USER_CODE_VIRT: u64  = 0x0040_0000;
 const USER_STACK_VIRT: u64 = 0x0050_0000;
 const USER_STACK_TOP: u64  = USER_STACK_VIRT + 0x1000;
 
-/// Small dedicated stack for the iretq trampoline in `launch_isolated`.
-/// Lives in BSS (PML4 entry 510) so it survives any CR3 switch.
-/// Only needs room for the 5-entry iretq frame (40 bytes); 128 bytes is plenty.
-static mut TRAMPOLINE_STACK: [u8; 128] = [0; 128];
-
 // ---------------------------------------------------------------------------
 // Assembly blobs
 
@@ -119,23 +114,14 @@ fn launch_isolated(code: &[u8]) -> ! {
     // spaces correctly when context-switching away from this thread.
     libkernel::task::scheduler::set_current_cr3(user_pml4.as_u64());
 
-    // The boot stack (thread 0) lives in the bootloader's lower-half mapping
-    // which is not present in the user PML4, so we must switch RSP to a
-    // high-half stack *before* changing CR3.  We use a dedicated trampoline
-    // stack (BSS, PML4 entry 510) rather than the SYSCALL stack to avoid
-    // aliasing with the syscall entry stub or timer ISR.
-    let ksp = unsafe {
-        (&raw const TRAMPOLINE_STACK as *const u8).add(128) as u64
-    };
-
+    // Thread 0's stack is now heap-allocated (PML4 entry 256, high half)
+    // which is copied into user page tables, so no trampoline is needed.
     unsafe {
         core::arch::asm!(
             "cli",
             "swapgs",
-            // Move to a stack that survives the CR3 switch (BSS, entry 510).
-            "mov rsp, {ksp}",
             // Switch to the isolated address space.  The kernel (entry 510)
-            // remains mapped, so the next instruction fetch succeeds.
+            // and heap (entry 256) remain mapped, so RSP stays valid.
             "mov cr3, {pml4}",
             // Build the iretq frame (SS, RSP, RFLAGS, CS, RIP) and return.
             "push {ss}",
@@ -144,7 +130,6 @@ fn launch_isolated(code: &[u8]) -> ! {
             "push {cs}",
             "push {ip}",
             "iretq",
-            ksp   = in(reg) ksp,
             pml4  = in(reg) user_pml4.as_u64(),
             ss    = in(reg) user_ss,
             usp   = in(reg) USER_STACK_TOP,

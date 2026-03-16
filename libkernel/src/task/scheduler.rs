@@ -114,6 +114,30 @@ core::arch::global_asm!(
     "iretq",
 );
 
+/// Allocate a heap stack and switch RSP to it, then call `continuation`.
+///
+/// This moves the boot thread off the bootloader's lower-half stack onto a
+/// heap-backed stack (PML4 entry 256, high canonical half).  The old stack is
+/// abandoned — `continuation` must never return.
+///
+/// Call once, after the heap allocator is initialised.
+pub fn migrate_to_heap_stack(continuation: fn() -> !) -> ! {
+    const STACK_SIZE: usize = 64 * 1024;
+    let mut stack: Vec<u8> = Vec::with_capacity(STACK_SIZE);
+    stack.resize(STACK_SIZE, 0u8);
+    let stack_top = (stack.as_ptr() as u64 + stack.len() as u64) & !0xF;
+    core::mem::forget(stack); // leaked — permanent stack for thread 0
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {top}",
+            "call {entry}",
+            top = in(reg) stack_top,
+            entry = in(reg) continuation,
+            options(noreturn),
+        );
+    }
+}
+
 /// Register the current execution context as thread 0.
 /// Call once, after the heap is initialised and before starting the executor.
 pub fn init() {

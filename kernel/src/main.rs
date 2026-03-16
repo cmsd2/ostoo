@@ -50,7 +50,6 @@ entry_point!(libkernel_main);
 pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     use libkernel::memory;
     use libkernel::allocator;
-    use alloc::{boxed::Box, vec, vec::Vec, rc::Rc};
 
     libkernel::vga_buffer::init_display();
 
@@ -83,12 +82,23 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     // at runtime via libkernel::memory::with_memory().
     libkernel::memory::init_services(mapper, frame_allocator, phys_mem_offset, &boot_info.memory_map);
 
+    // The bootloader's stack lives in the lower canonical half.  Migrate
+    // thread 0 to a heap-allocated stack (PML4 entry 256, high half) so
+    // that it survives CR3 switches into user page tables.
+    scheduler::migrate_to_heap_stack(run_kernel);
+}
+
+fn run_kernel() -> ! {
+    use alloc::{boxed::Box, vec, vec::Vec, rc::Rc};
+
     // Map the VGA framebuffer into the kernel high half so it is accessible
     // from isolated user page tables (entries 256–510 are shared).
     let vga_virt = libkernel::memory::with_memory(|mem| {
         mem.map_mmio_region(x86_64::PhysAddr::new(0xb8000), 0x1000)
     });
     libkernel::vga_buffer::remap_vga(vga_virt);
+
+    let phys_mem_offset = libkernel::memory::with_memory(|mem| mem.phys_mem_offset());
 
     let heap_value = Box::new(41);
     println!("heap_value at {:p}", heap_value);
