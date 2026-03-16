@@ -29,9 +29,15 @@ Threads cycle between **Ready** and **Running** in strict round-robin order.
 There is no blocked/sleeping state for threads — a thread that has nothing to
 do (idle executor loop) calls `HLT` until an interrupt wakes it.
 
-Thread 0 is the initial kernel thread (the boot stack).  Additional threads
-are created with `scheduler::spawn_thread(entry: fn() -> !)`.  The entry
-function must never return; in practice it calls `executor::run_worker()`.
+Thread 0 is the initial kernel thread.  Early in boot, `libkernel_main` calls
+`scheduler::migrate_to_heap_stack(run_kernel)` which allocates a 64 KiB heap
+stack and switches RSP to it before continuing.  This moves thread 0 off the
+bootloader's lower-half stack onto PML4 entry 256 (high canonical half), so
+its stack survives CR3 switches into user page tables.
+
+Additional threads are created with `scheduler::spawn_thread(entry: fn() -> !)`.
+The entry function must never return; in practice it calls
+`executor::run_worker()`.
 
 ---
 

@@ -73,7 +73,7 @@ Toolchain: current nightly (floating, `rust-toolchain.toml`).
   all virtual address allocation at runtime.
 
 ### 10. Heap Allocation
-- Kernel heap mapped at `0xFFFF_8000_0000_0000`, size 100 KiB
+- Kernel heap mapped at `0xFFFF_8000_0000_0000`, size 256 KiB
   (`libkernel/src/allocator/mod.rs`).
 - Global allocator: `linked_list_allocator::LockedHeap`.
 - `extern crate alloc` available; `Box`, `Vec`, `Rc`, `BTreeMap`, etc. all work.
@@ -110,6 +110,10 @@ Toolchain: current nightly (floating, `rust-toolchain.toml`).
 - `preempt_tick` advances the tick counter, acknowledges the LAPIC interrupt,
   decrements the quantum, and when it expires saves the old RSP, selects the
   next ready thread, and returns its `saved_rsp`.
+- `scheduler::migrate_to_heap_stack(run_kernel)` allocates a 64 KiB heap stack
+  and switches thread 0 off the bootloader's lower-half stack onto PML4
+  entry 256 (high canonical half), so it survives CR3 switches into user page
+  tables.
 - `scheduler::init()` registers the boot context as thread 0.
 - `scheduler::spawn_thread(entry)` allocates a 64 KiB stack, synthesises an
   iret frame, and enqueues the new thread.
@@ -236,10 +240,11 @@ are present, racing all event sources in a single future.
 ## Known Issues / Technical Debt
 
 ### Heap Size
-The heap is a fixed 100 KiB at `0xFFFF_8000_0000_0000`. This is sufficient for
-the current workload but will need to grow for any real subsystem work.
-The `DumbVmemAllocator` has no reclamation path, so virtual address space
-for MMIO/ACPI mappings is also consumed monotonically.
+The heap is a fixed 256 KiB at `0xFFFF_8000_0000_0000`. This accommodates two
+64 KiB thread stacks (thread 0 and thread 1) plus driver and task allocations,
+but will need to grow for any real subsystem work.  The `DumbVmemAllocator` has
+no reclamation path, so virtual address space for MMIO/ACPI mappings is also
+consumed monotonically.
 
 ### virtio-blk Busy Polling
 `CompletionFuture` re-schedules itself immediately rather than sleeping on an

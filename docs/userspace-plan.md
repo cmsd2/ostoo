@@ -43,7 +43,7 @@ self-mapping.
 0x0000_3FFF_FF00_0000  ← user stack top (grows down)
 0x0000_7FFF_FFFF_FFFF  ← top of lower canonical half (entire range = user)
                          (non-canonical gap)
-0xFFFF_8000_0000_0000  ← kernel heap        (HEAP_START, 100 KiB)
+0xFFFF_8000_0000_0000  ← kernel heap        (HEAP_START, 256 KiB)
 0xFFFF_8001_0000_0000  ← Local APIC MMIO    (APIC_BASE)
 0xFFFF_8001_0001_0000  ← IO APIC(s)
 0xFFFF_8002_0000_0000  ← MMIO window        (MMIO_VIRT_BASE, 512 GiB)
@@ -597,9 +597,10 @@ per-CPU `CURRENT_PID`, per-CPU kernel stacks in the TSS, and IPI-based TLB
 shootdown when modifying another process's page table.
 
 ### Heap size
-The kernel heap is 100 KiB.  Process control blocks, page table frames, and
-file tables will exhaust this quickly.  Grow the heap (or implement demand
-paging) before loading real programs.
+The kernel heap is 256 KiB (increased from 100 KiB to accommodate heap-allocated
+thread stacks).  Process control blocks, page table frames, and file tables will
+exhaust this quickly.  Grow the heap (or implement demand paging) before loading
+real programs.
 
 ---
 

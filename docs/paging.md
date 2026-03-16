@@ -9,7 +9,7 @@ x86-64 canonical addresses split into two halves:
        ...            │  lower canonical half — user process address space
 0x0000_7FFF_FFFF_FFFF ┘
                         (non-canonical gap — any access faults)
-0xFFFF_8000_0000_0000   kernel heap        (HEAP_START, 100 KiB)
+0xFFFF_8000_0000_0000   kernel heap        (HEAP_START, 256 KiB)
 0xFFFF_8001_0000_0000   Local APIC MMIO   (APIC_BASE, 4 KiB)
 0xFFFF_8001_0001_0000   IO APIC(s)        (4 KiB × n, relative to APIC_BASE)
 0xFFFF_8002_0000_0000   MMIO window       (MMIO_VIRT_BASE, 512 GiB)
