@@ -20,6 +20,21 @@ pub fn current_thread_idx() -> usize {
     CURRENT_THREAD_IDX_ATOMIC.load(Ordering::Relaxed)
 }
 
+/// Update the PML4 physical address recorded for the currently running thread.
+///
+/// Call this before switching CR3 outside the scheduler (e.g. before `iretq`
+/// to a user process) so that `preempt_tick` will restore the correct
+/// address space on context switch.
+pub fn set_current_cr3(pml4_phys: u64) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        if sched.initialized {
+            let idx = sched.current_idx;
+            sched.threads[idx].pml4_phys = pml4_phys;
+        }
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ThreadId(u64);
 
@@ -40,6 +55,9 @@ struct Thread {
     id: ThreadId,
     state: ThreadState,
     saved_rsp: u64,
+    /// Physical address of this thread's PML4 (CR3 value).
+    /// All kernel threads share the boot PML4; user processes each have their own.
+    pml4_phys: u64,
     ticks_remaining: u32,
     /// Owned stack backing. None for thread 0 (uses the boot stack).
     _stack: Option<Vec<u8>>,
@@ -100,6 +118,7 @@ core::arch::global_asm!(
 /// Call once, after the heap is initialised and before starting the executor.
 pub fn init() {
     x86_64::instructions::interrupts::without_interrupts(|| {
+        let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
         let mut sched = SCHEDULER.lock();
         // Pre-allocate so that preempt_tick's push_back never allocates from
         // ISR context (where the heap allocator may already be locked).
@@ -110,6 +129,7 @@ pub fn init() {
             id,
             state: ThreadState::Running,
             saved_rsp: 0, // filled in on first preemption
+            pml4_phys: cr3_frame.start_address().as_u64(),
             ticks_remaining: QUANTUM_TICKS,
             _stack: None,
         });
@@ -159,6 +179,7 @@ pub fn spawn_thread(entry: fn() -> !) {
         frame.add(19).write(0);                     // SS
     }
 
+    let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut sched = SCHEDULER.lock();
         let id = ThreadId::new();
@@ -167,6 +188,7 @@ pub fn spawn_thread(entry: fn() -> !) {
             id,
             state: ThreadState::Ready,
             saved_rsp,
+            pml4_phys: cr3_frame.start_address().as_u64(),
             ticks_remaining: QUANTUM_TICKS,
             _stack: Some(stack),
         });
@@ -217,8 +239,18 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
     sched.threads[next_idx].state = ThreadState::Running;
     sched.threads[next_idx].ticks_remaining = QUANTUM_TICKS;
 
-    let next_rsp = sched.threads[next_idx].saved_rsp;
+    let next_rsp  = sched.threads[next_idx].saved_rsp;
+    let cur_pml4  = sched.threads[current_idx].pml4_phys;
+    let next_pml4 = sched.threads[next_idx].pml4_phys;
     drop(sched); // release before VGA write (no lock needed, but be explicit)
+
+    // Switch address space when the new thread lives in a different PML4.
+    // Kernel threads all share the boot PML4 so this is a no-op for them.
+    if next_pml4 != cur_pml4 {
+        unsafe {
+            crate::memory::switch_address_space(x86_64::PhysAddr::new(next_pml4));
+        }
+    }
 
     CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
     CURRENT_THREAD_IDX_ATOMIC.store(next_idx, Ordering::Relaxed);

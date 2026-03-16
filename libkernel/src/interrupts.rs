@@ -169,6 +169,9 @@ lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
         let mut idt = InterruptDescriptorTable::new();
         idt.breakpoint.set_handler_fn(breakpoint_handler);
+        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+        idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
+        idt.stack_segment_fault.set_handler_fn(stack_segment_fault_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
         unsafe {
             idt.double_fault.set_handler_fn(double_fault_handler)
@@ -226,6 +229,41 @@ extern "x86-interrupt" fn breakpoint_handler(
     println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
 
+extern "x86-interrupt" fn invalid_opcode_handler(
+    stack_frame: InterruptStackFrame)
+{
+    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        error!("ring-3 invalid opcode — halting (TODO: kill process)\n{:#?}", stack_frame);
+        crate::hlt_loop();
+    }
+    panic!("EXCEPTION: INVALID OPCODE\n{:#?}", stack_frame);
+}
+
+extern "x86-interrupt" fn general_protection_fault_handler(
+    stack_frame: InterruptStackFrame, error_code: u64)
+{
+    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        error!(
+            "ring-3 general protection fault (error={:#x}) — halting (TODO: kill process)\n{:#?}",
+            error_code, stack_frame
+        );
+        crate::hlt_loop();
+    }
+    panic!(
+        "EXCEPTION: GENERAL PROTECTION FAULT (error={:#x})\n{:#?}",
+        error_code, stack_frame
+    );
+}
+
+extern "x86-interrupt" fn stack_segment_fault_handler(
+    stack_frame: InterruptStackFrame, error_code: u64)
+{
+    panic!(
+        "EXCEPTION: STACK SEGMENT FAULT (error={:#x})\n{:#?}",
+        error_code, stack_frame
+    );
+}
+
 extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame, _error_code: u64) -> !
 {
@@ -238,7 +276,23 @@ extern "x86-interrupt" fn page_fault_handler(
 ) {
     use x86_64::registers::control::Cr2;
 
-    panic!("EXCEPTION: PAGE FAULT\nAccessed Address: {:?}\nError Code: {:?}\n{:#?}", Cr2::read(), error_code, stack_frame);
+    let faulting_addr = Cr2::read();
+
+    // Check whether the fault came from ring 3 (RPL field of the saved CS).
+    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        // Ring-3 fault: log and halt.
+        // Phase 3 will replace this with process termination + rescheduling.
+        error!(
+            "ring-3 page fault at {:?} (error: {:?}) — halting (TODO: kill process)",
+            faulting_addr, error_code
+        );
+        crate::hlt_loop();
+    }
+
+    panic!(
+        "EXCEPTION: PAGE FAULT\nAccessed Address: {:?}\nError Code: {:?}\n{:#?}",
+        faulting_addr, error_code, stack_frame
+    );
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(

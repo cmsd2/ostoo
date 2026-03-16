@@ -145,6 +145,7 @@ impl Shell {
             "pwd"     => self.cmd_pwd(),
             "cd"      => self.cmd_cd(rest).await,
             "mount"   => self.cmd_mount(rest).await,
+            "test"    => self.cmd_test(rest).await,
             other     => println!("unknown command: '{}'  (try 'help')", other),
         }
     }
@@ -319,6 +320,34 @@ impl Shell {
         }
     }
 
+    // ── test ──────────────────────────────────────────────────────────────────
+    async fn cmd_test(&self, rest: &str) {
+        match rest.trim() {
+            "ring3" => {
+                println!("ring3: dropping to ring 3 (machine will halt after sys_exit)...");
+                crate::ring3::run_hello_isolated();
+            }
+            "pagefault" => {
+                println!("pagefault: dropping to ring 3 (machine will halt after page fault)...");
+                crate::ring3::run_pagefault_isolated();
+            }
+            "isolation" => {
+                let ok = crate::ring3::test_isolation();
+                if ok {
+                    println!("isolation: PASS — two PML4s have independent mappings");
+                } else {
+                    println!("isolation: FAIL");
+                }
+            }
+            _ => {
+                println!("usage: test <ring3|pagefault|isolation>");
+                println!("  ring3      ring-3 write+exit via syscall, machine halts");
+                println!("  pagefault  ring-3 touches unmapped address, machine halts");
+                println!("  isolation  verify two address spaces are independent (returns)");
+            }
+        }
+    }
+
     async fn cmd_driver(&self, rest: &str) {
         let (subcmd, name) = match rest.find(' ') {
             Some(i) => (rest[..i].trim(), rest[i + 1..].trim()),
@@ -403,6 +432,9 @@ fn cmd_help() {
     println!("  mount             list mounted filesystems");
     println!("  mount proc <mp>   mount procfs at <mountpoint>");
     println!("  mount blk <mp>    mount exFAT block device at <mountpoint>");
+    println!("  test ring3        ring-3 write+exit via syscall (halts)");
+    println!("  test pagefault    ring-3 page fault on unmapped addr (halts)");
+    println!("  test isolation    verify two PML4s are independent (returns)");
 }
 
 // ---------------------------------------------------------------------------

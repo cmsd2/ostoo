@@ -26,6 +26,7 @@ pub mod task_driver;
 
 mod kernel_acpi;
 mod keyboard_actor;
+mod ring3;
 mod shell;
 
 pub const APIC_BASE: u64 = 0xFFFF_8001_0000_0000;
@@ -81,6 +82,13 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     // Hand ownership to the global memory services so drivers can map memory
     // at runtime via libkernel::memory::with_memory().
     libkernel::memory::init_services(mapper, frame_allocator, phys_mem_offset, &boot_info.memory_map);
+
+    // Map the VGA framebuffer into the kernel high half so it is accessible
+    // from isolated user page tables (entries 256–510 are shared).
+    let vga_virt = libkernel::memory::with_memory(|mem| {
+        mem.map_mmio_region(x86_64::PhysAddr::new(0xb8000), 0x1000)
+    });
+    libkernel::vga_buffer::remap_vga(vga_virt);
 
     let heap_value = Box::new(41);
     println!("heap_value at {:p}", heap_value);
@@ -165,12 +173,6 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
         ));
     }
 
-    // Ring-3 smoke test: print "Hello from ring 3!\n" via syscall, then exit.
-    // Halts the machine after sys_exit; never reaches the driver/executor code.
-    // Build with `--features ring3_test` to enable.
-    #[cfg(feature = "ring3_test")]
-    run_ring3_test();
-
     let (dummy_driver, dummy_inbox) =
         devices::dummy::DummyDriver::new(devices::dummy::Dummy::new());
     devices::driver::register(Box::new(dummy_driver));
@@ -205,120 +207,6 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     // Thread 0 enters the executor loop.  The LAPIC timer will preempt it
     // every 10 ms regardless of what the running async task is doing.
     executor::run_worker();
-}
-
-// Assembly blob that will run in ring 3.  Position-independent: the message
-// pointer uses RIP-relative addressing, so the blob works wherever it is copied.
-// `ring3_user_code_end` lets us compute the size at compile time.
-#[cfg(feature = "ring3_test")]
-core::arch::global_asm!(r#"
-.global ring3_user_code_start
-.global ring3_user_code_end
-ring3_user_code_start:
-    mov  rax, 1                     /* SYS_write */
-    mov  rdi, 1                     /* fd = stdout */
-    lea  rsi, [rip + ring3_msg]     /* buf (RIP-relative, works after copy) */
-    mov  rdx, 19                    /* len */
-    syscall
-    mov  rax, 60                    /* SYS_exit */
-    xor  edi, edi                   /* exit code 0 */
-    syscall
-ring3_msg:
-    .ascii "Hello from ring 3!\n"
-ring3_user_code_end:
-"#);
-
-// Linker-defined symbols bracketing the ring-3 code blob.
-#[cfg(feature = "ring3_test")]
-extern "C" {
-    static ring3_user_code_start: u8;
-    static ring3_user_code_end:   u8;
-}
-
-/// One-shot ring-3 smoke test.  Enabled by `--features ring3_test`.
-///
-/// Copies the `ring3_user_code_start..end` blob to a fresh user-accessible
-/// page at 0x0040_0000, then drops to ring 3 via `iretq`.  The user code
-/// calls `write(1, msg, 19)` and `exit(0)` via `syscall`.  `sys_exit` halts.
-///
-/// Declared as `fn` (not `fn -> !`) so the caller doesn't get an
-/// unreachable-code lint on the executor path below it.
-#[cfg(feature = "ring3_test")]
-fn run_ring3_test() {
-    use libkernel::memory::with_memory;
-    use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
-
-    let (code_ptr, code_len) = unsafe {
-        let start = &raw const ring3_user_code_start as *const u8;
-        let end   = &raw const ring3_user_code_end   as *const u8;
-        (start, end.offset_from(start) as usize)
-    };
-    assert!(code_len <= 0x1000, "ring3_test code blob exceeds one page");
-
-    const USER_CODE_VIRT: u64 = 0x0040_0000;
-    const USER_STACK_VIRT: u64 = 0x0050_0000;
-    const USER_STACK_TOP: u64  = USER_STACK_VIRT + 0x1000;
-
-    with_memory(|mem| {
-        // Allocate a physical frame for user code, copy the blob into it via
-        // the physical-memory map, then make it visible at USER_CODE_VIRT.
-        let code_phys = mem
-            .alloc_dma_pages(1)
-            .expect("ring3_test: out of frames (code)");
-        let dst_virt = mem.phys_mem_offset() + code_phys.as_u64();
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                code_ptr,
-                dst_virt.as_mut_ptr::<u8>(),
-                code_len,
-            );
-        }
-        mem.map_page(
-            Page::<Size4KiB>::from_start_address(x86_64::VirtAddr::new(USER_CODE_VIRT)).unwrap(),
-            code_phys,
-            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE,
-        );
-
-        // Allocate a physical frame for user stack and map it at USER_STACK_VIRT.
-        let stack_phys = mem
-            .alloc_dma_pages(1)
-            .expect("ring3_test: out of frames (stack)");
-        mem.map_page(
-            Page::<Size4KiB>::from_start_address(x86_64::VirtAddr::new(USER_STACK_VIRT)).unwrap(),
-            stack_phys,
-            PageTableFlags::PRESENT
-                | PageTableFlags::WRITABLE
-                | PageTableFlags::USER_ACCESSIBLE
-                | PageTableFlags::NO_EXECUTE,
-        );
-    });
-
-    // Swap GS so that GS.BASE = 0 (user) and KERNEL_GS_BASE = &PER_CPU.
-    // The SYSCALL entry stub will then restore kernel GS with its own swapgs.
-    libkernel::syscall::prepare_swapgs();
-
-    let user_cs = libkernel::gdt::user_code_selector().0 as u64;
-    let user_ss = libkernel::gdt::user_data_selector().0 as u64;
-
-    // Drop to ring 3 via iretq.
-    // iretq frame (popped in order): RIP, CS, RFLAGS, RSP, SS.
-    // We push in reverse order so RIP ends up at the top.
-    unsafe {
-        core::arch::asm!(
-            "push {ss}",        // SS  (user data selector, RPL=3)
-            "push {usp}",       // RSP (user stack top)
-            "push {rf}",        // RFLAGS (IF=1, IOPL=0)
-            "push {cs}",        // CS  (user code selector, RPL=3)
-            "push {ip}",        // RIP (user entry point)
-            "iretq",
-            ss  = in(reg) user_ss,
-            usp = in(reg) USER_STACK_TOP,
-            rf  = in(reg) 0x0202u64,
-            cs  = in(reg) user_cs,
-            ip  = in(reg) USER_CODE_VIRT,
-            options(noreturn),
-        );
-    }
 }
 
 async fn async_number() -> u32 {

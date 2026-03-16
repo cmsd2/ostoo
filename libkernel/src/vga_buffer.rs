@@ -1,15 +1,32 @@
 use volatile::Volatile;
 use core::fmt;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
+
+/// Physical VGA base as a kernel virtual address.  Initially the bootloader
+/// identity address (0xb8000).  Call `remap_vga` after memory services are
+/// ready to switch to the phys-mem-offset alias in the high half.
+static VGA_BASE: AtomicU64 = AtomicU64::new(0xb8000);
 
 lazy_static! {
     pub static ref WRITER: Mutex<Writer> = Mutex::new(Writer {
         column_position: 0,
         color_code: ColorCode::new(Color::Yellow, Color::Black),
-        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+        buffer: 0xb8000 as *mut Buffer,
     });
+}
+
+/// Switch the VGA writer to a high-half virtual address for the VGA
+/// framebuffer.
+///
+/// `vga_virt` must point to the VGA buffer (physical `0xb8000`) mapped into
+/// the kernel high half (entries 256–510), so it is present in every
+/// isolated user page table.  Call once, after `memory::init_services()`.
+pub fn remap_vga(vga_virt: x86_64::VirtAddr) {
+    let base = vga_virt.as_u64();
+    VGA_BASE.store(base, Ordering::Relaxed);
+    WRITER.lock().buffer = base as *mut Buffer;
 }
 
 #[macro_export]
@@ -195,8 +212,13 @@ struct Buffer {
 pub struct Writer {
     column_position: usize,
     color_code: ColorCode,
-    buffer: &'static mut Buffer,
+    buffer: *mut Buffer,
 }
+
+// Safety: Writer is only accessed through Mutex<Writer>; the raw pointer
+// is always valid (either the bootloader identity map or the phys-mem-offset
+// alias) and never aliased outside the lock.
+unsafe impl Send for Writer {}
 
 impl Writer {
     pub fn write_string(&mut self, s: &str) {
@@ -223,7 +245,7 @@ impl Writer {
                 let col = self.column_position;
 
                 let color_code = self.color_code;
-                self.buffer.chars[row][col].write(ScreenChar {
+                unsafe { &mut *self.buffer }.chars[row][col].write(ScreenChar {
                     ascii_character: byte,
                     color_code,
                 });
@@ -236,10 +258,11 @@ impl Writer {
 
     fn new_line(&mut self) {
         // Rows 0 (status bar) and 1 (timeline) are fixed; scroll only rows 2..24.
+        let buf = unsafe { &mut *self.buffer };
         for row in 3..BUFFER_HEIGHT {
             for col in 0..BUFFER_WIDTH {
-                let character = self.buffer.chars[row][col].read();
-                self.buffer.chars[row - 1][col].write(character);
+                let character = buf.chars[row][col].read();
+                buf.chars[row - 1][col].write(character);
             }
         }
         self.clear_row(BUFFER_HEIGHT - 1);
@@ -253,7 +276,7 @@ impl Writer {
             self.column_position -= 1;
             let row = BUFFER_HEIGHT - 1;
             let col = self.column_position;
-            self.buffer.chars[row][col].write(ScreenChar {
+            unsafe { &mut *self.buffer }.chars[row][col].write(ScreenChar {
                 ascii_character: b' ',
                 color_code: self.color_code,
             });
@@ -263,8 +286,9 @@ impl Writer {
     /// Overwrite row 0 (status bar) with `data`, rendered white-on-blue.
     fn write_status_row(&mut self, data: &[u8; BUFFER_WIDTH]) {
         let color = ColorCode::new(Color::White, Color::Blue);
+        let buf = unsafe { &mut *self.buffer };
         for col in 0..BUFFER_WIDTH {
-            self.buffer.chars[0][col].write(ScreenChar {
+            buf.chars[0][col].write(ScreenChar {
                 ascii_character: data[col],
                 color_code: color,
             });
@@ -276,8 +300,9 @@ impl Writer {
             ascii_character: b' ',
             color_code: self.color_code,
         };
+        let buf = unsafe { &mut *self.buffer };
         for col in 0..BUFFER_WIDTH {
-            self.buffer.chars[row][col].write(blank);
+            buf.chars[row][col].write(blank);
         }
     }
 }
@@ -339,9 +364,10 @@ pub fn redraw_line(start_col: usize, buf: &[u8], len: usize, cursor: usize) {
     let mut w = WRITER.lock();
     let row = BUFFER_HEIGHT - 1;
     let color = w.color_code;
+    let vbuf = unsafe { &mut *w.buffer };
     for i in 0..(BUFFER_WIDTH - start_col) {
         let byte = if i < len { buf[i] } else { b' ' };
-        w.buffer.chars[row][start_col + i].write(ScreenChar {
+        vbuf.chars[row][start_col + i].write(ScreenChar {
             ascii_character: byte,
             color_code: color,
         });
@@ -365,13 +391,14 @@ pub fn clear_content() {
 /// Call once before the first `println!` so the reserved rows look intentional.
 pub fn init_display() {
     let mut w = WRITER.lock();
+    let buf = unsafe { &mut *w.buffer };
     let bar_color = ColorCode::new(Color::White, Color::Blue);
     for col in 0..BUFFER_WIDTH {
-        w.buffer.chars[0][col].write(ScreenChar { ascii_character: b' ', color_code: bar_color });
+        buf.chars[0][col].write(ScreenChar { ascii_character: b' ', color_code: bar_color });
     }
     let tl_color = ColorCode::new(Color::DarkGray, Color::Black);
     for col in 0..BUFFER_WIDTH {
-        w.buffer.chars[1][col].write(ScreenChar { ascii_character: b' ', color_code: tl_color });
+        buf.chars[1][col].write(ScreenChar { ascii_character: b' ', color_code: tl_color });
     }
 }
 
@@ -402,7 +429,7 @@ pub fn timeline_append(thread_idx: usize) {
 
     // VGA RAM: each cell is a u16 (low byte = character, high byte = colour).
     // Row 1 starts at offset BUFFER_WIDTH from the base address.
-    let vga = 0xb8000 as *mut u16;
+    let vga = VGA_BASE.load(Ordering::Relaxed) as *mut u16;
     let row1 = BUFFER_WIDTH; // offset in u16 units
     unsafe {
         // Shift the 80-column row left by one position.
@@ -447,7 +474,7 @@ mod test {
         let mut writer = WRITER.lock();
         writeln!(writer, "\n{}", s).expect("writeln failed");
         for (i, c) in s.chars().enumerate() {
-            let screen_char = writer.buffer.chars[BUFFER_HEIGHT - 2][i].read();
+            let screen_char = unsafe { &*writer.buffer }.chars[BUFFER_HEIGHT - 2][i].read();
             assert_eq!(char::from(screen_char.ascii_character), c);
         }
 

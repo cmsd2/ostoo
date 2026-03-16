@@ -3,6 +3,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::{VirtAddr, PhysAddr};
 use x86_64::structures::paging::{
+    OffsetPageTable,
     Page,
     PageTable,
     PageTableFlags,
@@ -12,6 +13,7 @@ use x86_64::structures::paging::{
     Size4KiB,
     FrameAllocator,
     RecursivePageTable,
+    mapper::MapToError,
 };
 use bootloader::bootinfo::{MemoryMap, MemoryRegion};
 
@@ -175,6 +177,80 @@ impl MemoryServices {
             self.frame_allocator.total_usable_frames(),
         )
     }
+
+    // -----------------------------------------------------------------------
+    // Per-process page table management
+
+    /// Allocate a fresh PML4 for a new user process.
+    ///
+    /// The new table is initialised as follows:
+    /// - Entries 0–255 zeroed (user-private lower half; populated by the ELF loader).
+    /// - Entries 256–510 copied verbatim from the active PML4 so every process
+    ///   shares the kernel's high-half mappings without `USER_ACCESSIBLE`.
+    /// - Entry 511 set to a recursive self-mapping pointing at the new frame,
+    ///   so the `RecursivePageTable` mechanism works after `switch_address_space`.
+    ///
+    /// Returns the physical address of the new PML4 frame (use as CR3 value).
+    pub fn create_user_page_table(&mut self) -> PhysAddr {
+        use x86_64::registers::control::Cr3;
+
+        // Allocate and zero a fresh PML4 frame.
+        let pml4_frame = self.frame_allocator
+            .allocate_frame()
+            .expect("create_user_page_table: out of frames");
+        let pml4_phys = pml4_frame.start_address();
+        let pml4_virt = self.phys_mem_offset + pml4_phys.as_u64();
+        let new_pml4: &mut PageTable = unsafe { &mut *pml4_virt.as_mut_ptr() };
+        new_pml4.zero();
+
+        // Copy kernel-half entries (256–510) from the active PML4 so the new
+        // address space inherits all kernel mappings.  Use raw u64 copies to
+        // avoid touching the entry API (flags, frame, etc.).
+        let (active_frame, _) = Cr3::read();
+        let active_virt = self.phys_mem_offset + active_frame.start_address().as_u64();
+        unsafe {
+            let src = active_virt.as_ptr::<u64>();
+            let dst = pml4_virt.as_mut_ptr::<u64>();
+            for i in 256..511usize {
+                dst.add(i).write(src.add(i).read());
+            }
+        }
+
+        // Entry 511: recursive self-mapping — points at this PML4's own frame.
+        new_pml4[PageTableIndex::new(511)].set_frame(
+            pml4_frame,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        );
+
+        pml4_phys
+    }
+
+    /// Map a single 4 KiB page into a *non-active* page table rooted at
+    /// `pml4_phys`.
+    ///
+    /// Uses an `OffsetPageTable` view over the target PML4 so intermediate
+    /// page-table frames are allocated automatically.  The flush token is
+    /// discarded (`.ignore()`) because the target address space is not active;
+    /// the TLB is implicitly clean after `switch_address_space`.
+    pub fn map_user_page(
+        &mut self,
+        pml4_phys: PhysAddr,
+        virt: VirtAddr,
+        phys: PhysAddr,
+        flags: PageTableFlags,
+    ) -> Result<(), MapToError<Size4KiB>> {
+        let pml4_virt = self.phys_mem_offset + pml4_phys.as_u64();
+        let pml4: &mut PageTable = unsafe { &mut *pml4_virt.as_mut_ptr() };
+        // Safety: phys_mem_offset correctly maps all physical memory, and
+        // pml4_phys is a valid PML4 frame allocated by this MemoryServices.
+        let mut table = unsafe { OffsetPageTable::new(pml4, self.phys_mem_offset) };
+        let page  = Page::<Size4KiB>::containing_address(virt);
+        let frame = PhysFrame::<Size4KiB>::containing_address(phys);
+        unsafe {
+            table.map_to(page, frame, flags, &mut self.frame_allocator)?.ignore();
+        }
+        Ok(())
+    }
 }
 
 // Safety: RecursivePageTable contains raw pointers (*mut PageTable) which are
@@ -218,6 +294,19 @@ where
     let mut guard = MEMORY.lock();
     let svc = guard.as_mut().expect("memory::init_services not yet called");
     f(svc)
+}
+
+/// Switch the active address space by writing a new PML4 physical address to CR3.
+///
+/// # Safety
+/// - Must be called with interrupts disabled (a context switch between the CR3
+///   write and the next instruction could land in an inconsistent state).
+/// - The new PML4 must have correct kernel entries (indices 256–510) and a
+///   valid recursive self-mapping at index 511.
+pub unsafe fn switch_address_space(pml4_phys: PhysAddr) {
+    use x86_64::registers::control::{Cr3, Cr3Flags};
+    let frame = PhysFrame::containing_address(pml4_phys);
+    Cr3::write(frame, Cr3Flags::empty());
 }
 
 /// Initialise a `RecursivePageTable` for the active PML4.
