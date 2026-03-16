@@ -61,17 +61,19 @@ Toolchain: current nightly (floating, `rust-toolchain.toml`).
   pushes it into the async scancode queue.
 
 ### 8–9. Paging / Paging Implementation
-- `libkernel/src/memory/mod.rs` — `OffsetPageTable` wrapping the active
-  level-4 page table; physical memory fully mapped at a fixed offset
-  supplied by the bootloader (`map_physical_memory` feature).
+- `libkernel/src/memory/mod.rs` — `RecursivePageTable` (PML4 slot 511
+  self-referential); MMIO bump allocator at `0xFFFF_8002_0000_0000` with
+  `BTreeMap` cache for idempotency; physical memory identity map kept for
+  DMA address translation only (`phys_mem_offset` from bootloader).
 - `libkernel/src/memory/frame_allocator.rs` — `BootInfoFrameAllocator`
   walks the bootloader memory map to hand out usable physical frames.
 - `libkernel/src/memory/vmem_allocator.rs` — `DumbVmemAllocator` hands
-  out a sequential range of virtual addresses (no reclamation); used by
-  the ACPI mapper.
+  out a sequential range of virtual addresses (no reclamation); currently
+  unused in production — the MMIO bump allocator in `MemoryServices` handles
+  all virtual address allocation at runtime.
 
 ### 10. Heap Allocation
-- Kernel heap mapped at `0x4444_4444_0000`, size 100 KiB
+- Kernel heap mapped at `0xFFFF_8000_0000_0000`, size 100 KiB
   (`libkernel/src/allocator/mod.rs`).
 - Global allocator: `linked_list_allocator::LockedHeap`.
 - `extern crate alloc` available; `Box`, `Vec`, `Rc`, `BTreeMap`, etc. all work.
@@ -201,14 +203,15 @@ are present, racing all event sources in a single future.
 - Demonstrates the full actor feature set.
 
 ### ACPI Parsing
-- `kernel/src/kernel_acpi.rs` implements an `AcpiHandler` that maps
-  physical ACPI regions into virtual memory via the `DumbVmemAllocator`.
-- ACPI virtual address space: `0x6666_6666_0000`, up to 200 pages.
+- `kernel/src/kernel_acpi.rs` implements an `AcpiHandler` that accesses
+  physical ACPI regions via the bootloader's identity map
+  (`phys + physical_memory_offset`); no dynamic page mapping is required
+  since all ACPI tables live in physical RAM.
 - Calls `acpi::search_for_rsdp_bios` to locate and parse ACPI tables.
 - On boot the interrupt model is printed; APIC vs legacy PIC is detected.
 
 ### APIC Crate (`apic/`)
-- A separate crate for APIC initialisation, mapped at `0x5555_5555_0000`.
+- A separate crate for APIC initialisation, mapped at `0xFFFF_8001_0000_0000`.
 - `apic/src/local_apic/` — Local APIC register access via MMIO and MSR.
 - `apic/src/io_apic/` — I/O APIC register access via MMIO.
 - `apic::init()` maps the Local APIC and all I/O APICs from the ACPI table,
@@ -233,7 +236,7 @@ are present, racing all event sources in a single future.
 ## Known Issues / Technical Debt
 
 ### Heap Size
-The heap is a fixed 100 KiB at `0x4444_4444_0000`. This is sufficient for
+The heap is a fixed 100 KiB at `0xFFFF_8000_0000_0000`. This is sufficient for
 the current workload but will need to grow for any real subsystem work.
 The `DumbVmemAllocator` has no reclamation path, so virtual address space
 for MMIO/ACPI mappings is also consumed monotonically.

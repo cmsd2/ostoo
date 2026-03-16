@@ -80,7 +80,7 @@ page at `APIC_BASE` is mapped to this physical frame (with `NO_CACHE` flag, as
 MMIO must not be cached):
 
 ```
-Physical 0xFEE00000  →  Virtual 0x5555_5555_0000
+Physical 0xFEE00000  →  Virtual 0xFFFF_8001_0000_0000
 ```
 
 After mapping:
@@ -130,7 +130,7 @@ vectors or cause double-delivery with the IO APIC.
 
 | Symbol              | Value      | Description                           |
 |---------------------|------------|---------------------------------------|
-| `APIC_BASE`         | `0x5555_5555_0000` | Virtual base for LAPIC mapping |
+| `APIC_BASE`         | `0xFFFF_8001_0000_0000` | Virtual base for LAPIC mapping |
 | `LAPIC_EOI_OFFSET`  | `0xB0`     | Offset of EOI register in LAPIC       |
 | `LAPIC_SIVR_OFFSET` | `0xF0`     | Offset of SIVR in LAPIC               |
 | `SPURIOUS_VECTOR`   | `0xFF`     | IDT vector for LAPIC spurious IRQs    |

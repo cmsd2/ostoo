@@ -28,7 +28,7 @@ mod kernel_acpi;
 mod keyboard_actor;
 mod shell;
 
-pub const APIC_BASE: u64 = 0x_5555_5555_0000;
+pub const APIC_BASE: u64 = 0xFFFF_8001_0000_0000;
 
 #[cfg(not(test))]
 #[panic_handler]

@@ -1,3 +1,4 @@
+use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::{VirtAddr, PhysAddr};
@@ -5,11 +6,12 @@ use x86_64::structures::paging::{
     Page,
     PageTable,
     PageTableFlags,
+    PageTableIndex,
     PhysFrame,
     Mapper,
     Size4KiB,
     FrameAllocator,
-    OffsetPageTable
+    RecursivePageTable,
 };
 use bootloader::bootinfo::{MemoryMap, MemoryRegion};
 
@@ -19,6 +21,22 @@ pub mod vmem_allocator;
 pub use frame_allocator::BootInfoFrameAllocator;
 pub use vmem_allocator::VmemAllocator;
 pub use vmem_allocator::DumbVmemAllocator;
+
+// ---------------------------------------------------------------------------
+// Constants
+
+/// PML4 index used for the recursive self-mapping.
+const RECURSIVE_INDEX: u16 = 511;
+
+/// Virtual address of the PML4 when accessed through the recursive mapping.
+/// With RECURSIVE_INDEX=511: P4=511, P3=511, P2=511, P1=511, offset=0.
+const PML4_RECURSIVE_VIRT: u64 = 0xFFFF_FFFF_FFFF_F000;
+
+/// Base of the high-half MMIO virtual window.
+pub const MMIO_VIRT_BASE: u64 = 0xFFFF_8002_0000_0000;
+
+/// Size of the MMIO virtual window (512 GiB).
+const MMIO_VIRT_SIZE: u64 = 0x0000_0080_0000_0000;
 
 // ---------------------------------------------------------------------------
 // Global physical memory offset (set once during init, readable from anywhere)
@@ -36,10 +54,14 @@ pub fn phys_mem_offset() -> u64 {
 
 /// Combined mapper and frame allocator, accessible via [`with_memory`].
 pub struct MemoryServices {
-    mapper: OffsetPageTable<'static>,
+    mapper:          RecursivePageTable<'static>,
     frame_allocator: BootInfoFrameAllocator,
     phys_mem_offset: VirtAddr,
-    memory_map: &'static MemoryMap,
+    memory_map:      &'static MemoryMap,
+    /// Bump pointer for the MMIO virtual window.
+    mmio_next:       u64,
+    /// Cache: page-aligned physical base → virtual base of the mapped region.
+    mmio_cache:      BTreeMap<u64, u64>,
 }
 
 impl MemoryServices {
@@ -76,43 +98,54 @@ impl MemoryServices {
         self.memory_map.iter()
     }
 
-    /// Map a range of physical MMIO (or any physical) addresses into the linear
-    /// physical memory window and return the corresponding virtual address.
+    /// Map a range of physical MMIO addresses into a fresh high-half virtual
+    /// region and return the corresponding virtual address.
     ///
-    /// Pages that are already present in the page table are skipped silently.
+    /// A `BTreeMap` cache keyed on the page-aligned physical base ensures that
+    /// calling this function twice for the same physical base always returns the
+    /// same virtual address, regardless of the requested size.
+    ///
     /// New pages are mapped with PRESENT | WRITABLE | NO_CACHE flags.
     pub fn map_mmio_region(&mut self, phys_start: PhysAddr, size: usize) -> VirtAddr {
-        use x86_64::structures::paging::{
-            Mapper, Page, PageTableFlags, PhysFrame, Size4KiB,
-        };
-        use x86_64::structures::paging::mapper::TranslateError;
-        let offset = self.phys_mem_offset;
-        let virt_start = offset + phys_start.as_u64();
-        let start_page = Page::<Size4KiB>::containing_address(virt_start);
-        let num_pages = (size + 4095) / 4096;
+        // Work in page-aligned units.
+        let phys_base  = phys_start.as_u64() & !0xFFF; // round down to page
+        let page_off   = (phys_start.as_u64() - phys_base) as usize;
+        let num_pages  = (size + page_off + 0xFFF) / 0x1000;
+
+        // Return the cached virtual address if this physical region was already
+        // mapped.  The cache key is the page-aligned physical base.
+        if let Some(&virt_base) = self.mmio_cache.get(&phys_base) {
+            return VirtAddr::new(virt_base + page_off as u64);
+        }
+
+        // Allocate virtual pages from the MMIO window.
+        let virt_base = self.mmio_next;
+        self.mmio_next += num_pages as u64 * 0x1000;
+        assert!(
+            self.mmio_next <= MMIO_VIRT_BASE + MMIO_VIRT_SIZE,
+            "MMIO virtual window exhausted"
+        );
+
         let flags = PageTableFlags::PRESENT
-            | PageTableFlags::WRITABLE
-            | PageTableFlags::NO_CACHE;
+                  | PageTableFlags::WRITABLE
+                  | PageTableFlags::NO_CACHE;
 
         for i in 0..num_pages as u64 {
-            let page = start_page + i;
-            match self.mapper.translate_page(page) {
-                Ok(_) => continue, // already mapped as a 4 KiB page — skip
-                Err(TranslateError::ParentEntryHugePage) => continue, // inside a huge page — already accessible
-                Err(_) => {
-                    // Not mapped yet; create a 4 KiB mapping.
-                    let phys = PhysAddr::new(phys_start.as_u64() + i * 4096);
-                    let frame = PhysFrame::<Size4KiB>::containing_address(phys);
-                    unsafe {
-                        self.mapper
-                            .map_to(page, frame, flags, &mut self.frame_allocator)
-                            .expect("map_mmio_region: map_to failed")
-                            .flush();
-                    }
-                }
+            let page = Page::<Size4KiB>::from_start_address(
+                VirtAddr::new(virt_base + i * 0x1000)
+            ).expect("map_mmio_region: unaligned virt page");
+            let phys  = PhysAddr::new(phys_base + i * 0x1000);
+            let frame = PhysFrame::<Size4KiB>::containing_address(phys);
+            unsafe {
+                self.mapper
+                    .map_to(page, frame, flags, &mut self.frame_allocator)
+                    .expect("map_mmio_region: map_to failed")
+                    .flush();
             }
         }
-        virt_start
+
+        self.mmio_cache.insert(phys_base, virt_base);
+        VirtAddr::new(virt_base + page_off as u64)
     }
 
     /// Allocate `pages` physically-contiguous 4 KiB frames for DMA.
@@ -144,7 +177,7 @@ impl MemoryServices {
     }
 }
 
-// Safety: OffsetPageTable contains raw pointers (*mut PageTable) which are
+// Safety: RecursivePageTable contains raw pointers (*mut PageTable) which are
 // !Send by default.  Access is always serialised through the Mutex, and the
 // lock is never held across interrupt boundaries (see with_memory docs).
 unsafe impl Send for MemoryServices {}
@@ -156,7 +189,7 @@ static MEMORY: Mutex<Option<MemoryServices>> = Mutex::new(None);
 /// Call exactly once, after the heap is initialised and before any driver
 /// needs to map memory.
 pub fn init_services(
-    mapper: OffsetPageTable<'static>,
+    mapper: RecursivePageTable<'static>,
     frame_allocator: BootInfoFrameAllocator,
     phys_mem_offset: VirtAddr,
     memory_map: &'static MemoryMap,
@@ -164,7 +197,14 @@ pub fn init_services(
     PHYS_MEM_OFFSET.store(phys_mem_offset.as_u64(), Ordering::Relaxed);
     let mut m = MEMORY.lock();
     assert!(m.is_none(), "memory::init_services called more than once");
-    *m = Some(MemoryServices { mapper, frame_allocator, phys_mem_offset, memory_map });
+    *m = Some(MemoryServices {
+        mapper,
+        frame_allocator,
+        phys_mem_offset,
+        memory_map,
+        mmio_next:  MMIO_VIRT_BASE,
+        mmio_cache: BTreeMap::new(),
+    });
 }
 
 /// Run `f` with exclusive access to the kernel memory services.
@@ -180,41 +220,57 @@ where
     f(svc)
 }
 
-/// Initialize a new OffsetPageTable.
+/// Initialise a `RecursivePageTable` for the active PML4.
 ///
-/// This function is unsafe because the caller must guarantee that the
-/// complete physical memory is mapped to virtual memory at the passed
-/// `physical_memory_offset`. Also, this function must be only called once
-/// to avoid aliasing `&mut` references (which is undefined behavior).
-pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
-    let level_4_table = active_level_4_table(physical_memory_offset);
-    OffsetPageTable::new(level_4_table, physical_memory_offset)
-}
-
-/// Returns a mutable reference to the active level 4 table.
+/// # What this does
 ///
-/// This function is unsafe because the caller must guarantee that the
-/// complete physical memory is mapped to virtual memory at the passed
-/// `physical_memory_offset`. Also, this function must be only called once
-/// to avoid aliasing `&mut` references (which is undefined behavior).
-unsafe fn active_level_4_table(physical_memory_offset: VirtAddr)
-    -> &'static mut PageTable
-{
+/// 1. Reads CR3 to find the PML4's physical frame.
+/// 2. Accesses the PML4 via the bootloader's identity map and writes a
+///    self-referential entry at slot `RECURSIVE_INDEX` (511).
+/// 3. Flushes the TLB so the new entry is immediately active.
+/// 4. Re-accesses the PML4 through its recursive virtual address and wraps it
+///    in `RecursivePageTable`.
+///
+/// After this call the identity map is still alive (the bootloader's PML4
+/// entries are never touched), but page-table walks no longer need it.
+///
+/// # Safety
+///
+/// * `physical_memory_offset` must be the exact offset at which all physical
+///   memory is linearly mapped (supplied by the bootloader).
+/// * Must be called exactly once to avoid aliasing `&mut PageTable` references.
+pub unsafe fn init(physical_memory_offset: VirtAddr) -> RecursivePageTable<'static> {
     use x86_64::registers::control::Cr3;
 
-    let (level_4_table_frame, _) = Cr3::read();
+    // 1. Find the PML4's physical frame.
+    let (pml4_frame, _) = Cr3::read();
 
-    let phys = level_4_table_frame.start_address();
-    let virt = physical_memory_offset + phys.as_u64();
-    let page_table_ptr: *mut PageTable = virt.as_mut_ptr();
+    // 2. Access the PML4 via the identity map and install the recursive entry.
+    {
+        let pml4_virt = physical_memory_offset + pml4_frame.start_address().as_u64();
+        let pml4: &mut PageTable = &mut *pml4_virt.as_mut_ptr();
+        pml4[PageTableIndex::new(RECURSIVE_INDEX)].set_frame(
+            pml4_frame,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        );
+    } // pml4 reference dropped here — no aliasing with the recursive reference below
 
-    &mut *page_table_ptr // unsafe
+    // 3. Flush all TLB entries so the new recursive entry takes effect.
+    x86_64::instructions::tlb::flush_all();
+
+    // 4. Access the PML4 through its recursive virtual address.
+    //    With RECURSIVE_INDEX=511, this is 0xFFFF_FFFF_FFFF_F000.
+    let pml4_recursive: &'static mut PageTable =
+        &mut *VirtAddr::new(PML4_RECURSIVE_VIRT).as_mut_ptr();
+
+    RecursivePageTable::new(pml4_recursive)
+        .expect("recursive page table setup failed")
 }
 
 pub fn map_page(
     page: Page,
     addr: PhysAddr,
-    mapper: &mut OffsetPageTable,
+    mapper: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     flags: PageTableFlags,
 ) -> VirtAddr {

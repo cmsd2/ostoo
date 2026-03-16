@@ -189,7 +189,7 @@ with the sequential allocator).
 
 #### `translate_virt(virt) -> Option<PhysAddr>`
 
-Walks the active `OffsetPageTable` to find the physical address for any virtual
+Walks the active `RecursivePageTable` to find the physical address for any virtual
 address, regardless of page size (4 KiB, 2 MiB, or 1 GiB).
 
 This is used by `KernelHal::share` to convert heap buffer addresses to physical

@@ -57,7 +57,7 @@ mod test {
     use x86_64::structures::paging::Size4KiB;
     use super::{DumbVmemAllocator, VmemAllocator};
 
-    const BASE: u64 = 0x_4444_4444_0000;
+    const BASE: u64 = 0xFFFF_8000_1000_0000;
     const PAGE: u64 = 4096;
 
     #[test_case]
