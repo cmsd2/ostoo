@@ -145,6 +145,19 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
         info!("[kernel] no virtio-blk device found");
     }
 
+    // Always mount /proc (no block device required).
+    devices::vfs::mount("/proc", devices::vfs::AnyVfs::Proc(devices::vfs::ProcVfs));
+
+    // Mount exFAT at / if virtio-blk was registered.
+    if let Some(inbox) = libkernel::task::registry::get::<
+        devices::virtio::blk::VirtioBlkMsg,
+        devices::virtio::blk::VirtioBlkInfo,
+    >("virtio-blk") {
+        devices::vfs::mount("/", devices::vfs::AnyVfs::Exfat(
+            devices::vfs::ExfatVfs::new(inbox)
+        ));
+    }
+
     let (dummy_driver, dummy_inbox) =
         devices::dummy::DummyDriver::new(devices::dummy::Dummy::new());
     devices::driver::register(Box::new(dummy_driver));

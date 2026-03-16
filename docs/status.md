@@ -11,8 +11,8 @@ significantly beyond the tutorial.
 |---|---|
 | `kernel/` | Top-level kernel binary — entry point, ties everything together |
 | `libkernel/` | Core kernel library — all subsystems live here |
-| `apic/` | Advanced Programmable Interrupt Controller support (in progress) |
-| `devices/` | Driver framework — `DriverTask` trait, actor macro, built-in drivers |
+| `apic/` | Local APIC and I/O APIC initialisation and LAPIC timer |
+| `devices/` | Driver framework — `DriverTask` trait, actor macro, built-in drivers, VFS |
 | `devices-macros/` | Proc-macro crate: `#[actor]`, `#[on_message]`, `#[on_info]`, `#[on_tick]`, `#[on_stream]`, `#[on_start]` |
 
 Target triple: `x86_64-os` (custom JSON target, bare-metal, no std).
@@ -34,6 +34,11 @@ Toolchain: current nightly (floating, `rust-toolchain.toml`).
 - Volatile writes to avoid compiler optimisation of MMIO.
 - Hardware cursor (CRTC registers 0x3D4/0x3D5) kept in sync on every write.
 - `redraw_line(start_col, buf, len, cursor)` for in-place line editing.
+- Fixed status bar at row 0 (`status_bar!` macro, white-on-blue); updated by
+  `status_task` every 250 ms with thread index, context-switch count, task
+  queue depths, and uptime.
+- Timeline strip at row 1: scrolling coloured blocks, one per context switch,
+  colour-coded by thread index.
 
 ### 4. Testing
 - Custom test framework (`custom_test_frameworks` feature).
@@ -49,8 +54,8 @@ Toolchain: current nightly (floating, `rust-toolchain.toml`).
 - GDT + TSS initialised in `libkernel/src/gdt.rs`.
 
 ### 7. Hardware Interrupts
-- 8259 PIC (chained) initialised via the `pic8259_simple` crate.
-- PIC remapped to IRQ vectors 32–47 to avoid conflict with CPU exceptions.
+- 8259 PIC (chained) initialised via `pic8259`; remapped to IRQ vectors 32–47.
+- PIC is later disabled once the APIC is configured.
 - Timer interrupt handler (IRQ 0): increments tick counter, wakes timer futures.
 - Keyboard interrupt handler (IRQ 1): reads scancode from port 0x60,
   pushes it into the async scancode queue.
@@ -91,9 +96,25 @@ Toolchain: current nightly (floating, `rust-toolchain.toml`).
 ## Beyond the Tutorial
 
 ### Timer
-- `libkernel/src/task/timer.rs` — PIT tick counter; `TICKS_PER_SECOND = 1000`.
+- `libkernel/src/task/timer.rs` — LAPIC tick counter; `TICKS_PER_SECOND = 1000`.
 - `Delay` future: resolves after a given number of ticks.
 - `Mailbox::recv_timeout(ticks)` races inbox against a `Delay`.
+
+### Preemptive Multi-threaded Scheduler
+- `libkernel/src/task/scheduler.rs` — round-robin preemptive scheduler driven
+  by the LAPIC timer at 1000 Hz; 10 ms quantum (`QUANTUM_TICKS = 10`).
+- Assembly stub `lapic_timer_stub` saves all 15 GPRs + iret frame on the
+  current stack, then calls `preempt_tick(current_rsp) -> new_rsp` in Rust.
+- `preempt_tick` advances the tick counter, acknowledges the LAPIC interrupt,
+  decrements the quantum, and when it expires saves the old RSP, selects the
+  next ready thread, and returns its `saved_rsp`.
+- `scheduler::init()` registers the boot context as thread 0.
+- `scheduler::spawn_thread(entry)` allocates a 64 KiB stack, synthesises an
+  iret frame, and enqueues the new thread.
+- The kernel boots two executor threads (threads 0 and 1) that share the same
+  async task queue; tasks are transparently dispatched across both.
+- Shell command `threads` shows the current thread index and total context
+  switches since boot.
 
 ### Actor System (`devices/`, `devices-macros/`)
 - `DriverTask` trait: `name()`, `run(inbox, handle)`.
@@ -121,7 +142,7 @@ are present, racing all event sources in a single future.
 - Prompt includes CWD: `ostoo:/path> `.
 - `resolve_path` / `normalize_path` handle relative paths and `..` components.
 - Commands: `help`, `echo`, `driver <start|stop|info>`, `blk <info|read|ls|cat>`,
-  `ls`, `cat`, `pwd`, `cd`.
+  `ls`, `cat`, `pwd`, `cd`, `mount`.
 
 ### Keyboard Actor (`kernel/src/keyboard_actor.rs`)
 - `#[actor]` + `#[on_stream(key_stream)]`; registered as `"keyboard"`.
@@ -140,8 +161,8 @@ are present, racing all event sources in a single future.
 - QEMU Q35 machine; PCIe ECAM at physical `0xB000_0000` mapped at boot via
   `MemoryServices::map_mmio_region`.
 - `VirtioBlkActor` actor: handles `Read` and `Write` messages using the
-  non-blocking virtio-drivers API (`read_blocks_nb` / `complete_read_blocks`,
-  etc.) with a busy-poll `CompletionFuture` for MVP.
+  non-blocking virtio-drivers API (`read_blocks_nb` / `complete_read_blocks`)
+  with a busy-poll `CompletionFuture` for MVP.
 - `KernelHal::share` performs a full page-table walk (`translate_virt`) so that
   heap-allocated `BlkReq`/`BlkResp`/data buffers produce correct physical
   addresses for the device.
@@ -154,9 +175,25 @@ are present, racing all event sources in a single future.
 - Implements: boot sector parsing, FAT chain traversal, directory entry set
   parsing (File / Stream Extension / File Name entries), and recursive path
   walking with case-insensitive ASCII matching.
-- Shell commands: `ls [path]`, `cat <path>`, `pwd`, `cd [path]`.
 - File reads capped at 16 KiB; peak heap usage during `ls` ≈ 5 KiB.
 - See [`docs/exfat.md`](exfat.md) for full details.
+
+### VFS Layer (`devices/src/vfs/`)
+- Uniform path namespace over multiple filesystems; shell no longer calls
+  filesystem drivers directly.
+- Enum dispatch (`AnyVfs`) avoids `Pin<Box<dyn Future>>` trait objects.
+- Mount table (`MOUNTS`: `spin::Mutex<Vec<(String, Arc<AnyVfs>)>>`) sorted
+  longest-mountpoint-first; the `Arc` is cloned out before any `.await` so
+  the lock is never held across a suspension point.
+- `ExfatVfs` — wraps a `BlkInbox` and delegates to the exFAT driver.
+- `ProcVfs` — synthetic filesystem; no block I/O:
+  - `/proc/tasks` — ready / waiting task counts from the executor.
+  - `/proc/uptime` — seconds since boot from the LAPIC tick counter.
+  - `/proc/drivers` — name and state of every registered driver.
+- Shell commands: `ls`, `cat`, `cd` use the VFS API; `mount` manages the
+  mount table at runtime (`mount`, `mount proc <mp>`, `mount blk <mp>`).
+- `/proc` is always mounted at boot; exFAT `/` is mounted if virtio-blk is present.
+- See [`docs/vfs.md`](vfs.md) for full design notes.
 
 ### Dummy Driver (`devices/src/dummy.rs`)
 - Example actor with `#[on_tick]` heartbeat, `#[on_message(SetInterval)]`,
@@ -195,42 +232,57 @@ are present, racing all event sources in a single future.
 
 ## Known Issues / Technical Debt
 
-### Stale Dependencies
-All dependencies are pinned to 2019–2020 versions. Key crates with significant
-breaking changes since:
-
-| Crate | Pinned | Current | Notes |
-|---|---|---|---|
-| `bootloader` | 0.8.2 | ~0.11 | Completely new API in 0.9+ |
-| `x86_64` | 0.9.6 (libkernel) / 0.7.5 (apic) | ~0.15 | `UnusedPhysFrame` removed in 0.12; Mapper API changed |
-| `acpi` | 0.4.0 | ~5.x | Completely rewritten API |
-| `pic8259_simple` | git (personal fork) | (superseded by `pic8259`) | |
-| `linked_list_allocator` | 0.8.2 | ~0.10 | |
-| `crossbeam-queue` | 0.2.1 | ~0.3 | |
-
-### `UnusedPhysFrame` Usage
-`libkernel/src/memory/mod.rs` and `kernel/src/kernel_acpi.rs` use
-`UnusedPhysFrame::new(frame)` which was removed from `x86_64` after 0.11.
-Any dependency update must address this.
-
-### Two Versions of x86_64
-`libkernel` uses `x86_64 = "0.9.6"` and `apic` uses `x86_64 = "0.7.5"`. Cargo
-will resolve these separately but it is a source of confusion. They should be
-unified.
-
 ### Heap Size
-The heap is 100 KiB. This is sufficient for the current workload but would need
-to grow for any real subsystem work.
+The heap is a fixed 100 KiB at `0x4444_4444_0000`. This is sufficient for
+the current workload but will need to grow for any real subsystem work.
+The `DumbVmemAllocator` has no reclamation path, so virtual address space
+for MMIO/ACPI mappings is also consumed monotonically.
+
+### virtio-blk Busy Polling
+`CompletionFuture` re-schedules itself immediately rather than sleeping on an
+IRQ waker. This burns CPU on every block read. The IRQ handler sets
+`IRQ_PENDING` but the executor does not yet have an `AtomicWaker` integration
+to park the future until the device signals completion.
+
+### Single-sector DMA Buffers
+Block I/O is done one 512-byte sector at a time. For large directory scans or
+file reads this results in many round-trips through the virtio queue.
+
+### exFAT Write Support
+The exFAT driver is read-only. All filesystem state changes (create, write,
+delete) are unsupported.
+
+### ProcVfs File Sizes Reported as Zero
+`VfsDirEntry::size` is 0 for all `/proc` entries because the content length
+is not known until the data is serialised. This is cosmetically wrong in `ls`
+output but functionally harmless.
 
 ---
 
 ## Possible Next Steps
 
-1. **Update dependencies** — modernise `bootloader`, `x86_64`, `acpi`, etc.
-   The `bootloader` 0.9+ series and current `x86_64` crate are much cleaner.
+1. **IRQ-driven virtio-blk** — wire `IRQ_PENDING` to an `AtomicWaker` so
+   `CompletionFuture` parks instead of busy-polling.
 
-3. **Process / scheduling** — the async executor is cooperative. A preemptive
-   scheduler on top of the timer interrupt would be the natural next step.
+2. **Larger / growable heap** — demand-paged heap that grows on fault, or at
+   minimum a larger static allocation.
 
-4. **Heap growth** — a demand-paged heap that grows on fault rather than a
-   fixed 100 KiB allocation.
+3. **exFAT write support** — directory entry creation, FAT chain allocation,
+   and sector writes to enable `touch`, `mkdir`, `cp`, `rm`.
+
+4. **More ProcVfs entries** — `/proc/meminfo`, `/proc/cpuinfo`, `/proc/pci`,
+   etc., surfacing existing shell command output as readable files.
+
+5. **New filesystem drivers** — a RAM-based tmpfs (`TmpVfs`) or a simple
+   flat-file initrd would exercise the VFS extension path without requiring
+   block I/O.
+
+6. **Multi-sector DMA** — batch multiple sectors per virtio request to reduce
+   queue round-trips for directory scans and file reads.
+
+7. **User space / process isolation** — ring-3 processes with their own page
+   tables, system call interface, and per-process file descriptor tables built
+   on top of the VFS.
+
+8. **Reclaiming virtual address space** — replace `DumbVmemAllocator` with a
+   proper free-list allocator so MMIO mappings can be released.

@@ -144,6 +144,7 @@ impl Shell {
             "cat"     => self.cmd_blk_cat(rest).await,
             "pwd"     => self.cmd_pwd(),
             "cd"      => self.cmd_cd(rest).await,
+            "mount"   => self.cmd_mount(rest).await,
             other     => println!("unknown command: '{}'  (try 'help')", other),
         }
     }
@@ -209,53 +210,23 @@ impl Shell {
 
     // ── cd ────────────────────────────────────────────────────────────────────
     async fn cmd_cd(&self, path: &str) {
-        use devices::virtio::blk::{VirtioBlkMsg, VirtioBlkInfo};
-        use devices::virtio::exfat;
-
         let cwd    = self.cwd.lock().clone();
         let target = resolve_path(&cwd, if path.is_empty() { "/" } else { path });
 
-        let inbox = match libkernel::task::registry::get::<VirtioBlkMsg, VirtioBlkInfo>(
-            "virtio-blk"
-        ) {
-            Some(mb) => mb,
-            None => { println!("virtio-blk: driver not found"); return; }
-        };
-
-        let vol = match exfat::open_exfat(&inbox).await {
-            Ok(v)  => v,
-            Err(e) => { println!("exfat open: {:?}", e); return; }
-        };
-
-        match exfat::list_dir(&vol, &inbox, target.as_str()).await {
-            Ok(_)                                  => *self.cwd.lock() = target,
-            Err(exfat::ExfatError::PathNotFound)   => println!("cd: not found: {}", target),
-            Err(exfat::ExfatError::NotADirectory)  => println!("cd: not a directory: {}", target),
-            Err(e)                                 => println!("cd: {:?}", e),
+        match devices::vfs::list_dir(&target).await {
+            Ok(_)                                         => *self.cwd.lock() = target,
+            Err(devices::vfs::VfsError::NotFound)         => println!("cd: not found: {}", target),
+            Err(devices::vfs::VfsError::NotADirectory)    => println!("cd: not a directory: {}", target),
+            Err(e)                                        => println!("cd: {:?}", e),
         }
     }
 
     // ── blk ls ────────────────────────────────────────────────────────────────
     async fn cmd_blk_ls(&self, path: &str) {
-        use devices::virtio::blk::{VirtioBlkMsg, VirtioBlkInfo};
-        use devices::virtio::exfat;
-
         let cwd  = self.cwd.lock().clone();
         let path = resolve_path(&cwd, path);
 
-        let inbox = match libkernel::task::registry::get::<VirtioBlkMsg, VirtioBlkInfo>(
-            "virtio-blk"
-        ) {
-            Some(mb) => mb,
-            None => { println!("virtio-blk: driver not found"); return; }
-        };
-
-        let vol = match exfat::open_exfat(&inbox).await {
-            Ok(v)  => v,
-            Err(e) => { println!("exfat open: {:?}", e); return; }
-        };
-
-        match exfat::list_dir(&vol, &inbox, &path).await {
+        match devices::vfs::list_dir(&path).await {
             Ok(entries) => {
                 if entries.is_empty() {
                     println!("  (empty)");
@@ -275,9 +246,6 @@ impl Shell {
 
     // ── blk cat ───────────────────────────────────────────────────────────────
     async fn cmd_blk_cat(&self, path: &str) {
-        use devices::virtio::blk::{VirtioBlkMsg, VirtioBlkInfo};
-        use devices::virtio::exfat;
-
         if path.is_empty() {
             println!("usage: cat <path>");
             return;
@@ -286,19 +254,7 @@ impl Shell {
         let cwd  = self.cwd.lock().clone();
         let path = resolve_path(&cwd, path);
 
-        let inbox = match libkernel::task::registry::get::<VirtioBlkMsg, VirtioBlkInfo>(
-            "virtio-blk"
-        ) {
-            Some(mb) => mb,
-            None => { println!("virtio-blk: driver not found"); return; }
-        };
-
-        let vol = match exfat::open_exfat(&inbox).await {
-            Ok(v)  => v,
-            Err(e) => { println!("exfat open: {:?}", e); return; }
-        };
-
-        match exfat::read_file(&vol, &inbox, &path).await {
+        match devices::vfs::read_file(&path).await {
             Ok(data) => {
                 for &b in &data {
                     if (0x20..0x7F).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
@@ -310,6 +266,56 @@ impl Shell {
                 println!();
             }
             Err(e) => println!("error: {:?}", e),
+        }
+    }
+
+    // ── mount ─────────────────────────────────────────────────────────────────
+    async fn cmd_mount(&self, rest: &str) {
+        use devices::virtio::blk::{VirtioBlkMsg, VirtioBlkInfo};
+
+        let rest = rest.trim();
+        if rest.is_empty() {
+            // List current mounts.
+            devices::vfs::with_mounts(|mounts| {
+                if mounts.is_empty() {
+                    println!("  (no mounts)");
+                } else {
+                    for (mp, fs) in mounts {
+                        println!("  {}  {}", mp, fs.fs_type());
+                    }
+                }
+            });
+            return;
+        }
+
+        let (fstype, mountpoint) = match rest.find(' ') {
+            Some(i) => (rest[..i].trim(), rest[i + 1..].trim()),
+            None    => { println!("usage: mount [<fstype> <mountpoint>]"); return; }
+        };
+
+        if mountpoint.is_empty() {
+            println!("usage: mount [<fstype> <mountpoint>]");
+            return;
+        }
+
+        match fstype {
+            "proc" => {
+                devices::vfs::mount(mountpoint, devices::vfs::AnyVfs::Proc(devices::vfs::ProcVfs));
+                println!("mounted proc at {}", mountpoint);
+            }
+            "blk" => {
+                let inbox = match libkernel::task::registry::get::<VirtioBlkMsg, VirtioBlkInfo>(
+                    "virtio-blk"
+                ) {
+                    Some(mb) => mb,
+                    None => { println!("virtio-blk: driver not found"); return; }
+                };
+                devices::vfs::mount(mountpoint, devices::vfs::AnyVfs::Exfat(
+                    devices::vfs::ExfatVfs::new(inbox)
+                ));
+                println!("mounted blk at {}", mountpoint);
+            }
+            other => println!("unknown filesystem type '{}' (use: proc | blk)", other),
         }
     }
 
@@ -390,10 +396,13 @@ fn cmd_help() {
     println!("  blk read <n>      hex-dump sector N from virtio-blk");
     println!("  blk ls [path]     list exFAT directory (default: /)");
     println!("  blk cat <path>    print exFAT file as text");
-    println!("  ls [path]         alias for blk ls");
-    println!("  cat <path>        alias for blk cat");
+    println!("  ls [path]         list directory via VFS");
+    println!("  cat <path>        print file via VFS");
     println!("  pwd               print working directory");
     println!("  cd [path]         change working directory");
+    println!("  mount             list mounted filesystems");
+    println!("  mount proc <mp>   mount procfs at <mountpoint>");
+    println!("  mount blk <mp>    mount exFAT block device at <mountpoint>");
 }
 
 // ---------------------------------------------------------------------------
