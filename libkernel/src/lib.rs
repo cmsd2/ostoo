@@ -28,6 +28,7 @@ pub mod allocator;
 pub mod logger;
 pub mod cpuid;
 pub mod task;
+pub mod syscall;
 
 pub fn init() {
     cpuid::init();

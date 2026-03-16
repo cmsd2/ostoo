@@ -32,6 +32,11 @@ harness = false
 name = "stack_overflow"
 harness = false
 
+[features]
+default = []
+# Enable to run a one-shot ring-3 smoke test at boot (halts after exit syscall).
+ring3_test = []
+
 [dependencies]
 apic                  = { workspace = true }
 devices               = { workspace = true }

@@ -2,7 +2,7 @@
 
 DISK_IMG=disk.img
 
-cargo bootimage --manifest-path kernel/Cargo.toml
+cargo bootimage --manifest-path kernel/Cargo.toml --features ring3_test
 
 qemu-system-x86_64 \
     -machine q35 \
