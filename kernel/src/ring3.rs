@@ -1,6 +1,7 @@
-//! Ring-3 test helpers invoked by the shell `test` command.
+//! Ring-3 execution: test helpers and ELF process spawning.
 
 use libkernel::memory::with_memory;
+use libkernel::process::ProcessId;
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
@@ -49,39 +50,33 @@ extern "C" {
 }
 
 // ---------------------------------------------------------------------------
-// Core helper
+// Raw code blob spawning (used by test commands)
 
-/// Allocate a fresh isolated PML4 (kernel high-half shared, user half empty),
-/// map code and stack into it, switch CR3, then drop to ring 3 via `iretq`.
+/// Spawn a user process from a raw code blob (not ELF).
 ///
-/// # Why CR3 switch works now
-///
-/// The kernel is linked at PML4 entry 510 (`0xFFFF_FF00_0000_0000`).
-/// `create_user_page_table` copies entries 256–510 from the active PML4,
-/// so the new PML4 has the full kernel (code, data, BSS, heap, SYSCALL stack)
-/// at high-half addresses.  After `mov cr3`, the very next instruction is
-/// still reachable because it is in entry 510.
-///
-/// Never returns: the user code calls `sys_exit` or triggers a fault, both
-/// of which halt via `hlt_loop`.
-fn launch_isolated(code: &[u8]) -> ! {
+/// Maps the blob at `USER_CODE_VIRT` (RX) and a stack at `USER_STACK_VIRT`
+/// (RW, NX), creates a Process, and places it on the scheduler.  Returns
+/// immediately — the process runs when scheduled.
+fn spawn_blob(code: &[u8]) -> ProcessId {
+    // Free kernel stacks of previously exited processes so the heap doesn't run out.
+    libkernel::process::reap_zombies();
+
     assert!(code.len() <= 0x1000, "ring3 code blob exceeds one page");
 
-    let user_pml4 = with_memory(|mem| {
-        // Allocate code frame and copy the blob into it.
+    let pml4_phys = with_memory(|mem| {
         let code_phys = mem.alloc_dma_pages(1).expect("ring3: out of frames (code)");
         let dst = mem.phys_mem_offset() + code_phys.as_u64();
         unsafe {
+            core::ptr::write_bytes(dst.as_mut_ptr::<u8>(), 0, 0x1000);
             core::ptr::copy_nonoverlapping(code.as_ptr(), dst.as_mut_ptr::<u8>(), code.len());
         }
 
-        // Allocate stack frame.
         let stack_phys = mem.alloc_dma_pages(1).expect("ring3: out of frames (stack)");
+        let stack_dst = mem.phys_mem_offset() + stack_phys.as_u64();
+        unsafe { core::ptr::write_bytes(stack_dst.as_mut_ptr::<u8>(), 0, 0x1000); }
 
-        // Create the isolated PML4: kernel half copied, user half empty.
         let pml4_phys = mem.create_user_page_table();
 
-        // Map user code (RX) and stack (RW, NX) into the new address space.
         mem.map_user_page(
             pml4_phys,
             VirtAddr::new(USER_CODE_VIRT),
@@ -102,68 +97,160 @@ fn launch_isolated(code: &[u8]) -> ! {
         pml4_phys
     });
 
-    let user_cs = libkernel::gdt::user_code_selector().0 as u64;
-    let user_ss = libkernel::gdt::user_data_selector().0 as u64;
+    let proc = libkernel::process::Process::new(pml4_phys, USER_CODE_VIRT, USER_STACK_TOP);
+    let pid = proc.pid;
+    libkernel::process::insert(proc);
 
-    log::info!(
-        "ring3: iretq to {:#x}  pml4={:#x}  cs={:#x}  ss={:#x}  rsp={:#x}",
-        USER_CODE_VIRT, user_pml4.as_u64(), user_cs, user_ss, USER_STACK_TOP,
-    );
+    let thread_idx = libkernel::task::scheduler::spawn_user_thread(pid, pml4_phys);
+    libkernel::process::with_process(pid, |p| {
+        p.thread_idx = Some(thread_idx);
+    });
 
-    // Tell the scheduler about the new CR3 so preempt_tick switches address
-    // spaces correctly when context-switching away from this thread.
-    libkernel::task::scheduler::set_current_cr3(user_pml4.as_u64());
-
-    // Thread 0's stack is now heap-allocated (PML4 entry 256, high half)
-    // which is copied into user page tables, so no trampoline is needed.
-    unsafe {
-        core::arch::asm!(
-            "cli",
-            "swapgs",
-            // Switch to the isolated address space.  The kernel (entry 510)
-            // and heap (entry 256) remain mapped, so RSP stays valid.
-            "mov cr3, {pml4}",
-            // Build the iretq frame (SS, RSP, RFLAGS, CS, RIP) and return.
-            "push {ss}",
-            "push {usp}",
-            "push {rf}",
-            "push {cs}",
-            "push {ip}",
-            "iretq",
-            pml4  = in(reg) user_pml4.as_u64(),
-            ss    = in(reg) user_ss,
-            usp   = in(reg) USER_STACK_TOP,
-            rf    = in(reg) 0x0202u64,
-            cs    = in(reg) user_cs,
-            ip    = in(reg) USER_CODE_VIRT,
-            options(noreturn),
-        );
-    }
+    pid
 }
 
 // ---------------------------------------------------------------------------
 // Public test entry points
 
-/// Run hello-world via `write` + `exit` syscalls in ring 3.
-/// `sys_exit` calls `hlt_loop`; never returns.
-pub fn run_hello_isolated() -> ! {
+/// Spawn the hello-world ring-3 test as a proper process.
+/// Returns the PID; the shell continues running.
+pub fn run_hello_isolated() -> ProcessId {
     let code = unsafe {
         let start = &raw const ring3_hello_start as *const u8;
         let end   = &raw const ring3_hello_end   as *const u8;
         core::slice::from_raw_parts(start, end.offset_from(start) as usize)
     };
-    launch_isolated(code)
+    spawn_blob(code)
 }
 
-/// Touch unmapped 0x700000 in ring 3; page fault handler logs and halts.
-/// Never returns.
-pub fn run_pagefault_isolated() -> ! {
+/// Spawn the page-fault ring-3 test as a proper process.
+/// Returns the PID; the shell continues running.
+pub fn run_pagefault_isolated() -> ProcessId {
     let code = unsafe {
         let start = &raw const ring3_fault_start as *const u8;
         let end   = &raw const ring3_fault_end   as *const u8;
         core::slice::from_raw_parts(start, end.offset_from(start) as usize)
     };
-    launch_isolated(code)
+    spawn_blob(code)
+}
+
+// ---------------------------------------------------------------------------
+// ELF process spawning
+
+/// Parse an ELF binary, create a user address space with its segments mapped,
+/// and spawn a scheduler thread for it.  Returns the new process's PID.
+pub fn spawn_process(elf_data: &[u8]) -> Result<ProcessId, &'static str> {
+    use libkernel::elf::{self, PF_W, PF_X};
+    use libkernel::process::Process;
+
+    // Free kernel stacks of previously exited processes so the heap doesn't run out.
+    libkernel::process::reap_zombies();
+
+    let info = elf::parse(elf_data).map_err(|_| "invalid ELF binary")?;
+
+    if info.segments.is_empty() {
+        return Err("ELF has no loadable segments");
+    }
+
+    let pml4_phys = with_memory(|mem| {
+        let pml4_phys = mem.create_user_page_table();
+        let phys_off = mem.phys_mem_offset();
+
+        // Map each PT_LOAD segment.
+        for seg in &info.segments {
+            // Calculate the page range needed.
+            let page_start = seg.vaddr & !0xFFF;
+            let page_end = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
+            let num_pages = ((page_end - page_start) / 0x1000) as usize;
+
+            for p in 0..num_pages {
+                let page_vaddr = page_start + (p as u64) * 0x1000;
+                let frame_phys = mem.alloc_dma_pages(1)
+                    .expect("spawn_process: out of frames");
+
+                // Zero the frame.
+                let dst_base = phys_off + frame_phys.as_u64();
+                unsafe {
+                    core::ptr::write_bytes(dst_base.as_mut_ptr::<u8>(), 0, 0x1000);
+                }
+
+                // Copy file data into this page if it overlaps with filesz.
+                let page_off_in_seg = page_vaddr.wrapping_sub(seg.vaddr);
+                // The segment might not start at a page boundary.
+                let copy_start_in_page = if page_vaddr < seg.vaddr {
+                    (seg.vaddr - page_vaddr) as usize
+                } else {
+                    0
+                };
+                let seg_offset_for_page = if page_vaddr >= seg.vaddr {
+                    page_off_in_seg
+                } else {
+                    0
+                };
+
+                if seg_offset_for_page < seg.filesz {
+                    let avail = (seg.filesz - seg_offset_for_page) as usize;
+                    let room = 0x1000 - copy_start_in_page;
+                    let count = avail.min(room);
+                    let src = &elf_data[(seg.offset + seg_offset_for_page) as usize..][..count];
+                    unsafe {
+                        let dst = (dst_base + copy_start_in_page as u64).as_mut_ptr::<u8>();
+                        core::ptr::copy_nonoverlapping(src.as_ptr(), dst, count);
+                    }
+                }
+
+                // Build page flags.
+                let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+                if seg.flags & PF_W != 0 {
+                    flags |= PageTableFlags::WRITABLE;
+                }
+                if seg.flags & PF_X == 0 {
+                    flags |= PageTableFlags::NO_EXECUTE;
+                }
+
+                mem.map_user_page(
+                    pml4_phys,
+                    VirtAddr::new(page_vaddr),
+                    frame_phys,
+                    flags,
+                ).expect("spawn_process: failed to map segment page");
+            }
+        }
+
+        // Map user stack page (RW, NX).
+        let stack_phys = mem.alloc_dma_pages(1)
+            .expect("spawn_process: out of frames (stack)");
+        let stack_virt = phys_off + stack_phys.as_u64();
+        unsafe { core::ptr::write_bytes(stack_virt.as_mut_ptr::<u8>(), 0, 0x1000); }
+
+        mem.map_user_page(
+            pml4_phys,
+            VirtAddr::new(USER_STACK_VIRT),
+            stack_phys,
+            PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::USER_ACCESSIBLE
+                | PageTableFlags::NO_EXECUTE,
+        ).expect("spawn_process: failed to map stack page");
+
+        pml4_phys
+    });
+
+    // Create the process and insert it into the process table.
+    let proc = Process::new(pml4_phys, info.entry, USER_STACK_TOP);
+    let pid = proc.pid;
+    libkernel::process::insert(proc);
+
+    // Spawn a scheduler thread and record the thread index on the process.
+    let thread_idx = libkernel::task::scheduler::spawn_user_thread(pid, pml4_phys);
+    libkernel::process::with_process(pid, |p| {
+        p.thread_idx = Some(thread_idx);
+    });
+
+    log::info!("spawn_process: pid={} entry={:#x} pml4={:#x}",
+        pid.as_u64(), info.entry, pml4_phys.as_u64());
+
+    Ok(pid)
 }
 
 /// Kernel-mode test: verify that two independently-created PML4s have

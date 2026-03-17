@@ -146,6 +146,7 @@ impl Shell {
             "cd"      => self.cmd_cd(rest).await,
             "mount"   => self.cmd_mount(rest).await,
             "test"    => self.cmd_test(rest).await,
+            "exec"    => self.cmd_exec(rest).await,
             other     => println!("unknown command: '{}'  (try 'help')", other),
         }
     }
@@ -324,12 +325,12 @@ impl Shell {
     async fn cmd_test(&self, rest: &str) {
         match rest.trim() {
             "ring3" => {
-                println!("ring3: dropping to ring 3 (machine will halt after sys_exit)...");
-                crate::ring3::run_hello_isolated();
+                let pid = crate::ring3::run_hello_isolated();
+                println!("[test ring3] spawned pid {}", pid.as_u64());
             }
             "pagefault" => {
-                println!("pagefault: dropping to ring 3 (machine will halt after page fault)...");
-                crate::ring3::run_pagefault_isolated();
+                let pid = crate::ring3::run_pagefault_isolated();
+                println!("[test pagefault] spawned pid {}", pid.as_u64());
             }
             "isolation" => {
                 let ok = crate::ring3::test_isolation();
@@ -345,6 +346,26 @@ impl Shell {
                 println!("  pagefault  ring-3 touches unmapped address, machine halts");
                 println!("  isolation  verify two address spaces are independent (returns)");
             }
+        }
+    }
+
+    // ── exec ──────────────────────────────────────────────────────────────
+    async fn cmd_exec(&self, path: &str) {
+        if path.is_empty() {
+            println!("usage: exec <path>");
+            return;
+        }
+        let cwd  = self.cwd.lock().clone();
+        let path = resolve_path(&cwd, path);
+
+        match devices::vfs::read_file(&path).await {
+            Ok(data) => {
+                match crate::ring3::spawn_process(&data) {
+                    Ok(pid) => println!("[exec] spawned pid {}", pid.as_u64()),
+                    Err(e)  => println!("exec: {}", e),
+                }
+            }
+            Err(e) => println!("exec: {:?}", e),
         }
     }
 
@@ -432,8 +453,9 @@ fn cmd_help() {
     println!("  mount             list mounted filesystems");
     println!("  mount proc <mp>   mount procfs at <mountpoint>");
     println!("  mount blk <mp>    mount exFAT block device at <mountpoint>");
-    println!("  test ring3        ring-3 write+exit via syscall (halts)");
-    println!("  test pagefault    ring-3 page fault on unmapped addr (halts)");
+    println!("  exec <path>       load and run an ELF binary from the VFS");
+    println!("  test ring3        ring-3 write+exit via syscall (spawns process)");
+    println!("  test pagefault    ring-3 page fault on unmapped addr (spawns process)");
     println!("  test isolation    verify two PML4s are independent (returns)");
 }
 

@@ -10,7 +10,7 @@ use x86_64::{
 pub mod bump;
 
 pub const HEAP_START: usize = 0xFFFF_8000_0000_0000;
-pub const HEAP_SIZE: usize = 256 * 1024; // 256 KiB
+pub const HEAP_SIZE: usize = 512 * 1024; // 512 KiB
 
 /// Align the given address `addr` upwards to alignment `align`.
 pub fn align_up(addr: usize, align: usize) -> usize {

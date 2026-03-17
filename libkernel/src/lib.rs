@@ -29,6 +29,8 @@ pub mod logger;
 pub mod cpuid;
 pub mod task;
 pub mod syscall;
+pub mod process;
+pub mod elf;
 
 pub fn init() {
     cpuid::init();

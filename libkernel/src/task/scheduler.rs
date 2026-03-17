@@ -3,6 +3,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
+use crate::process::ProcessId;
+
 pub const QUANTUM_TICKS: u32 = 10; // 10 ms at 1000 Hz
 
 static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(0);
@@ -48,6 +50,14 @@ impl ThreadId {
 enum ThreadState {
     Ready,
     Running,
+    Dead,
+}
+
+/// What kind of schedulable entity this thread represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulableKind {
+    Kernel,
+    UserProcess(ProcessId),
 }
 
 struct Thread {
@@ -59,8 +69,14 @@ struct Thread {
     /// All kernel threads share the boot PML4; user processes each have their own.
     pml4_phys: u64,
     ticks_remaining: u32,
-    /// Owned stack backing. None for thread 0 (uses the boot stack).
+    /// Owned stack backing. None for thread 0 (uses the boot stack) and for
+    /// user process threads (kernel stack owned by Process).
     _stack: Option<Vec<u8>>,
+    /// What this thread represents.
+    kind: SchedulableKind,
+    /// For user process threads: the top of the process's kernel stack.
+    /// Used to update TSS.rsp0 and PER_CPU on context switch.
+    kernel_stack_top: u64,
 }
 
 struct Scheduler {
@@ -156,6 +172,8 @@ pub fn init() {
             pml4_phys: cr3_frame.start_address().as_u64(),
             ticks_remaining: QUANTUM_TICKS,
             _stack: None,
+            kind: SchedulableKind::Kernel,
+            kernel_stack_top: 0,
         });
         sched.current_idx = 0;
         sched.initialized = true;
@@ -215,9 +233,154 @@ pub fn spawn_thread(entry: fn() -> !) {
             pml4_phys: cr3_frame.start_address().as_u64(),
             ticks_remaining: QUANTUM_TICKS,
             _stack: Some(stack),
+            kind: SchedulableKind::Kernel,
+            kernel_stack_top: 0,
         });
         sched.ready_queue.push_back(idx);
     });
+}
+
+// ---------------------------------------------------------------------------
+// User-process thread support
+
+/// Spawn a scheduler thread for a user process.
+///
+/// The new thread starts in kernel mode at `process_trampoline`, which reads
+/// the PID from r15, looks up the process, and drops to ring 3.
+///
+/// Returns the thread index in the scheduler's thread vec.
+pub fn spawn_user_thread(pid: ProcessId, pml4_phys: x86_64::PhysAddr) -> usize {
+    // Read process info under the process table lock (not from ISR context).
+    let (kernel_stack_top, entry_point, user_stack_top) =
+        crate::process::with_process_ref(pid, |p| {
+            (p.kernel_stack_top, p.entry_point, p.user_stack_top)
+        }).expect("spawn_user_thread: process not found");
+
+    let _ = entry_point;
+    let _ = user_stack_top;
+
+    // Build a fake iretq frame on the process's kernel stack.
+    // The frame targets `process_trampoline` in kernel mode, with the PID
+    // encoded in the r15 GPR slot so the trampoline can recover it.
+    let stack_top = kernel_stack_top;
+    let saved_rsp = stack_top - (20 * 8);
+
+    unsafe {
+        let frame = saved_rsp as *mut u64;
+        for i in 0..15usize {
+            frame.add(i).write(0); // 15 GPRs (all zero initially)
+        }
+        // RDI = PID (slot 9 in the pop order: r15,r14,...,rbp,rdi,...)
+        // process_trampoline is extern "C" so it receives PID as first arg.
+        frame.add(9).write(pid.as_u64());
+        frame.add(15).write(process_trampoline as *const () as usize as u64); // RIP
+        frame.add(16).write(0x08);                                // CS (kernel)
+        frame.add(17).write(0x202);                               // RFLAGS
+        frame.add(18).write(stack_top - 160);                     // RSP after iretq
+        frame.add(19).write(0);                                   // SS
+    }
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        let id = ThreadId::new();
+        let idx = sched.threads.len();
+        sched.threads.push(Thread {
+            id,
+            state: ThreadState::Ready,
+            saved_rsp,
+            pml4_phys: pml4_phys.as_u64(),
+            ticks_remaining: QUANTUM_TICKS,
+            _stack: None, // kernel stack owned by Process, not Thread
+            kind: SchedulableKind::UserProcess(pid),
+            kernel_stack_top: stack_top,
+        });
+        sched.ready_queue.push_back(idx);
+        idx
+    })
+}
+
+/// Trampoline for newly-spawned user process threads.
+///
+/// The scheduler's iretq lands here in kernel mode with the PID passed in RDI
+/// (first argument, SysV64 ABI).  We look up the process, set up TSS/PER_CPU,
+/// switch CR3, and drop to ring 3.
+extern "C" fn process_trampoline(pid_raw: u64) -> ! {
+    let pid = ProcessId::from_raw(pid_raw);
+
+    let (entry_point, user_stack_top, pml4_phys, kernel_stack_top) =
+        crate::process::with_process_ref(pid, |p| {
+            (p.entry_point, p.user_stack_top, p.pml4_phys.as_u64(), p.kernel_stack_top)
+        }).expect("process_trampoline: process not found");
+
+    // Set up TSS.rsp0 and PER_CPU kernel_rsp for this process.
+    crate::gdt::set_kernel_stack(x86_64::VirtAddr::new(kernel_stack_top));
+    crate::syscall::set_kernel_rsp(kernel_stack_top);
+    crate::process::set_current_pid(pid);
+
+    // Tell the scheduler about our CR3 for context-switch address space restore.
+    set_current_cr3(pml4_phys);
+
+    let user_cs = crate::gdt::user_code_selector().0 as u64;
+    let user_ss = crate::gdt::user_data_selector().0 as u64;
+
+    // Explicitly set GS MSRs instead of using `swapgs`, because the GS
+    // polarity is unpredictable: a timer preemption of a previous user process
+    // leaves user GS active, while a kernel thread leaves kernel GS active.
+    // Writing both MSRs directly avoids this ambiguity.
+    //   IA32_GS_BASE (0xC000_0101) = 0         → user GS for ring 3
+    //   IA32_KERNEL_GS_BASE (0xC000_0102) = &PER_CPU → restored by syscall swapgs
+    //
+    // Done via Msr::write (not raw inline asm) so LLVM correctly tracks
+    // register usage for wrmsr and doesn't clobber iretq operands.
+    let per_cpu = crate::syscall::per_cpu_addr();
+
+    unsafe {
+        core::arch::asm!("cli", options(nostack, nomem));
+        x86_64::registers::model_specific::Msr::new(0xC000_0101).write(0);
+        x86_64::registers::model_specific::Msr::new(0xC000_0102).write(per_cpu);
+
+        core::arch::asm!(
+            "mov cr3, {pml4}",
+            "push {ss}",
+            "push {usp}",
+            "push {rf}",
+            "push {cs}",
+            "push {ip}",
+            "iretq",
+            pml4  = in(reg) pml4_phys,
+            ss    = in(reg) user_ss,
+            usp   = in(reg) user_stack_top,
+            rf    = in(reg) 0x0202u64,
+            cs    = in(reg) user_cs,
+            ip    = in(reg) entry_point,
+            options(noreturn),
+        );
+    }
+}
+
+/// Returns `true` if the thread at `idx` is in the `Dead` state.
+pub fn is_thread_dead(idx: usize) -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let sched = SCHEDULER.lock();
+        sched.threads.get(idx).map_or(true, |t| t.state == ThreadState::Dead)
+    })
+}
+
+/// Mark the current thread as dead and yield.
+///
+/// The timer ISR will see `Dead` and not re-queue the thread.  This function
+/// never returns — it enables interrupts and spins until preempted.
+pub fn kill_current_thread() -> ! {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        let idx = sched.current_idx;
+        sched.threads[idx].state = ThreadState::Dead;
+    });
+    // Enable interrupts and spin; the timer will preempt us and we won't be
+    // re-queued because our state is Dead.
+    loop {
+        x86_64::instructions::interrupts::enable_and_hlt();
+    }
 }
 
 /// Called by the LAPIC timer assembly stub on every tick.
@@ -244,29 +407,52 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
 
     let current_idx = sched.current_idx;
 
-    // Decrement the running thread's quantum; keep running if ticks remain.
-    sched.threads[current_idx].ticks_remaining -= 1;
-    if sched.threads[current_idx].ticks_remaining > 0 {
-        return current_rsp;
+    // Decrement the running thread's quantum; keep running if ticks remain
+    // (unless the thread is Dead, in which case we must switch away).
+    if sched.threads[current_idx].state != ThreadState::Dead {
+        sched.threads[current_idx].ticks_remaining -= 1;
+        if sched.threads[current_idx].ticks_remaining > 0 {
+            return current_rsp;
+        }
     }
 
-    // Quantum expired — save context and pick the next thread.
+    // Save context of the current thread.
     sched.threads[current_idx].saved_rsp = current_rsp;
-    sched.threads[current_idx].state = ThreadState::Ready;
-    sched.ready_queue.push_back(current_idx);
+
+    // Only re-queue the thread if it's not Dead.
+    if sched.threads[current_idx].state != ThreadState::Dead {
+        sched.threads[current_idx].state = ThreadState::Ready;
+        sched.ready_queue.push_back(current_idx);
+    }
 
     // Round-robin: pop from the front of the ready queue.
-    // If no other thread is ready we re-schedule the current one.
-    let next_idx = sched.ready_queue.pop_front().unwrap_or(current_idx);
+    let next_idx = match sched.ready_queue.pop_front() {
+        Some(idx) => idx,
+        None => return current_rsp, // no other thread ready; stay on current
+    };
 
     sched.current_idx = next_idx;
     sched.threads[next_idx].state = ThreadState::Running;
     sched.threads[next_idx].ticks_remaining = QUANTUM_TICKS;
 
-    let next_rsp  = sched.threads[next_idx].saved_rsp;
-    let cur_pml4  = sched.threads[current_idx].pml4_phys;
-    let next_pml4 = sched.threads[next_idx].pml4_phys;
-    drop(sched); // release before VGA write (no lock needed, but be explicit)
+    let next_rsp         = sched.threads[next_idx].saved_rsp;
+    let cur_pml4         = sched.threads[current_idx].pml4_phys;
+    let next_pml4        = sched.threads[next_idx].pml4_phys;
+    let next_kind        = sched.threads[next_idx].kind;
+    let next_kstack_top  = sched.threads[next_idx].kernel_stack_top;
+    drop(sched); // release before touching other subsystems
+
+    // Update TSS.rsp0 and PER_CPU for user process threads; reset PID for kernel threads.
+    match next_kind {
+        SchedulableKind::UserProcess(pid) => {
+            crate::gdt::set_kernel_stack(x86_64::VirtAddr::new(next_kstack_top));
+            crate::syscall::set_kernel_rsp(next_kstack_top);
+            crate::process::set_current_pid(pid);
+        }
+        SchedulableKind::Kernel => {
+            crate::process::set_current_pid(ProcessId::KERNEL);
+        }
+    }
 
     // Switch address space when the new thread lives in a different PML4.
     // Kernel threads all share the boot PML4 so this is a no-op for them.

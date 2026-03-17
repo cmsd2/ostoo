@@ -142,9 +142,17 @@ fn sys_write(fd: u64, buf: u64, count: u64) -> i64 {
 }
 
 fn sys_exit(code: i32) -> i64 {
-    crate::println!("\n[kernel] user process exited with code {}", code);
-    // Phase 1: halt. Phase 3 will replace this with proper process teardown.
-    crate::hlt_loop();
+    let pid = crate::process::current_pid();
+    if pid != crate::process::ProcessId::KERNEL {
+        crate::println!("\n[kernel] pid {} exited with code {}", pid.as_u64(), code);
+        crate::process::mark_zombie(pid, code);
+        // Don't reap here — we're still running on the process's kernel stack.
+        // The Process (and its kernel stack) leaks as a zombie until a future
+        // wait()/reaper is implemented.
+    } else {
+        crate::println!("\n[kernel] kernel sys_exit({}) — halting", code);
+    }
+    crate::task::scheduler::kill_current_thread();
 }
 
 fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
@@ -157,6 +165,25 @@ fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
         }
         _ => -(22i64), // EINVAL
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-process kernel RSP
+
+/// Update the kernel RSP in the per-CPU data block.
+///
+/// Call this on context switch to a user process so that SYSCALL entry and
+/// hardware interrupts from ring 3 land on the correct kernel stack.
+pub fn set_kernel_rsp(rsp: u64) {
+    unsafe { PER_CPU.kernel_rsp = rsp; }
+}
+
+/// Address of the kernel per-CPU data block.
+///
+/// Used by `process_trampoline` to write IA32_KERNEL_GS_BASE explicitly
+/// instead of relying on `swapgs` polarity.
+pub fn per_cpu_addr() -> u64 {
+    &raw const PER_CPU as u64
 }
 
 // ---------------------------------------------------------------------------

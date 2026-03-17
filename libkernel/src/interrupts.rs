@@ -233,8 +233,16 @@ extern "x86-interrupt" fn invalid_opcode_handler(
     stack_frame: InterruptStackFrame)
 {
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
-        error!("ring-3 invalid opcode — halting (TODO: kill process)\n{:#?}", stack_frame);
-        crate::hlt_loop();
+        let pid = crate::process::current_pid();
+        error!("ring-3 invalid opcode (pid {}) — killing process\n{:#?}",
+            pid.as_u64(), stack_frame);
+        if pid != crate::process::ProcessId::KERNEL {
+            crate::process::mark_zombie(pid, -4); // SIGILL
+        }
+        // Restore kernel GS polarity: the CPU entered the fault handler from
+        // ring 3 without swapgs, so GS.BASE is still the user value.
+        unsafe { core::arch::asm!("swapgs", options(nostack, nomem)); }
+        crate::task::scheduler::kill_current_thread();
     }
     panic!("EXCEPTION: INVALID OPCODE\n{:#?}", stack_frame);
 }
@@ -243,11 +251,17 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame, error_code: u64)
 {
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        let pid = crate::process::current_pid();
         error!(
-            "ring-3 general protection fault (error={:#x}) — halting (TODO: kill process)\n{:#?}",
-            error_code, stack_frame
+            "ring-3 GPF (pid {}, error={:#x}) — killing process\n{:#?}",
+            pid.as_u64(), error_code, stack_frame
         );
-        crate::hlt_loop();
+        if pid != crate::process::ProcessId::KERNEL {
+            crate::process::mark_zombie(pid, -11); // SIGSEGV
+        }
+        // Restore kernel GS polarity (see invalid_opcode_handler comment).
+        unsafe { core::arch::asm!("swapgs", options(nostack, nomem)); }
+        crate::task::scheduler::kill_current_thread();
     }
     panic!(
         "EXCEPTION: GENERAL PROTECTION FAULT (error={:#x})\n{:#?}",
@@ -280,13 +294,21 @@ extern "x86-interrupt" fn page_fault_handler(
 
     // Check whether the fault came from ring 3 (RPL field of the saved CS).
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
-        // Ring-3 fault: log and halt.
-        // Phase 3 will replace this with process termination + rescheduling.
+        let pid = crate::process::current_pid();
         error!(
-            "ring-3 page fault at {:?} (error: {:?}) — halting (TODO: kill process)",
-            faulting_addr, error_code
+            "ring-3 page fault at {:?} (pid {}, error: {:?}) — killing process",
+            faulting_addr, pid.as_u64(), error_code
         );
-        crate::hlt_loop();
+        if pid != crate::process::ProcessId::KERNEL {
+            crate::process::mark_zombie(pid, -11); // SIGSEGV
+        }
+        // Restore kernel GS polarity: the CPU entered the fault handler from
+        // ring 3 without swapgs, so GS.BASE is still the user value.  We must
+        // swap back to kernel GS before kill_current_thread spins with
+        // interrupts enabled, otherwise the next process_trampoline will
+        // observe the wrong polarity.
+        unsafe { core::arch::asm!("swapgs", options(nostack, nomem)); }
+        crate::task::scheduler::kill_current_thread();
     }
 
     panic!(
