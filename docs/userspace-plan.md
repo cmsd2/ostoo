@@ -10,17 +10,53 @@ through system calls, and eventually linked against a ported musl libc.
 
 ---
 
-## Current State Summary
+## Progress Summary
 
-| Area | What exists | Gap |
-|------|-------------|-----|
-| Page tables | `RecursivePageTable` (PML4[511] self-referential); kernel in high canonical half; lower half entirely free for user processes | No per-process tables; no address-space switching |
-| GDT | Ring-0 code segment + TSS only | No ring-3 code/data segments |
-| Syscalls | None | No SYSCALL MSR setup, no entry point |
-| Page faults | Kernel panic | Must forward ring-3 faults to the process |
-| Exceptions | Kernel-only context saved (15 GPRs + iret frame) | User RSP/CS/RFLAGS/FS/GS not saved |
-| Task model | Pinned `Box<dyn Future>` in one address space | No `Process` struct, no file tables, no signals |
-| Scheduler | Round-robin kernel threads (10 ms quantum) | No user-mode threads; no per-process kernel stacks |
+Phases 0–3 are **complete**. The kernel can parse ELF binaries, create isolated
+per-process address spaces, drop to ring 3 via `iretq`, handle SYSCALL/SYSRET,
+and preemptively schedule user processes alongside kernel threads. Ring-3 page
+faults kill the offending process without crashing the kernel.
+
+| Phase | Status | Milestone |
+|-------|--------|-----------|
+| 0 — Toolchain | **Done** | Hand-crafted assembly blobs and static ELF binaries load and run |
+| 1 — Ring-3 + SYSCALL | **Done** | GDT has ring-3 segments; SYSCALL/SYSRET works; `sys_write`, `sys_exit`, `sys_arch_prctl` implemented |
+| 2 — Per-process page tables | **Done** | `create_user_page_table`, `map_user_page`, CR3 switching on context switch; ring-3 page faults kill the process |
+| 3 — Process abstraction | **Done** | `Process` struct, process table, ELF loader, `exec` shell command, zombie reaping |
+| 4 — System call layer | **Not started** | Need `read`, `mmap`, `brk`, `fstat`, `close`, `munmap` for musl hello-world |
+| 5 — Cross-compiler + musl | **Not started** | Need Phase 4 syscalls first |
+| 6 — Fork / wait / user shell | **Not started** | Requires CoW page faults, `waitpid` |
+| 7 — Signals | **Not started** | Requires signal frame push/pop, `rt_sigaction`, `rt_sigreturn` |
+
+### What works today
+
+- Shell command `exec <path>` reads an ELF from the VFS and spawns it as a
+  ring-3 process with its own PML4.
+- User code can call `sys_write(1, buf, len)` to print to the VGA console.
+- User code calls `sys_exit(code)` to terminate; the process is marked zombie
+  and reaped on the next `exec` or `spawn_blob`.
+- `sys_arch_prctl(ARCH_SET_FS, addr)` writes `IA32_FS_BASE` (needed by musl TLS).
+- Ring-3 page faults (e.g. `test pagefault`) log the fault, mark the process
+  zombie, restore kernel GS polarity, and kill the thread — no kernel panic.
+- `test isolation` verifies two independently-created PML4s have genuinely
+  independent user-space mappings at the same virtual address.
+- System info commands (cpuinfo, meminfo, memmap, pmap, threads, tasks, idt,
+  pci, lapic, ioapic, drivers, uptime) are exposed as `/proc` virtual files
+  accessible via `cat /proc/<file>`.
+
+### Key implementation files
+
+| File | Role |
+|------|------|
+| `libkernel/src/gdt.rs` | GDT with kernel + user code/data segments, TSS, `set_kernel_stack` for rsp0 |
+| `libkernel/src/syscall.rs` | SYSCALL MSR init, assembly entry stub, `syscall_dispatch`, per-CPU data |
+| `libkernel/src/process.rs` | `Process` struct, `ProcessId`, process table, zombie marking/reaping |
+| `libkernel/src/elf.rs` | Minimal ELF64 parser (static `ET_EXEC`, x86-64) |
+| `libkernel/src/memory/mod.rs` | `create_user_page_table`, `map_user_page`, `switch_address_space` |
+| `libkernel/src/task/scheduler.rs` | `spawn_user_thread`, `process_trampoline`, CR3 switching in `preempt_tick` |
+| `libkernel/src/interrupts.rs` | Ring-3-aware page fault handler |
+| `kernel/src/ring3.rs` | `spawn_process` (ELF), `spawn_blob` (raw code), test helpers |
+| `devices/src/vfs/proc_vfs.rs` | ProcVfs with 12 virtual files |
 
 ---
 
@@ -57,7 +93,7 @@ without `USER_ACCESSIBLE`; they are invisible to ring-3 code.
 
 ---
 
-## Phase 0 — Toolchain and Build Infrastructure
+## Phase 0 — Toolchain and Build Infrastructure  ✅ COMPLETE
 
 **Goal:** produce user-space ELF binaries that the kernel can load, without
 needing musl yet.
@@ -96,10 +132,24 @@ syscalls work.
 
 ---
 
-## Phase 1 — Ring-3 GDT Segments and SYSCALL Infrastructure
+## Phase 1 — Ring-3 GDT Segments and SYSCALL Infrastructure  ✅ COMPLETE
 
 **Goal:** the kernel can jump to ring 3 and come back via SYSCALL/SYSRET.
 No process isolation yet — user code runs in the kernel's own address space.
+
+**What was implemented:**
+- GDT extended with kernel data, user data, and user code segments in the order
+  required by `IA32_STAR` (`libkernel/src/gdt.rs`).
+- `TSS.rsp0` updated via `set_kernel_stack()` on every context switch to a user
+  process.
+- SYSCALL MSRs (`STAR`, `LSTAR`, `FMASK`, `EFER.SCE`) configured in
+  `libkernel/src/syscall.rs::init()`.
+- Assembly entry stub with `swapgs`, per-CPU kernel/user RSP swap, and SysV64
+  argument shuffle before calling `syscall_dispatch`.
+- Three syscalls: `write` (fd 1/2 to VGA), `exit`/`exit_group` (mark zombie +
+  kill thread), `arch_prctl(ARCH_SET_FS)` (write `IA32_FS_BASE` MSR).
+- Ring-3 test (`test ring3`): drops to user mode, writes "Hello from ring 3!"
+  via syscall, exits cleanly.
 
 ### 1a. GDT additions (`libkernel/src/gdt.rs`)
 
@@ -215,10 +265,26 @@ space isolation.
 
 ---
 
-## Phase 2 — Per-Process Page Tables and Address Space Isolation
+## Phase 2 — Per-Process Page Tables and Address Space Isolation  ✅ COMPLETE
 
 **Goal:** each process has its own PML4; kernel mappings are shared; user
 mappings are private.
+
+**What was implemented:**
+- `MemoryServices::create_user_page_table()` allocates a fresh PML4, copies
+  kernel entries (indices 256–510) without `USER_ACCESSIBLE`, and sets the
+  recursive self-mapping at index 511.
+- `MemoryServices::map_user_page()` maps individual 4 KiB pages in a non-active
+  page table given its PML4 physical address.
+- `unsafe switch_address_space(pml4_phys)` writes CR3.
+- Page fault handler (`libkernel/src/interrupts.rs`) checks
+  `stack_frame.code_segment.rpl()` — ring-3 faults mark the process zombie
+  (exit code -11 / SIGSEGV), restore kernel GS via `swapgs`, and call
+  `kill_current_thread()`.  Kernel faults still panic.
+- `test isolation` shell command verifies two PML4s map the same user virtual
+  address to different physical frames.
+- Scheduler `preempt_tick` saves/restores CR3 when switching between threads
+  with different page tables.
 
 ### 2a. Page table creation (`libkernel/src/memory/`)
 
@@ -284,9 +350,34 @@ different page tables.
 
 ---
 
-## Phase 3 — Process Abstraction
+## Phase 3 — Process Abstraction  ✅ COMPLETE
 
 **Goal:** `Process` struct, a process table, and a working `exec`.
+
+**What was implemented:**
+- `Process` struct (`libkernel/src/process.rs`) with PID, state (Running/Zombie),
+  PML4 physical address, heap-allocated 64 KiB kernel stack, entry point, user
+  stack top, thread index, and exit code.
+- Global `PROCESS_TABLE: Mutex<BTreeMap<ProcessId, Process>>` and
+  `CURRENT_PID: AtomicU64`.
+- `insert()`, `current_pid()`, `set_current_pid()`, `with_process()`,
+  `mark_zombie()`, `reap()`, `reap_zombies()`.
+- Scheduler integration: `SchedulableKind::Kernel | UserProcess(ProcessId)`.
+  `spawn_user_thread` creates a thread targeting `process_trampoline` which sets
+  up TSS.rsp0, per-CPU kernel RSP, PID tracking, GS polarity, CR3 switch, and
+  then does `iretq` into ring-3 user code.
+- `kill_current_thread()` marks the thread Dead and spins; timer preemption skips
+  dead threads.
+- ELF loader (`libkernel/src/elf.rs`): minimal parser for static `ET_EXEC`
+  x86-64 binaries.  Returns `ElfInfo { entry, segments: Vec<LoadSegment> }`.
+- `kernel/src/ring3.rs::spawn_process(elf_data)` — parses ELF, creates user PML4,
+  maps all PT_LOAD segments (with correct R/W/X flags) plus a user stack page,
+  creates a Process, and spawns a user thread.  Returns `Ok(ProcessId)`.
+- Shell command `exec <path>` reads an ELF from the VFS and calls `spawn_process`.
+- `spawn_blob(code)` helper for test commands: maps a raw code blob + stack,
+  creates a Process, spawns a user thread.
+- Zombie reaping: `reap_zombies()` is called at the start of `spawn_blob` and
+  `spawn_process` to free kernel stacks of fully-exited processes.
 
 ### 3a. `Process` struct (`libkernel/src/process/mod.rs`)
 
@@ -356,10 +447,15 @@ fn sys_execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -
 
 ---
 
-## Phase 4 — System Call Layer
+## Phase 4 — System Call Layer  ⬜ NOT STARTED
 
 **Goal:** a syscall table wide enough to run a static musl binary that prints
 "Hello, world!" and exits.
+
+**Current state:** Only `write` (nr 1), `exit`/`exit_group` (nr 60/231), and
+`arch_prctl` (nr 158) are implemented.  All other syscall numbers return
+`-ENOSYS`.  No file descriptor table exists yet — `sys_write` checks
+`fd == 1 || fd == 2` and writes directly to the VGA console.
 
 ### 4a. Syscall numbering
 
@@ -404,7 +500,7 @@ Stdin (fd 0), stdout (fd 1), stderr (fd 2) are wired up on process creation:
 
 ---
 
-## Phase 5 — Cross-Compiler and musl Port
+## Phase 5 — Cross-Compiler and musl Port  ⬜ NOT STARTED
 
 **Goal:** compile C programs that run as ostoo user processes.
 
@@ -475,7 +571,7 @@ pub extern "C" fn main() {
 
 ---
 
-## Phase 6 — Fork, Wait, and a Minimal Shell
+## Phase 6 — Fork, Wait, and a Minimal Shell  ⬜ NOT STARTED
 
 **Goal:** a user-mode shell that can `fork` + `exec` child programs.
 
@@ -528,7 +624,7 @@ while (1) {
 
 ---
 
-## Phase 7 — Signals
+## Phase 7 — Signals  ⬜ NOT STARTED
 
 Signals are the last major piece of POSIX plumbing needed for a realistic
 user-space environment.
@@ -597,20 +693,20 @@ per-CPU `CURRENT_PID`, per-CPU kernel stacks in the TSS, and IPI-based TLB
 shootdown when modifying another process's page table.
 
 ### Heap size
-The kernel heap is 256 KiB (increased from 100 KiB to accommodate heap-allocated
-thread stacks).  Process control blocks, page table frames, and file tables will
-exhaust this quickly.  Grow the heap (or implement demand paging) before loading
-real programs.
+The kernel heap is 512 KiB.  Process control blocks each consume 64 KiB
+(kernel stack) plus page table frames.  `reap_zombies()` is called before each
+`spawn_process` to recover heap, but loading multiple concurrent processes will
+still require a larger or demand-paged heap.
 
 ---
 
 ## Milestones and Test Checkpoints
 
-| Milestone | Observable result |
-|-----------|------------------|
-| Phase 1 complete | `iretq` drops to ring 3; `syscall` returns to ring 0; one character appears on VGA |
-| Phase 2 complete | Two user processes have separate address spaces; write by process A is not visible to process B |
-| Phase 3 complete | Kernel reads an ELF from the VFS, loads it into a fresh address space, and runs it |
-| Phase 4 / musl hello world | `hello` compiled with `x86_64-linux-musl-gcc -static` prints and exits cleanly |
-| Phase 6 complete | User shell forks, execs, and waits for children |
-| Phase 7 complete | `SIGINT` (Ctrl+C) terminates the foreground process |
+| Milestone | Observable result | Status |
+|-----------|------------------|--------|
+| Phase 1 complete | `iretq` drops to ring 3; `syscall` returns to ring 0; "Hello from ring 3!" appears on VGA | ✅ Done |
+| Phase 2 complete | Two user processes have separate address spaces; `test isolation` passes | ✅ Done |
+| Phase 3 complete | `exec /path/to/elf` reads an ELF from the VFS, loads it into a fresh address space, and runs it | ✅ Done |
+| Phase 4 / musl hello world | `hello` compiled with `x86_64-linux-musl-gcc -static` prints and exits cleanly | ⬜ |
+| Phase 6 complete | User shell forks, execs, and waits for children | ⬜ |
+| Phase 7 complete | `SIGINT` (Ctrl+C) terminates the foreground process | ⬜ |

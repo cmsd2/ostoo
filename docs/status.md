@@ -73,7 +73,7 @@ Toolchain: current nightly (floating, `rust-toolchain.toml`).
   all virtual address allocation at runtime.
 
 ### 10. Heap Allocation
-- Kernel heap mapped at `0xFFFF_8000_0000_0000`, size 256 KiB
+- Kernel heap mapped at `0xFFFF_8000_0000_0000`, size 512 KiB
   (`libkernel/src/allocator/mod.rs`).
 - Global allocator: `linked_list_allocator::LockedHeap`.
 - `extern crate alloc` available; `Box`, `Vec`, `Rc`, `BTreeMap`, etc. all work.
@@ -148,7 +148,9 @@ are present, racing all event sources in a single future.
 - Prompt includes CWD: `ostoo:/path> `.
 - `resolve_path` / `normalize_path` handle relative paths and `..` components.
 - Commands: `help`, `echo`, `driver <start|stop|info>`, `blk <info|read|ls|cat>`,
-  `ls`, `cat`, `pwd`, `cd`, `mount`.
+  `ls`, `cat`, `pwd`, `cd`, `mount`, `exec`, `test`.
+- Info commands (cpuinfo, meminfo, etc.) migrated to `/proc`; accessible via
+  `cat /proc/<file>`.
 
 ### Keyboard Actor (`kernel/src/keyboard_actor.rs`)
 - `#[actor]` + `#[on_stream(key_stream)]`; registered as `"keyboard"`.
@@ -192,10 +194,20 @@ are present, racing all event sources in a single future.
   longest-mountpoint-first; the `Arc` is cloned out before any `.await` so
   the lock is never held across a suspension point.
 - `ExfatVfs` — wraps a `BlkInbox` and delegates to the exFAT driver.
-- `ProcVfs` — synthetic filesystem; no block I/O:
+- `ProcVfs` — synthetic filesystem; no block I/O.  All system info commands
+  have been migrated from the shell to `/proc` virtual files:
   - `/proc/tasks` — ready / waiting task counts from the executor.
   - `/proc/uptime` — seconds since boot from the LAPIC tick counter.
   - `/proc/drivers` — name and state of every registered driver.
+  - `/proc/threads` — current thread index and context-switch count.
+  - `/proc/meminfo` — heap usage, frame allocator stats, known virtual regions.
+  - `/proc/memmap` — physical memory regions from the bootloader memory map.
+  - `/proc/cpuinfo` — CPU vendor, family/model/stepping, CR0/CR4/EFER/RFLAGS.
+  - `/proc/pmap` — page table walk with coalesced contiguous regions.
+  - `/proc/idt` — IDT vector assignments (exceptions, PIC, LAPIC, dynamic).
+  - `/proc/pci` — enumerated PCI devices.
+  - `/proc/lapic` — Local APIC state and timer configuration.
+  - `/proc/ioapic` — I/O APIC redirection table entries.
 - Shell commands: `ls`, `cat`, `cd` use the VFS API; `mount` manages the
   mount table at runtime (`mount`, `mount proc <mp>`, `mount blk <mp>`).
 - `/proc` is always mounted at boot; exFAT `/` is mounted if virtio-blk is present.
@@ -240,11 +252,12 @@ are present, racing all event sources in a single future.
 ## Known Issues / Technical Debt
 
 ### Heap Size
-The heap is a fixed 256 KiB at `0xFFFF_8000_0000_0000`. This accommodates two
-64 KiB thread stacks (thread 0 and thread 1) plus driver and task allocations,
-but will need to grow for any real subsystem work.  The `DumbVmemAllocator` has
-no reclamation path, so virtual address space for MMIO/ACPI mappings is also
-consumed monotonically.
+The heap is a fixed 512 KiB at `0xFFFF_8000_0000_0000`. This accommodates two
+64 KiB thread stacks (threads 0 and 1), per-process 64 KiB kernel stacks, plus
+driver and task allocations. `reap_zombies()` reclaims process heap on the next
+`spawn_process`, but concurrent processes will still pressure the heap. The
+`DumbVmemAllocator` has no reclamation path, so virtual address space for
+MMIO/ACPI mappings is also consumed monotonically.
 
 ### virtio-blk Busy Polling
 `CompletionFuture` re-schedules itself immediately rather than sleeping on an
@@ -278,19 +291,16 @@ output but functionally harmless.
 3. **exFAT write support** — directory entry creation, FAT chain allocation,
    and sector writes to enable `touch`, `mkdir`, `cp`, `rm`.
 
-4. **More ProcVfs entries** — `/proc/meminfo`, `/proc/cpuinfo`, `/proc/pci`,
-   etc., surfacing existing shell command output as readable files.
-
-5. **New filesystem drivers** — a RAM-based tmpfs (`TmpVfs`) or a simple
+4. **New filesystem drivers** — a RAM-based tmpfs (`TmpVfs`) or a simple
    flat-file initrd would exercise the VFS extension path without requiring
    block I/O.
 
-6. **Multi-sector DMA** — batch multiple sectors per virtio request to reduce
+5. **Multi-sector DMA** — batch multiple sectors per virtio request to reduce
    queue round-trips for directory scans and file reads.
 
-7. **User space / process isolation** — ring-3 processes with their own page
-   tables, system call interface, and per-process file descriptor tables built
-   on top of the VFS.
+6. **User space Phase 4: syscall layer** — implement `read`, `mmap`, `brk`,
+   `fstat`, `close`, `munmap` to run a static musl "Hello, world!" binary.
+   See [`docs/userspace-plan.md`](userspace-plan.md) for the full roadmap.
 
-8. **Reclaiming virtual address space** — replace `DumbVmemAllocator` with a
+7. **Reclaiming virtual address space** — replace `DumbVmemAllocator` with a
    proper free-list allocator so MMIO mappings can be released.

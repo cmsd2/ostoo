@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2018"
 
 [dependencies]
+apic            = { workspace = true }
+bootloader      = { workspace = true }
 devices-macros  = { path = "../devices-macros" }
 lazy_static     = { workspace = true }
 libkernel       = { workspace = true }
