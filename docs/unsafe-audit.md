@@ -76,7 +76,7 @@ from MMIO access via raw pointers in `read_reg_32` / `write_reg_32`, but
 the actual invariant is in *construction* (providing a valid base address),
 not in each register read/write.~~
 
-**Completed:**
+**Completed** (commit `24a421d`):
 
 - `MappedLocalApic::new()` is now the sole `unsafe` boundary with documented
   safety invariants.
@@ -85,14 +85,6 @@ not in each register read/write.~~
 - Callers in `apic/src/lib.rs` and `devices/src/vfs/proc_vfs.rs` updated —
   dozens of `unsafe` blocks removed.
 
-~~**Recommendations:**~~
-
-~~- Make `MappedLocalApic::new()` the sole `unsafe` boundary (with
-  documented safety invariants).
-- Register accessors use `read_volatile` / `write_volatile` internally but
-  become safe methods.
-- Callers in `apic/src/lib.rs` would lose dozens of `unsafe` blocks.~~
-
 ---
 
 ## 5. `apic/src/io_apic/mapped.rs` — Same pattern as local APIC ✅ DONE
@@ -100,7 +92,7 @@ not in each register read/write.~~
 ~~Same issue — every public method is `unsafe`, and register access helpers
 use raw pointer dereferences without `read_volatile` / `write_volatile`.~~
 
-**Completed:**
+**Completed** (commit `24a421d`):
 
 - `MappedIoApic::new()` is now the sole `unsafe` boundary with documented
   safety invariants.  `base_addr` field made private with `base_addr()` getter.
@@ -111,13 +103,6 @@ use raw pointer dereferences without `read_volatile` / `write_volatile`.~~
   `write_reg_64`) now uses `core::ptr::read_volatile` / `write_volatile`
   instead of raw dereferences — correct for MMIO.
 - Callers in `apic/src/lib.rs` and `devices/src/vfs/proc_vfs.rs` updated.
-
-~~**Recommendations:**~~
-
-~~- Move unsafety to construction; make methods safe.
-- Replace raw `*ptr` / `*ptr = val` with `core::ptr::read_volatile` /
-  `write_volatile` — MMIO registers **must** use volatile access; plain
-  dereferences can be optimised away by the compiler.~~
 
 ---
 
@@ -206,7 +191,7 @@ casts like `unsafe { &*((phys_off + addr) as *const PageTable) }`.
 | **High**   | `syscall.rs`              | ~8           | Eliminate `static mut`, validate user pointers   |
 | **High**   | `local_apic/mapped.rs`    | ~~18~~       | ✅ Done — safe methods, unsafe-only construction |
 | **High**   | `io_apic/mapped.rs`       | ~~12~~       | ✅ Done — same + `read_volatile` / `write_volatile` |
-| **Medium** | `vga_buffer.rs`           | ~~~14~~     | ✅ Done — `VgaBuffer` wrapper                   |
+| **Medium** | `vga_buffer.rs`           | ~~14~~       | ✅ Done — `VgaBuffer` wrapper                   |
 | **Medium** | `kernel_acpi.rs`          | ~16          | Generic volatile MMIO helpers                    |
 | **Medium** | `ring3.rs`                | ~8           | `zero_frame` / `copy_to_frame` on MemoryServices |
 | **Medium** | `gdt.rs`                  | 2            | `UnsafeCell` for TSS mutation                    |
