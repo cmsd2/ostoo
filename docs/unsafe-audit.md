@@ -1,0 +1,186 @@
+# Unsafe Code Audit & Refactoring Opportunities
+
+An audit of `unsafe` usage across the codebase, prioritised by density and
+refactoring payoff.
+
+---
+
+## 1. `libkernel/src/vga_buffer.rs` — Raw pointer to MMIO buffer
+
+`Writer` stores a raw `*mut Buffer` pointer and dereferences it with
+`unsafe { &mut *self.buffer }` in **7 separate places**.  There is also a
+manual `unsafe impl Send` to paper over the raw pointer.
+
+**Recommendations:**
+
+- Create a safe `VgaBuffer` wrapper that encapsulates the raw pointer and
+  provides bounds-checked `read_cell` / `write_cell` methods.  All `Writer`
+  methods would use the wrapper, eliminating every interior `unsafe` block
+  and the manual `Send` impl.
+- `set_hw_cursor` (currently `unsafe fn`) could become a safe method on the
+  wrapper.
+- The test at lines 503–504 uses `core::mem::transmute` on `u8 → Color` —
+  replace with `TryFrom` or a `from_u8` constructor.
+
+---
+
+## 2. `libkernel/src/task/scheduler.rs` — Raw stack frame construction & inline asm
+
+`spawn_thread` and `spawn_user_thread` both manually write 20 `u64` values
+to raw stack pointers to construct fake iretq frames.  `preempt_tick` reads
+raw pointers at computed offsets for sanity checks.  `process_trampoline`
+contains a large `unsafe` asm block.
+
+**Recommendations:**
+
+- Define a `#[repr(C)]` `IretqFrame` struct with named fields (`r15`,
+  `r14`, …, `rip`, `cs`, `rflags`, `rsp`, `ss`) and constructors
+  `IretqFrame::new_kernel(entry, stack_top)` /
+  `IretqFrame::new_user(…)`.  This replaces error-prone
+  `frame.add(15).write(…)` magic-number indexing with named fields, and
+  both `spawn_thread` and `spawn_user_thread` can share it.
+- Extract `process_trampoline`'s MSR / CR3 / iretq asm into a dedicated
+  `drop_to_ring3(entry, user_rsp, pml4_phys, user_cs, user_ss)` unsafe
+  helper so the safety boundary is explicit and well-documented.
+
+---
+
+## 3. `libkernel/src/syscall.rs` — `static mut` per-CPU data
+
+`PER_CPU` and `SYSCALL_STACK` are `static mut`, accessed with bare
+`unsafe` throughout.  `sys_write` creates a slice from a raw user-space
+pointer without any validation.
+
+**Recommendations:**
+
+- Replace `static mut PER_CPU` with a `#[repr(C)]` struct behind an
+  `UnsafeCell` wrapper with explicit access methods (`get_kernel_rsp()`,
+  `set_kernel_rsp()`), removing the `static mut`.
+- `sys_write` should validate that `buf` and `buf + count` fall within the
+  user address range (< `0x0000_8000_0000_0000`) before building the slice
+  — this is a potential safety / security issue.
+
+---
+
+## 4. `apic/src/local_apic/mapped.rs` — Every method is `unsafe`
+
+`MappedLocalApic` has **15 public `unsafe` methods**.  The unsafety stems
+from MMIO access via raw pointers in `read_reg_32` / `write_reg_32`, but
+the actual invariant is in *construction* (providing a valid base address),
+not in each register read/write.
+
+**Recommendations:**
+
+- Make `MappedLocalApic::new()` the sole `unsafe` boundary (with
+  documented safety invariants).
+- Register accessors use `read_volatile` / `write_volatile` internally but
+  become safe methods.
+- Callers in `apic/src/lib.rs` would lose dozens of `unsafe` blocks.
+
+---
+
+## 5. `apic/src/io_apic/mapped.rs` — Same pattern as local APIC
+
+Same issue — every public method is `unsafe`, and register access helpers
+use raw pointer dereferences without `read_volatile` / `write_volatile`.
+
+**Recommendations:**
+
+- Move unsafety to construction; make methods safe.
+- Replace raw `*ptr` / `*ptr = val` with `core::ptr::read_volatile` /
+  `write_volatile` — MMIO registers **must** use volatile access; plain
+  dereferences can be optimised away by the compiler.
+
+---
+
+## 6. `kernel/src/kernel_acpi.rs` — Repetitive raw pointer reads/writes
+
+The `acpi::Handler` impl has 8 nearly identical `read_uN` / `write_uN`
+methods, each doing `unsafe { *(addr as *const T) }`.  No volatile access,
+no alignment checks.
+
+**Recommendations:**
+
+- Create a generic `fn mmio_read<T>(addr: usize) -> T` /
+  `fn mmio_write<T>(addr: usize, val: T)` helper using
+  `read_volatile` / `write_volatile`, then call it from each trait method.
+  Reduces 16 lines of unsafe to 2.
+- Same for the IO port methods — a single `port_read::<T>(port)` /
+  `port_write::<T>(port, val)` generic would collapse 6 methods.
+
+---
+
+## 7. `kernel/src/ring3.rs` — Scattered raw pointer copies
+
+`spawn_blob` and `spawn_process` manually call `core::ptr::write_bytes`
+and `core::ptr::copy_nonoverlapping` on physical-memory-mapped addresses.
+The pattern `phys_off + phys_addr → as_mut_ptr → write_bytes` repeats
+multiple times.
+
+**Recommendations:**
+
+- Add `zero_frame(phys: PhysAddr)` and
+  `copy_to_frame(phys: PhysAddr, data: &[u8])` utilities on
+  `MemoryServices` that encapsulate the offset arithmetic and unsafe ptr
+  operations.  This would also clean up similar patterns in
+  `libkernel/src/memory/mod.rs`.
+
+---
+
+## 8. `libkernel/src/gdt.rs` — Mutable cast of `static` TSS
+
+`set_kernel_stack` casts `&*TSS` through `*const → *mut` to write `rsp0`.
+This is technically UB (mutating through a shared reference to a
+`lazy_static`).
+
+**Recommendations:**
+
+- Store the TSS in an `UnsafeCell` or `Mutex` so the mutation is sound.
+  Since it is single-CPU and only called with interrupts off, an
+  `UnsafeCell` wrapper with a documented invariant is sufficient.
+
+---
+
+## 9. `libkernel/src/interrupts.rs` — Crash-dump raw pointer reads
+
+`double_fault_handler` and `invalid_opcode_handler` use
+`core::ptr::read_volatile` on raw addresses for crash diagnostics, and the
+inline-asm MSR reads are duplicated across fault handlers.
+
+**Recommendations:**
+
+- Extract a `fn dump_cpu_state(frame: &InterruptStackFrame) -> CpuState`
+  helper that reads CR2/CR3/CR4/GS MSRs once and returns a struct,
+  eliminating duplicated inline asm across fault handlers.
+- A `fn dump_bytes_at(addr: u64, len: usize) -> [u8; 16]` helper would
+  replace the raw pointer reads in both handlers.
+
+---
+
+## 10. `devices/src/vfs/proc_vfs.rs` — Manual page-table walking
+
+`gen_pmap()` manually walks PML4 / PDPT / PD / PT levels using raw pointer
+casts like `unsafe { &*((phys_off + addr) as *const PageTable) }`.
+
+**Recommendations:**
+
+- Add a `walk_page_tables` iterator or visitor on `MemoryServices` that
+  safely provides `(virt_range, phys_base, flags)` entries.  Replaces 50+
+  lines of raw pointer walks.
+
+---
+
+## Summary table
+
+| Priority   | File                      | Unsafe count | Refactor                                       |
+|------------|---------------------------|--------------|-------------------------------------------------|
+| **High**   | `scheduler.rs`            | ~12          | `IretqFrame` struct, `drop_to_ring3` helper     |
+| **High**   | `syscall.rs`              | ~8           | Eliminate `static mut`, validate user pointers   |
+| **High**   | `local_apic/mapped.rs`    | ~18          | Safe methods, unsafe-only construction           |
+| **High**   | `io_apic/mapped.rs`       | ~12          | Same + use `read_volatile` / `write_volatile`    |
+| **Medium** | `vga_buffer.rs`           | ~14          | `VgaBuffer` wrapper around raw pointer           |
+| **Medium** | `kernel_acpi.rs`          | ~16          | Generic volatile MMIO helpers                    |
+| **Medium** | `ring3.rs`                | ~8           | `zero_frame` / `copy_to_frame` on MemoryServices |
+| **Medium** | `gdt.rs`                  | 2            | `UnsafeCell` for TSS mutation                    |
+| **Low**    | `interrupts.rs`           | ~10          | `dump_cpu_state` + `dump_bytes_at` helpers       |
+| **Low**    | `proc_vfs.rs`             | ~5           | Page-table walk iterator                         |
