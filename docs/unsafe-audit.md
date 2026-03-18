@@ -31,41 +31,44 @@ manual `unsafe impl Send` to paper over the raw pointer.~~
 
 ---
 
-## 2. `libkernel/src/task/scheduler.rs` — Raw stack frame construction & inline asm
+## 2. `libkernel/src/task/scheduler.rs` — Raw stack frame construction & inline asm ✅ DONE
 
-`spawn_thread` and `spawn_user_thread` both manually write 20 `u64` values
+~~`spawn_thread` and `spawn_user_thread` both manually write 20 `u64` values
 to raw stack pointers to construct fake iretq frames.  `preempt_tick` reads
 raw pointers at computed offsets for sanity checks.  `process_trampoline`
-contains a large `unsafe` asm block.
+contains a large `unsafe` asm block.~~
 
-**Recommendations:**
+**Completed** (commit `ac60740`):
 
-- Define a `#[repr(C)]` `IretqFrame` struct with named fields (`r15`,
-  `r14`, …, `rip`, `cs`, `rflags`, `rsp`, `ss`) and constructors
-  `IretqFrame::new_kernel(entry, stack_top)` /
-  `IretqFrame::new_user(…)`.  This replaces error-prone
-  `frame.add(15).write(…)` magic-number indexing with named fields, and
-  both `spawn_thread` and `spawn_user_thread` can share it.
-- Extract `process_trampoline`'s MSR / CR3 / iretq asm into a dedicated
-  `drop_to_ring3(entry, user_rsp, pml4_phys, user_cs, user_ss)` unsafe
-  helper so the safety boundary is explicit and well-documented.
+- Introduced `#[repr(C)] SwitchFrame` with named fields matching the
+  `lapic_timer_stub` push/pop order.  Constructors `new_kernel()` and
+  `new_user_trampoline()` replace magic-number `frame.add(N).write(...)` in
+  both `spawn_thread` and `spawn_user_thread`.
+- `preempt_tick` sanity check reads `frame.rip` / `frame.rsp` through the
+  typed struct instead of raw pointer arithmetic.
+- Extracted `drop_to_ring3()` unsafe helper from `process_trampoline`:
+  GS MSR writes + CR3 switch + iretq in one well-documented `unsafe fn`,
+  making the safety boundary explicit.
 
 ---
 
-## 3. `libkernel/src/syscall.rs` — `static mut` per-CPU data
+## 3. `libkernel/src/syscall.rs` — `static mut` per-CPU data ✅ DONE
 
-`PER_CPU` and `SYSCALL_STACK` are `static mut`, accessed with bare
+~~`PER_CPU` and `SYSCALL_STACK` are `static mut`, accessed with bare
 `unsafe` throughout.  `sys_write` creates a slice from a raw user-space
-pointer without any validation.
+pointer without any validation.~~
 
-**Recommendations:**
+**Completed** (commit `1c28010`):
 
-- Replace `static mut PER_CPU` with a `#[repr(C)]` struct behind an
-  `UnsafeCell` wrapper with explicit access methods (`get_kernel_rsp()`,
-  `set_kernel_rsp()`), removing the `static mut`.
-- `sys_write` should validate that `buf` and `buf + count` fall within the
-  user address range (< `0x0000_8000_0000_0000`) before building the slice
-  — this is a potential safety / security issue.
+- Replaced `static mut PER_CPU` with an `UnsafeCell` wrapper (`PerCpuCell`)
+  with documented safety invariant (single CPU, interrupts disabled).
+- Replaced `static mut SYSCALL_STACK` with a safe `#[repr(align(16))]`
+  static.  `kernel_stack_top()` is now fully safe.
+- `sys_write` now validates that the user buffer falls entirely within user
+  address space (< `0x0000_8000_0000_0000`), returning `EFAULT` for invalid
+  pointers.
+- `init()`, `set_kernel_rsp()`, `per_cpu_addr()` updated to use new
+  accessors — no more `&raw const` on `static mut`.
 
 ---
 
@@ -187,8 +190,8 @@ casts like `unsafe { &*((phys_off + addr) as *const PageTable) }`.
 
 | Priority   | File                      | Unsafe count | Refactor                                       |
 |------------|---------------------------|--------------|-------------------------------------------------|
-| **High**   | `scheduler.rs`            | ~12          | `IretqFrame` struct, `drop_to_ring3` helper     |
-| **High**   | `syscall.rs`              | ~8           | Eliminate `static mut`, validate user pointers   |
+| **High**   | `scheduler.rs`            | ~~12~~       | ✅ Done — `SwitchFrame` struct, `drop_to_ring3`  |
+| **High**   | `syscall.rs`              | ~~8~~        | ✅ Done — `UnsafeCell`, user pointer validation  |
 | **High**   | `local_apic/mapped.rs`    | ~~18~~       | ✅ Done — safe methods, unsafe-only construction |
 | **High**   | `io_apic/mapped.rs`       | ~~12~~       | ✅ Done — same + `read_volatile` / `write_volatile` |
 | **Medium** | `vga_buffer.rs`           | ~~14~~       | ✅ Done — `VgaBuffer` wrapper                   |
