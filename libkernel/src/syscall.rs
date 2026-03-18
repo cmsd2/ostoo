@@ -1,4 +1,5 @@
 use core::arch::global_asm;
+use core::cell::UnsafeCell;
 use x86_64::VirtAddr;
 
 // ---------------------------------------------------------------------------
@@ -15,11 +16,31 @@ pub struct PerCpuData {
     pub user_rsp: u64,
 }
 
-static mut PER_CPU: PerCpuData = PerCpuData { kernel_rsp: 0, user_rsp: 0 };
+/// Wrapper for the per-CPU data block, replacing `static mut`.
+///
+/// Safety invariant: only accessed with interrupts disabled (from the SYSCALL
+/// entry stub, from `init`, or from context-switch code that runs with IF=0).
+/// Single-CPU, so no concurrent access is possible when IF is clear.
+#[repr(transparent)]
+struct PerCpuCell(UnsafeCell<PerCpuData>);
+unsafe impl Sync for PerCpuCell {}
+
+impl PerCpuCell {
+    const fn new() -> Self {
+        PerCpuCell(UnsafeCell::new(PerCpuData { kernel_rsp: 0, user_rsp: 0 }))
+    }
+    fn get(&self) -> *mut PerCpuData {
+        self.0.get()
+    }
+}
+
+static PER_CPU: PerCpuCell = PerCpuCell::new();
 
 /// Dedicated kernel stack for SYSCALL entry (64 KiB).
 const SYSCALL_STACK_SIZE: usize = 64 * 1024;
-static mut SYSCALL_STACK: [u8; SYSCALL_STACK_SIZE] = [0; SYSCALL_STACK_SIZE];
+#[repr(align(16))]
+struct SyscallStack([u8; SYSCALL_STACK_SIZE]);
+static SYSCALL_STACK: SyscallStack = SyscallStack([0; SYSCALL_STACK_SIZE]);
 
 // ---------------------------------------------------------------------------
 // Initialisation
@@ -33,13 +54,15 @@ static mut SYSCALL_STACK: [u8; SYSCALL_STACK_SIZE] = [0; SYSCALL_STACK_SIZE];
 pub fn init(kernel_cs: u16, user_cs: u16) {
     use x86_64::registers::model_specific::Msr;
 
-    unsafe {
-        let per_cpu_addr = &raw const PER_CPU as u64;
-        let stack_top = (&raw const SYSCALL_STACK as *const u8).add(SYSCALL_STACK_SIZE) as u64;
-        PER_CPU.kernel_rsp = stack_top;
+    let per_cpu_ptr = PER_CPU.get();
+    let stack_top = SYSCALL_STACK.0.as_ptr_range().end as u64;
 
+    // Safety: called once during boot, single CPU, interrupts disabled.
+    unsafe { (*per_cpu_ptr).kernel_rsp = stack_top; }
+
+    unsafe {
         // IA32_GS_BASE (0xC000_0101): GS.BASE in ring 0 = kernel per-CPU.
-        Msr::new(0xC000_0101).write(per_cpu_addr);
+        Msr::new(0xC000_0101).write(per_cpu_ptr as u64);
         // IA32_KERNEL_GS_BASE (0xC000_0102): restored after swapgs = user GS.
         // Initially 0; will be set by arch_prctl(ARCH_SET_GS) when musl TLS
         // is initialised.  The syscall stub swaps on entry and exit.
@@ -133,7 +156,12 @@ fn sys_write(fd: u64, buf: u64, count: u64) -> i64 {
     if fd != 1 && fd != 2 {
         return -(9i64); // EBADF
     }
-    // Safety: buf/count come from user space; no SMAP in Phase 1.
+    // Validate that the entire buffer falls within user address space.
+    const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+    if buf == 0 || count > USER_LIMIT || buf.checked_add(count).map_or(true, |end| end > USER_LIMIT) {
+        return -(14i64); // EFAULT
+    }
+    // Safety: we have validated that buf..buf+count is within user space.
     let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, count as usize) };
     if let Ok(s) = core::str::from_utf8(bytes) {
         crate::print!("{}", s);
@@ -175,7 +203,8 @@ fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
 /// Call this on context switch to a user process so that SYSCALL entry and
 /// hardware interrupts from ring 3 land on the correct kernel stack.
 pub fn set_kernel_rsp(rsp: u64) {
-    unsafe { PER_CPU.kernel_rsp = rsp; }
+    // Safety: called from context-switch code with interrupts disabled.
+    unsafe { (*PER_CPU.get()).kernel_rsp = rsp; }
 }
 
 /// Address of the kernel per-CPU data block.
@@ -183,7 +212,7 @@ pub fn set_kernel_rsp(rsp: u64) {
 /// Used by `process_trampoline` to write IA32_KERNEL_GS_BASE explicitly
 /// instead of relying on `swapgs` polarity.
 pub fn per_cpu_addr() -> u64 {
-    &raw const PER_CPU as u64
+    PER_CPU.get() as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -203,5 +232,5 @@ pub fn prepare_swapgs() {
 /// Returns the top of the dedicated kernel syscall stack, suitable for
 /// storing in TSS.rsp0 so hardware interrupts from ring 3 land on it.
 pub fn kernel_stack_top() -> VirtAddr {
-    unsafe { VirtAddr::new((&raw const SYSCALL_STACK as *const u8).add(SYSCALL_STACK_SIZE) as u64) }
+    VirtAddr::new(SYSCALL_STACK.0.as_ptr_range().end as u64)
 }

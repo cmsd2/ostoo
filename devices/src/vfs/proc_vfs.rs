@@ -415,34 +415,32 @@ fn gen_lapic() -> String {
         let _ = writeln!(s, "Local APIC not initialised");
         return s;
     };
-    unsafe {
-        let id       = lapic.id();
-        let phys     = apic::local_apic::MappedLocalApic::get_base_phys_addr();
-        let enabled  = lapic.is_global_enabled();
-        let ver_raw  = lapic.read_version_raw();
-        let ver_byte = ver_raw as u8;
-        let max_lvt  = (ver_raw >> 16) as u8 & 0xFF;
+    let id       = lapic.id();
+    let phys     = unsafe { apic::local_apic::MappedLocalApic::get_base_phys_addr() };
+    let enabled  = lapic.is_global_enabled();
+    let ver_raw  = lapic.read_version_raw();
+    let ver_byte = ver_raw as u8;
+    let max_lvt  = (ver_raw >> 16) as u8 & 0xFF;
 
-        let _ = writeln!(s, "Local APIC:");
-        let _ = writeln!(s, "  ID: {}  phys={:#x}  globally enabled: {}",
-            id, phys.as_u64(), enabled);
-        let _ = writeln!(s, "  Version: {:#04x}  Max LVT: {}", ver_byte, max_lvt);
+    let _ = writeln!(s, "Local APIC:");
+    let _ = writeln!(s, "  ID: {}  phys={:#x}  globally enabled: {}",
+        id, phys.as_u64(), enabled);
+    let _ = writeln!(s, "  Version: {:#04x}  Max LVT: {}", ver_byte, max_lvt);
 
-        let lvt   = lapic.read_lvt_timer();
-        let vector = lvt as u8;
-        let masked = (lvt >> 16) & 1 != 0;
-        let mode   = match (lvt >> 17) & 3 {
-            0 => "one-shot",
-            1 => "periodic",
-            2 => "TSC-deadline",
-            _ => "unknown",
-        };
-        let init_cnt = lapic.read_timer_initial_count();
-        let curr_cnt = lapic.read_current_count();
-        let _ = writeln!(s, "  Timer: {}  vec={:#04x}  {}  initial={} current={}",
-            mode, vector, if masked { "[MASKED]" } else { "" },
-            init_cnt, curr_cnt);
-    }
+    let lvt   = lapic.read_lvt_timer();
+    let vector = lvt as u8;
+    let masked = (lvt >> 16) & 1 != 0;
+    let mode   = match (lvt >> 17) & 3 {
+        0 => "one-shot",
+        1 => "periodic",
+        2 => "TSC-deadline",
+        _ => "unknown",
+    };
+    let init_cnt = lapic.read_timer_initial_count();
+    let curr_cnt = lapic.read_current_count();
+    let _ = writeln!(s, "  Timer: {}  vec={:#04x}  {}  initial={} current={}",
+        mode, vector, if masked { "[MASKED]" } else { "" },
+        init_cnt, curr_cnt);
     s
 }
 
@@ -457,15 +455,13 @@ fn gen_ioapic() -> String {
         return s;
     }
     for ioapic in io_apics.iter() {
-        let (max_entries, ver) = unsafe {
-            let ver_raw = ioapic.read_version_raw();
-            ((ver_raw >> 16) as u8 + 1, ver_raw as u8)
-        };
+        let ver_raw = ioapic.read_version_raw();
+        let (max_entries, ver) = ((ver_raw >> 16) as u8 + 1, ver_raw as u8);
         let _ = writeln!(s, "IO APIC {}:  gsi_base={}  version={:#04x}  entries={}",
             ioapic.id, ioapic.interrupt_base, ver, max_entries);
         let _ = writeln!(s, "  GSI  Flags    Vec   Delivery  Trigger  Polarity  Dest");
         for i in 0..max_entries as u32 {
-            let entry = unsafe { ioapic.read_redirect_entry(i) };
+            let entry = ioapic.read_redirect_entry(i);
             let vector    = (entry & 0xFF) as u8;
             let delivery  = (entry >> 8) & 0x7;
             let dest_mode = (entry >> 11) & 1;

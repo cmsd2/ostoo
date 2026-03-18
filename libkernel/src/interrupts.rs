@@ -7,7 +7,7 @@ use x86_64::structures::idt::{
     PageFaultErrorCode,
 };
 use pic8259::ChainedPics;
-use crate::{gdt, println, task};
+use crate::{gdt, println, serial_println, task};
 
 static LAPIC_EOI_ADDR: AtomicU64 = AtomicU64::new(0);
 
@@ -244,6 +244,44 @@ extern "x86-interrupt" fn invalid_opcode_handler(
         unsafe { core::arch::asm!("swapgs", options(nostack, nomem)); }
         crate::task::scheduler::kill_current_thread();
     }
+
+    // Kernel-mode invalid opcode — dump diagnostics before panicking.
+    let rip = stack_frame.instruction_pointer.as_u64();
+    serial_println!("\n===== KERNEL INVALID OPCODE =====");
+    serial_println!("{:#?}", stack_frame);
+    serial_println!("thread_idx: {}  pid: {}  ctx_switches: {}",
+        crate::task::scheduler::current_thread_idx(),
+        crate::process::current_pid().as_u64(),
+        crate::task::scheduler::context_switches());
+    let cr3: u64;
+    let gs_base: u64;
+    let kernel_gs_base: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
+        gs_base = x86_64::registers::model_specific::Msr::new(0xC000_0101).read();
+        kernel_gs_base = x86_64::registers::model_specific::Msr::new(0xC000_0102).read();
+    }
+    serial_println!("CR3: {:#018x}  GS.BASE: {:#018x}  KERNEL_GS.BASE: {:#018x}",
+        cr3, gs_base, kernel_gs_base);
+    serial_println!("PER_CPU: {:#018x}", crate::syscall::per_cpu_addr());
+    // Check whether the faulting thread's RSP had correct SysV ABI alignment.
+    // At function entry RSP should be 8 mod 16 (a `call` pushes 8 bytes onto
+    // a 16-aligned stack).  The ISF's RSP reflects the value *at the fault*,
+    // which will have been adjusted by prologue pushes, but the low 4 bits
+    // still reveal the original parity.
+    let faulting_rsp = stack_frame.stack_pointer.as_u64();
+    serial_println!("Faulting RSP: {:#018x} (mod 16 = {})",
+        faulting_rsp, faulting_rsp & 0xF);
+    if rip >= 0xFFFF_8000_0000_0000 {
+        let ptr = rip as *const u8;
+        let mut buf = [0u8; 16];
+        for i in 0..16usize {
+            unsafe { buf[i] = core::ptr::read_volatile(ptr.add(i)); }
+        }
+        serial_println!("Bytes at RIP: {:02x?}", &buf);
+    }
+    serial_println!("===== END KERNEL INVALID OPCODE =====\n");
+
     panic!("EXCEPTION: INVALID OPCODE\n{:#?}", stack_frame);
 }
 
@@ -281,6 +319,94 @@ extern "x86-interrupt" fn stack_segment_fault_handler(
 extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame, _error_code: u64) -> !
 {
+    // ── Dump everything we can to serial — this is our best crash log. ──
+    // The double fault runs on its own IST stack, so serial output should work
+    // even if the faulting thread's stack was destroyed.
+
+    serial_println!("\n========== DOUBLE FAULT ==========");
+    serial_println!("{:#?}", stack_frame);
+
+    // Read key control/segment registers via inline asm.
+    let cr2: u64;
+    let cr3: u64;
+    let cr4: u64;
+    let cs_val: u64;
+    let ss_val: u64;
+    let ds_val: u64;
+    let es_val: u64;
+    let gs_base: u64;
+    let kernel_gs_base: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem));
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nostack, nomem));
+        core::arch::asm!("mov {0:r}, cs", out(reg) cs_val, options(nostack, nomem));
+        core::arch::asm!("mov {0:r}, ss", out(reg) ss_val, options(nostack, nomem));
+        core::arch::asm!("mov {0:r}, ds", out(reg) ds_val, options(nostack, nomem));
+        core::arch::asm!("mov {0:r}, es", out(reg) es_val, options(nostack, nomem));
+        // IA32_GS_BASE
+        gs_base = x86_64::registers::model_specific::Msr::new(0xC000_0101).read();
+        // IA32_KERNEL_GS_BASE
+        kernel_gs_base = x86_64::registers::model_specific::Msr::new(0xC000_0102).read();
+    }
+    serial_println!("CR2 (last page fault addr): {:#018x}", cr2);
+    serial_println!("CR3 (active PML4):          {:#018x}", cr3);
+    serial_println!("CR4:                        {:#018x}", cr4);
+    serial_println!("CS={:#06x}  SS={:#06x}  DS={:#06x}  ES={:#06x}", cs_val, ss_val, ds_val, es_val);
+    serial_println!("GS.BASE:          {:#018x}", gs_base);
+    serial_println!("KERNEL_GS.BASE:   {:#018x}", kernel_gs_base);
+
+    // PER_CPU address for comparison with GS bases.
+    let per_cpu = crate::syscall::per_cpu_addr();
+    serial_println!("PER_CPU addr:     {:#018x}", per_cpu);
+
+    // Scheduler state — use try_lock to avoid deadlock if the scheduler
+    // mutex was held when the fault occurred.
+    let thread_idx = crate::task::scheduler::current_thread_idx();
+    let ctx_switches = crate::task::scheduler::context_switches();
+    let pid = crate::process::current_pid();
+    serial_println!("current_thread_idx: {}  pid: {}  context_switches: {}",
+        thread_idx, pid.as_u64(), ctx_switches);
+
+    // Attempt to read the faulting instruction bytes at saved RIP.
+    let rip = stack_frame.instruction_pointer.as_u64();
+    serial_println!("Faulting RIP: {:#018x}", rip);
+    // Only attempt to read if RIP looks like a valid kernel address.
+    if rip >= 0xFFFF_8000_0000_0000 {
+        serial_println!("Bytes at RIP:");
+        let ptr = rip as *const u8;
+        // Read up to 16 bytes; each read could itself fault if the page is
+        // unmapped, but since we are already in a double fault on the IST
+        // stack, a triple fault here is acceptable — the CPU will reset, and
+        // the serial output above is already flushed.
+        let mut buf = [0u8; 16];
+        for i in 0..16usize {
+            unsafe { buf[i] = core::ptr::read_volatile(ptr.add(i)); }
+        }
+        serial_println!("  {:02x?}", &buf);
+    } else {
+        serial_println!("RIP is not in the kernel high half — likely corrupted");
+    }
+
+    // Dump stack words around the saved RSP to see what was on the faulting
+    // thread's stack (the ISF's RSP points into the faulting stack, not the
+    // IST stack we're running on).
+    let faulting_rsp = stack_frame.stack_pointer.as_u64();
+    serial_println!("Faulting RSP: {:#018x} (mod 16 = {})",
+        faulting_rsp, faulting_rsp & 0xF);
+    if faulting_rsp >= 0xFFFF_8000_0000_0000 && (faulting_rsp & 0x7) == 0 {
+        serial_println!("Stack dump (16 qwords from faulting RSP):");
+        let base = faulting_rsp as *const u64;
+        for i in 0..16usize {
+            let val = unsafe { core::ptr::read_volatile(base.add(i)) };
+            serial_println!("  RSP+{:#04x}: {:#018x}", i * 8, val);
+        }
+    } else {
+        serial_println!("Faulting RSP is not a valid kernel-half aligned address");
+    }
+
+    serial_println!("========== END DOUBLE FAULT ==========\n");
+
     panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
 }
 

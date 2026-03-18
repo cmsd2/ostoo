@@ -64,11 +64,11 @@ pub fn init_io(io_apics: &[AcpiIoApic], overrides: &[InterruptSourceOverride], m
 
     // Mask all entries before programming
     for apic in &mapped_io_apics {
-        unsafe { apic.mask_all(); }
+        apic.mask_all();
     }
 
     // Route ISA IRQ 0 (timer) → vector 0x20, IRQ 1 (keyboard) → vector 0x21
-    let lapic_id = unsafe {
+    let lapic_id = {
         LOCAL_APIC.lock().as_ref().map(|a| a.id()).unwrap_or(0)
     };
     route_isa_irq(&mapped_io_apics, 0, 0x20, lapic_id, overrides);
@@ -85,11 +85,11 @@ fn route_isa_irq(io_apics: &[MappedIoApic], isa_irq: u8, vector: u8, lapic_id: u
     let level_trig = ovr.map_or(false, |o| matches!(o.trigger_mode, TriggerMode::Level));
 
     for apic in io_apics {
-        let max = unsafe { apic.max_redirect_entries() };
+        let max = apic.max_redirect_entries();
         let end_gsi = apic.interrupt_base + max + 1;
         if gsi >= apic.interrupt_base && gsi < end_gsi {
             let offset = gsi - apic.interrupt_base;
-            unsafe { apic.set_irq(offset, vector, lapic_id, active_low, level_trig); }
+            apic.set_irq(offset, vector, lapic_id, active_low, level_trig);
             info!("[apic] isa_irq={} gsi={} vector={:#x} lapic={}", isa_irq, gsi, vector, lapic_id);
             if isa_irq == 0 {
                 TIMER_GSI.store(gsi, Ordering::Relaxed);
@@ -105,10 +105,10 @@ fn init_io_apic(io_apic: &AcpiIoApic, remap_addr: VirtAddr, mem: &mut MemoryServ
 
     info!("[apic] init mapped {:?} phys={:#x} virt={:#x}", io_apic, io_apic.address, remap_addr);
 
-    let mapped_io_apic = MappedIoApic {
-        id: io_apic.id,
-        base_addr: remap_addr,
-        interrupt_base: io_apic.global_system_interrupt_base,
+    // Safety: remap_addr was just mapped to the IO APIC MMIO region above
+    // and will remain mapped for the lifetime of the kernel.
+    let mapped_io_apic = unsafe {
+        MappedIoApic::new(io_apic.id, remap_addr, io_apic.global_system_interrupt_base)
     };
 
     mapped_io_apic.init();
@@ -125,11 +125,11 @@ pub fn init_local(remap_addr: VirtAddr, mem: &mut MemoryServices) {
 
     info!("[apic] init mapped local apic phys={:#x} virt={:#x}", phys_addr, remap_addr);
 
-    let mapped_apic = MappedLocalApic::new(remap_addr);
-    unsafe {
-        mapped_apic.init();
-        mapped_apic.enable();
-    }
+    // Safety: remap_addr has just been mapped to the LAPIC MMIO region and
+    // will remain mapped for the lifetime of the kernel.
+    let mapped_apic = unsafe { MappedLocalApic::new(remap_addr) };
+    mapped_apic.init();
+    mapped_apic.enable();
 
     // Register LAPIC EOI virtual address with libkernel (offset 0xB0 = EndOfInterrupt)
     libkernel::interrupts::set_local_apic_eoi_addr((remap_addr + 0xB0u64).as_u64());
@@ -155,9 +155,7 @@ pub fn calibrate_and_start_lapic_timer() {
     {
         let guard = LOCAL_APIC.lock();
         let apic = guard.as_ref().expect("LOCAL_APIC not initialised");
-        unsafe {
-            apic.start_oneshot_timer(0xFFFF_FFFF, LAPIC_DIVIDE_BY_16, LAPIC_TIMER_VECTOR);
-        }
+        apic.start_oneshot_timer(0xFFFF_FFFF, LAPIC_DIVIDE_BY_16, LAPIC_TIMER_VECTOR);
     }
 
     // Phase 2: busy-wait 500ms (PIT drives TICK_COUNT via timer ISR during this window).
@@ -166,31 +164,29 @@ pub fn calibrate_and_start_lapic_timer() {
     // Phase 3: read elapsed count, compute bus frequency, start periodic.
     let guard = LOCAL_APIC.lock();
     let apic = guard.as_ref().unwrap();
-    unsafe {
-        let remaining = apic.read_current_count();
-        let elapsed = 0xFFFF_FFFFu64 - remaining as u64;
-        apic.stop_timer();
+    let remaining = apic.read_current_count();
+    let elapsed = 0xFFFF_FFFFu64 - remaining as u64;
+    apic.stop_timer();
 
-        let lapic_bus_freq = elapsed * 16 * CALIBRATION_PIT_HZ / CALIBRATION_PIT_TICKS;
-        let initial_count  = lapic_bus_freq / (16 * LAPIC_TARGET_HZ);
-        assert!(initial_count > 0 && initial_count <= 0xFFFF_FFFF,
-            "LAPIC calibration out of range: {}", initial_count);
+    let lapic_bus_freq = elapsed * 16 * CALIBRATION_PIT_HZ / CALIBRATION_PIT_TICKS;
+    let initial_count  = lapic_bus_freq / (16 * LAPIC_TARGET_HZ);
+    assert!(initial_count > 0 && initial_count <= 0xFFFF_FFFF,
+        "LAPIC calibration out of range: {}", initial_count);
 
-        info!("[apic] LAPIC bus {} MHz, timer initial_count={} ({}Hz)",
-            lapic_bus_freq / 1_000_000, initial_count, LAPIC_TARGET_HZ);
+    info!("[apic] LAPIC bus {} MHz, timer initial_count={} ({}Hz)",
+        lapic_bus_freq / 1_000_000, initial_count, LAPIC_TARGET_HZ);
 
-        apic.start_periodic_timer(initial_count as u32, LAPIC_DIVIDE_BY_16, LAPIC_TIMER_VECTOR);
-    }
+    apic.start_periodic_timer(initial_count as u32, LAPIC_DIVIDE_BY_16, LAPIC_TIMER_VECTOR);
 
     // Mask the PIT's IO APIC redirection entry so it no longer fires.
     let timer_gsi = TIMER_GSI.load(Ordering::Relaxed);
     if timer_gsi != u32::MAX {
         let io_apics = IO_APICS.lock();
         for apic in io_apics.iter() {
-            let max = unsafe { apic.max_redirect_entries() };
+            let max = apic.max_redirect_entries();
             if timer_gsi >= apic.interrupt_base && timer_gsi <= apic.interrupt_base + max {
                 let offset = timer_gsi - apic.interrupt_base;
-                unsafe { apic.mask_entry(offset); }
+                apic.mask_entry(offset);
                 info!("[apic] masked PIT gsi={} in IO APIC", timer_gsi);
                 break;
             }

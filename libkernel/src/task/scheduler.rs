@@ -4,6 +4,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::process::ProcessId;
+use crate::serial_println;
 
 pub const QUANTUM_TICKS: u32 = 10; // 10 ms at 1000 Hz
 
@@ -101,6 +102,63 @@ impl Scheduler {
 static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 
 // ---------------------------------------------------------------------------
+// Switch frame — matches the layout pushed by `lapic_timer_stub`
+
+/// Saved register frame written to the stack by the timer stub and read back
+/// on context switch.  Must match the push/pop order in `lapic_timer_stub`
+/// exactly: 15 GPRs followed by the hardware iretq frame.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SwitchFrame {
+    // GPRs (push order in the stub: rax, rbx, rcx, rdx, rsi, rdi, rbp,
+    //       r8, r9, r10, r11, r12, r13, r14, r15)
+    // Pops happen in reverse, so r15 is at the lowest address.
+    r15: u64, r14: u64, r13: u64, r12: u64,
+    r11: u64, r10: u64, r9: u64,  r8: u64,
+    rbp: u64, rdi: u64, rsi: u64,
+    rdx: u64, rcx: u64, rbx: u64, rax: u64,
+    // iretq frame
+    rip: u64, cs: u64, rflags: u64, rsp: u64, ss: u64,
+}
+
+const KERNEL_CS: u64 = 0x08;
+const KERNEL_SS: u64 = 0;
+const RFLAGS_IF: u64 = 0x202; // IF + reserved bit 1
+
+impl SwitchFrame {
+    /// Build a frame for a new kernel thread.  All GPRs are zeroed.
+    fn new_kernel(entry: fn() -> !, stack_top: u64) -> Self {
+        SwitchFrame {
+            r15: 0, r14: 0, r13: 0, r12: 0,
+            r11: 0, r10: 0, r9: 0,  r8: 0,
+            rbp: 0, rdi: 0, rsi: 0,
+            rdx: 0, rcx: 0, rbx: 0, rax: 0,
+            rip: entry as usize as u64,
+            cs: KERNEL_CS,
+            rflags: RFLAGS_IF,
+            rsp: stack_top - 8, // 8 mod 16, simulates `call` push
+            ss: KERNEL_SS,
+        }
+    }
+
+    /// Build a frame that enters `process_trampoline` in kernel mode.
+    /// `pid` is passed via the `rdi` slot (first SysV64 argument).
+    fn new_user_trampoline(pid: ProcessId, stack_top: u64) -> Self {
+        SwitchFrame {
+            r15: 0, r14: 0, r13: 0, r12: 0,
+            r11: 0, r10: 0, r9: 0,  r8: 0,
+            rbp: 0, rdi: pid.as_u64(), rsi: 0,
+            rdx: 0, rcx: 0, rbx: 0, rax: 0,
+            rip: process_trampoline as *const () as usize as u64,
+            cs: KERNEL_CS,
+            rflags: RFLAGS_IF,
+            rsp: stack_top - 8,
+            ss: KERNEL_SS,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Assembly context-switch stub
 //
 // Stack alignment analysis at the point of `call preempt_tick`:
@@ -194,32 +252,10 @@ pub fn spawn_thread(entry: fn() -> !) {
     let stack_top_raw = stack.as_ptr() as u64 + stack.len() as u64;
     let stack_top = stack_top_raw & !0xF;
 
-    // saved_rsp is the address of the r15 slot — bottom of the 160-byte frame.
-    // The assembly stub restores all registers starting from this address then
-    // executes iretq to start the new thread.
-    //
-    // Frame layout from saved_rsp (each slot is 8 bytes, stack grows upward
-    // from saved_rsp):
-    //   offset  0..112  :  r15, r14, r13, r12, r11, r10, r9, r8,
-    //                      rbp, rdi, rsi, rdx, rcx, rbx, rax  (all 0)
-    //   offset 120      :  RIP  = entry
-    //   offset 128      :  CS   = 0x08 (kernel code segment)
-    //   offset 136      :  RFLAGS = 0x202 (IF + reserved bit 1)
-    //   offset 144      :  RSP  = stack_top − 160  (= saved_rsp, 16-byte aligned)
-    //   offset 152      :  SS   = 0  (null selector, valid for ring-0 iretq)
-    let saved_rsp = stack_top - (20 * 8); // 20 × u64 = 160 bytes
-
-    unsafe {
-        let frame = saved_rsp as *mut u64;
-        for i in 0..15usize {
-            frame.add(i).write(0); // 15 GPRs
-        }
-        frame.add(15).write(entry as usize as u64); // RIP
-        frame.add(16).write(0x08);                  // CS
-        frame.add(17).write(0x202);                 // RFLAGS
-        frame.add(18).write(stack_top - 160);       // RSP after iretq
-        frame.add(19).write(0);                     // SS
-    }
+    let frame = SwitchFrame::new_kernel(entry, stack_top);
+    let saved_rsp = stack_top - core::mem::size_of::<SwitchFrame>() as u64;
+    // Safety: saved_rsp points into our just-allocated, zeroed stack.
+    unsafe { core::ptr::write(saved_rsp as *mut SwitchFrame, frame); }
 
     let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -259,26 +295,14 @@ pub fn spawn_user_thread(pid: ProcessId, pml4_phys: x86_64::PhysAddr) -> usize {
     let _ = entry_point;
     let _ = user_stack_top;
 
-    // Build a fake iretq frame on the process's kernel stack.
+    // Build a SwitchFrame on the process's kernel stack.
     // The frame targets `process_trampoline` in kernel mode, with the PID
-    // encoded in the r15 GPR slot so the trampoline can recover it.
+    // passed via the RDI slot so the trampoline receives it as its first arg.
     let stack_top = kernel_stack_top;
-    let saved_rsp = stack_top - (20 * 8);
-
-    unsafe {
-        let frame = saved_rsp as *mut u64;
-        for i in 0..15usize {
-            frame.add(i).write(0); // 15 GPRs (all zero initially)
-        }
-        // RDI = PID (slot 9 in the pop order: r15,r14,...,rbp,rdi,...)
-        // process_trampoline is extern "C" so it receives PID as first arg.
-        frame.add(9).write(pid.as_u64());
-        frame.add(15).write(process_trampoline as *const () as usize as u64); // RIP
-        frame.add(16).write(0x08);                                // CS (kernel)
-        frame.add(17).write(0x202);                               // RFLAGS
-        frame.add(18).write(stack_top - 160);                     // RSP after iretq
-        frame.add(19).write(0);                                   // SS
-    }
+    let frame = SwitchFrame::new_user_trampoline(pid, stack_top);
+    let saved_rsp = stack_top - core::mem::size_of::<SwitchFrame>() as u64;
+    // Safety: saved_rsp points into the process's kernel stack.
+    unsafe { core::ptr::write(saved_rsp as *mut SwitchFrame, frame); }
 
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut sched = SCHEDULER.lock();
@@ -312,50 +336,77 @@ extern "C" fn process_trampoline(pid_raw: u64) -> ! {
             (p.entry_point, p.user_stack_top, p.pml4_phys.as_u64(), p.kernel_stack_top)
         }).expect("process_trampoline: process not found");
 
+    let rsp: u64;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem)); }
+    serial_println!("[trampoline] pid={} entry={:#x} usp={:#x} pml4={:#x} kstack={:#x} RSP={:#x} (mod16={})",
+        pid.as_u64(), entry_point, user_stack_top, pml4_phys, kernel_stack_top,
+        rsp, rsp & 0xF);
+
+    // Disable interrupts early to close the preemption window between
+    // set_current_cr3 (which re-enables IF) and the GS MSR writes.
+    // Without this, a timer interrupt in that gap could context-switch away
+    // with partially-configured GS polarity, corrupting kernel state.
+    x86_64::instructions::interrupts::disable();
+
     // Set up TSS.rsp0 and PER_CPU kernel_rsp for this process.
     crate::gdt::set_kernel_stack(x86_64::VirtAddr::new(kernel_stack_top));
     crate::syscall::set_kernel_rsp(kernel_stack_top);
     crate::process::set_current_pid(pid);
 
     // Tell the scheduler about our CR3 for context-switch address space restore.
+    // Note: with interrupts already disabled, the without_interrupts() inside
+    // set_current_cr3 is a no-op (IF stays cleared).
     set_current_cr3(pml4_phys);
 
     let user_cs = crate::gdt::user_code_selector().0 as u64;
     let user_ss = crate::gdt::user_data_selector().0 as u64;
+    let per_cpu = crate::syscall::per_cpu_addr();
 
+    // Safety: interrupts are disabled, we have set up TSS/PER_CPU/CR3,
+    // and the entry/stack/selector values come from a validated Process.
+    unsafe {
+        drop_to_ring3(entry_point, user_stack_top, pml4_phys, user_cs, user_ss, per_cpu);
+    }
+}
+
+/// Switch to ring 3: set GS MSRs, load CR3, and execute iretq.
+///
+/// # Safety
+/// - Interrupts must be disabled.
+/// - `pml4_phys` must be a valid PML4 physical address.
+/// - `entry` and `user_rsp` must be valid user-space addresses.
+/// - `user_cs` and `user_ss` must be valid ring-3 segment selectors.
+/// - `per_cpu` must point to the kernel's `PerCpuData` block.
+unsafe fn drop_to_ring3(
+    entry: u64, user_rsp: u64, pml4_phys: u64,
+    user_cs: u64, user_ss: u64, per_cpu: u64,
+) -> ! {
     // Explicitly set GS MSRs instead of using `swapgs`, because the GS
     // polarity is unpredictable: a timer preemption of a previous user process
     // leaves user GS active, while a kernel thread leaves kernel GS active.
     // Writing both MSRs directly avoids this ambiguity.
     //   IA32_GS_BASE (0xC000_0101) = 0         → user GS for ring 3
-    //   IA32_KERNEL_GS_BASE (0xC000_0102) = &PER_CPU → restored by syscall swapgs
-    //
-    // Done via Msr::write (not raw inline asm) so LLVM correctly tracks
-    // register usage for wrmsr and doesn't clobber iretq operands.
-    let per_cpu = crate::syscall::per_cpu_addr();
+    //   IA32_KERNEL_GS_BASE (0xC000_0102) = per_cpu → restored by syscall swapgs
+    core::arch::asm!("cli", options(nostack, nomem));
+    x86_64::registers::model_specific::Msr::new(0xC000_0101).write(0);
+    x86_64::registers::model_specific::Msr::new(0xC000_0102).write(per_cpu);
 
-    unsafe {
-        core::arch::asm!("cli", options(nostack, nomem));
-        x86_64::registers::model_specific::Msr::new(0xC000_0101).write(0);
-        x86_64::registers::model_specific::Msr::new(0xC000_0102).write(per_cpu);
-
-        core::arch::asm!(
-            "mov cr3, {pml4}",
-            "push {ss}",
-            "push {usp}",
-            "push {rf}",
-            "push {cs}",
-            "push {ip}",
-            "iretq",
-            pml4  = in(reg) pml4_phys,
-            ss    = in(reg) user_ss,
-            usp   = in(reg) user_stack_top,
-            rf    = in(reg) 0x0202u64,
-            cs    = in(reg) user_cs,
-            ip    = in(reg) entry_point,
-            options(noreturn),
-        );
-    }
+    core::arch::asm!(
+        "mov cr3, {pml4}",
+        "push {ss}",
+        "push {usp}",
+        "push {rf}",
+        "push {cs}",
+        "push {ip}",
+        "iretq",
+        pml4  = in(reg) pml4_phys,
+        ss    = in(reg) user_ss,
+        usp   = in(reg) user_rsp,
+        rf    = in(reg) RFLAGS_IF,
+        cs    = in(reg) user_cs,
+        ip    = in(reg) entry,
+        options(noreturn),
+    );
 }
 
 /// Returns `true` if the thread at `idx` is in the `Dead` state.
@@ -465,6 +516,20 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
     CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
     CURRENT_THREAD_IDX_ATOMIC.store(next_idx, Ordering::Relaxed);
     crate::vga_buffer::timeline_append(next_idx);
+
+    // Sanity-check: the stub will pop 15 GPRs then iretq.  For a brand-new
+    // thread the iretq RSP should be 8 mod 16 (SysV ABI entry alignment).
+    // We check the saved RIP: if it matches a known entry function, this is a
+    // first dispatch and we validate RSP alignment.
+    let frame = unsafe { &*(next_rsp as *const SwitchFrame) };
+    if frame.rip == (process_trampoline as *const () as u64)
+        || frame.rsp == next_rsp  // old pattern where RSP == saved_rsp
+    {
+        if frame.rsp & 0xF != 8 {
+            serial_println!("[preempt_tick] WARNING: thread {} initial iretq RSP={:#x} (mod16={}) — MISALIGNED!",
+                next_idx, frame.rsp, frame.rsp & 0xF);
+        }
+    }
 
     next_rsp
 }
