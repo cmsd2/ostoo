@@ -2,7 +2,7 @@ use volatile::Volatile;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use lazy_static::lazy_static;
-use spin::Mutex;
+use crate::irq_mutex::IrqMutex;
 
 /// Physical VGA base as a kernel virtual address.  Initially the bootloader
 /// identity address (0xb8000).  Call `remap_vga` after memory services are
@@ -10,7 +10,7 @@ use spin::Mutex;
 static VGA_BASE: AtomicU64 = AtomicU64::new(0xb8000);
 
 lazy_static! {
-    pub static ref WRITER: Mutex<Writer> = Mutex::new(Writer {
+    pub static ref WRITER: IrqMutex<Writer> = IrqMutex::new(Writer {
         column_position: 0,
         color_code: ColorCode::new(Color::Yellow, Color::Black),
         buffer: 0xb8000 as *mut Buffer,
@@ -110,7 +110,7 @@ impl fmt::Write for CaptureBuffer {
 }
 
 static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
-static CAPTURE: Mutex<CaptureBuffer> = Mutex::new(CaptureBuffer::new());
+static CAPTURE: IrqMutex<CaptureBuffer> = IrqMutex::new(CaptureBuffer::new());
 
 /// Begin capturing all `print!`/`println!` output into an internal buffer
 /// instead of writing directly to the VGA screen.

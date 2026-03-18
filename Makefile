@@ -8,9 +8,7 @@ QEMU_ARGS := -machine q35 \
 
 DISK_IMG := disk.img
 
-build: target/x86_64-os/debug/bootimage-kernel.bin
-
-target/x86_64-os/debug/bootimage-kernel.bin:
+build:
 	cargo bootimage --manifest-path kernel/Cargo.toml
 
 # Create a blank 64 MiB disk image if one does not already exist.

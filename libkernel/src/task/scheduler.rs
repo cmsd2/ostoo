@@ -4,6 +4,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::process::ProcessId;
+use crate::serial_println;
 
 pub const QUANTUM_TICKS: u32 = 10; // 10 ms at 1000 Hz
 
@@ -205,7 +206,7 @@ pub fn spawn_thread(entry: fn() -> !) {
     //   offset 120      :  RIP  = entry
     //   offset 128      :  CS   = 0x08 (kernel code segment)
     //   offset 136      :  RFLAGS = 0x202 (IF + reserved bit 1)
-    //   offset 144      :  RSP  = stack_top − 160  (= saved_rsp, 16-byte aligned)
+    //   offset 144      :  RSP  = stack_top − 8  (8 mod 16, simulates `call` push)
     //   offset 152      :  SS   = 0  (null selector, valid for ring-0 iretq)
     let saved_rsp = stack_top - (20 * 8); // 20 × u64 = 160 bytes
 
@@ -217,7 +218,7 @@ pub fn spawn_thread(entry: fn() -> !) {
         frame.add(15).write(entry as usize as u64); // RIP
         frame.add(16).write(0x08);                  // CS
         frame.add(17).write(0x202);                 // RFLAGS
-        frame.add(18).write(stack_top - 160);       // RSP after iretq
+        frame.add(18).write(stack_top - 8);         // RSP after iretq (8 mod 16 for SysV ABI)
         frame.add(19).write(0);                     // SS
     }
 
@@ -276,7 +277,7 @@ pub fn spawn_user_thread(pid: ProcessId, pml4_phys: x86_64::PhysAddr) -> usize {
         frame.add(15).write(process_trampoline as *const () as usize as u64); // RIP
         frame.add(16).write(0x08);                                // CS (kernel)
         frame.add(17).write(0x202);                               // RFLAGS
-        frame.add(18).write(stack_top - 160);                     // RSP after iretq
+        frame.add(18).write(stack_top - 8);                       // RSP after iretq (8 mod 16 for SysV ABI)
         frame.add(19).write(0);                                   // SS
     }
 
@@ -312,12 +313,26 @@ extern "C" fn process_trampoline(pid_raw: u64) -> ! {
             (p.entry_point, p.user_stack_top, p.pml4_phys.as_u64(), p.kernel_stack_top)
         }).expect("process_trampoline: process not found");
 
+    let rsp: u64;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem)); }
+    serial_println!("[trampoline] pid={} entry={:#x} usp={:#x} pml4={:#x} kstack={:#x} RSP={:#x} (mod16={})",
+        pid.as_u64(), entry_point, user_stack_top, pml4_phys, kernel_stack_top,
+        rsp, rsp & 0xF);
+
+    // Disable interrupts early to close the preemption window between
+    // set_current_cr3 (which re-enables IF) and the GS MSR writes.
+    // Without this, a timer interrupt in that gap could context-switch away
+    // with partially-configured GS polarity, corrupting kernel state.
+    x86_64::instructions::interrupts::disable();
+
     // Set up TSS.rsp0 and PER_CPU kernel_rsp for this process.
     crate::gdt::set_kernel_stack(x86_64::VirtAddr::new(kernel_stack_top));
     crate::syscall::set_kernel_rsp(kernel_stack_top);
     crate::process::set_current_pid(pid);
 
     // Tell the scheduler about our CR3 for context-switch address space restore.
+    // Note: with interrupts already disabled, the without_interrupts() inside
+    // set_current_cr3 is a no-op (IF stays cleared).
     set_current_cr3(pml4_phys);
 
     let user_cs = crate::gdt::user_code_selector().0 as u64;
@@ -335,6 +350,8 @@ extern "C" fn process_trampoline(pid_raw: u64) -> ! {
     let per_cpu = crate::syscall::per_cpu_addr();
 
     unsafe {
+        // Interrupts already disabled above; the `cli` is redundant but kept
+        // as a safety belt.
         core::arch::asm!("cli", options(nostack, nomem));
         x86_64::registers::model_specific::Msr::new(0xC000_0101).write(0);
         x86_64::registers::model_specific::Msr::new(0xC000_0102).write(per_cpu);
@@ -465,6 +482,23 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
     CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
     CURRENT_THREAD_IDX_ATOMIC.store(next_idx, Ordering::Relaxed);
     crate::vga_buffer::timeline_append(next_idx);
+
+    // Sanity-check: the stub will pop 15 GPRs then iretq.  The iretq frame's
+    // RSP field is at next_rsp + 144.  For a *brand-new* thread the iretq RSP
+    // should be 8 mod 16 (SysV ABI entry alignment), but for a preempted
+    // thread it can be anything because the interrupt froze RSP mid-function.
+    // We check the saved RIP instead: if it matches a known entry function,
+    // this is a first dispatch and we validate RSP alignment.
+    let iretq_rip = unsafe { *((next_rsp + 120) as *const u64) };
+    let iretq_rsp = unsafe { *((next_rsp + 144) as *const u64) };
+    if iretq_rip == (process_trampoline as *const () as u64)
+        || iretq_rsp == next_rsp  // old pattern where RSP == saved_rsp
+    {
+        if iretq_rsp & 0xF != 8 {
+            serial_println!("[preempt_tick] WARNING: thread {} initial iretq RSP={:#x} (mod16={}) — MISALIGNED!",
+                next_idx, iretq_rsp, iretq_rsp & 0xF);
+        }
+    }
 
     next_rsp
 }
