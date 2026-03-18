@@ -23,6 +23,11 @@ manual `unsafe impl Send` to paper over the raw pointer.~~
   `unsafe fn`).
 - `core::mem::transmute` in tests replaced with a new `Color::from_u8()`
   constructor.
+- `timeline_append` refactored: ISR now pushes to a lock-free `ArrayQueue`
+  instead of writing directly to VGA RAM with raw pointers.  A new
+  `TimelineActor` (stream-driven, using `#[on_stream]`) drains the queue
+  and writes to VGA row 1 through the safe `WRITER` / `VgaBuffer` interface.
+  Eliminates the last `unsafe` block and removes the `VGA_BASE` atomic.
 
 ---
 

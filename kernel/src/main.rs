@@ -28,6 +28,7 @@ mod kernel_acpi;
 mod keyboard_actor;
 mod ring3;
 mod shell;
+mod timeline_actor;
 
 pub const APIC_BASE: u64 = 0xFFFF_8001_0000_0000;
 
@@ -199,6 +200,12 @@ fn run_kernel() -> ! {
     devices::driver::register(Box::new(kb_driver));
     libkernel::task::registry::register("keyboard", kb_inbox);
     devices::driver::start_driver("keyboard").ok();
+
+    let (tl_driver, tl_inbox) =
+        timeline_actor::TimelineActorDriver::new(timeline_actor::TimelineActor::new());
+    devices::driver::register(Box::new(tl_driver));
+    libkernel::task::registry::register("timeline", tl_inbox);
+    devices::driver::start_driver("timeline").ok();
 
     #[cfg(test)]
     test_main();

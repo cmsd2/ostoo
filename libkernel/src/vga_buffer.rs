@@ -1,13 +1,14 @@
 use volatile::Volatile;
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Poll};
+use conquer_once::spin::OnceCell;
+use crossbeam_queue::ArrayQueue;
+use futures_util::stream::Stream;
+use futures_util::task::AtomicWaker;
 use lazy_static::lazy_static;
 use crate::irq_mutex::IrqMutex;
-
-/// Physical VGA base as a kernel virtual address.  Initially the bootloader
-/// identity address (0xb8000).  Call `remap_vga` after memory services are
-/// ready to switch to the phys-mem-offset alias in the high half.
-static VGA_BASE: AtomicU64 = AtomicU64::new(0xb8000);
 
 lazy_static! {
     pub static ref WRITER: IrqMutex<Writer> = IrqMutex::new(Writer {
@@ -27,7 +28,6 @@ lazy_static! {
 /// isolated user page table.  Call once, after `memory::init_services()`.
 pub fn remap_vga(vga_virt: x86_64::VirtAddr) {
     let base = vga_virt.as_u64();
-    VGA_BASE.store(base, Ordering::Relaxed);
     WRITER.lock().buffer.set_ptr(base as *mut Buffer);
 }
 
@@ -474,35 +474,82 @@ pub fn print_status_bar(args: fmt::Arguments) {
     WRITER.lock().write_status_row(&buf.data);
 }
 
-/// Append a coloured block to the timeline strip at row 1, shifting old blocks
-/// left.  Each call represents one context switch; colours cycle per thread.
+// ---------------------------------------------------------------------------
+// Timeline event queue — ISR producer, async actor consumer
+
+static TIMELINE_QUEUE: OnceCell<ArrayQueue<usize>> = OnceCell::uninit();
+static TIMELINE_WAKER: AtomicWaker = AtomicWaker::new();
+
+/// A stream of thread indices pushed by the scheduler ISR.
+pub struct TimelineStream {
+    _private: (),
+}
+
+impl TimelineStream {
+    pub fn new() -> Self {
+        let _ = TIMELINE_QUEUE.try_init_once(|| ArrayQueue::new(256));
+        TimelineStream { _private: () }
+    }
+}
+
+impl Stream for TimelineStream {
+    type Item = usize;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<usize>> {
+        let queue = TIMELINE_QUEUE.try_get().expect("timeline queue not initialized");
+
+        if let Some(idx) = queue.pop() {
+            return Poll::Ready(Some(idx));
+        }
+
+        TIMELINE_WAKER.register(cx.waker());
+
+        match queue.pop() {
+            Some(idx) => {
+                TIMELINE_WAKER.take();
+                Poll::Ready(Some(idx))
+            }
+            None => Poll::Pending,
+        }
+    }
+}
+
+/// Push a context-switch event into the timeline queue.
 ///
-/// # ISR Safety
-/// Writes directly to VGA memory without acquiring any lock, so it is safe to
-/// call from interrupt context (interrupts are already disabled by the CPU on
-/// IDT dispatch).
+/// Called from the scheduler ISR (`preempt_tick`).  Lock-free and
+/// allocation-free; safe to call with interrupts disabled.
 pub fn timeline_append(thread_idx: usize) {
+    if let Ok(queue) = TIMELINE_QUEUE.try_get() {
+        // Drop the event if the queue is full — a few missed visual ticks
+        // are invisible at screen refresh rates.
+        let _ = queue.push(thread_idx);
+        TIMELINE_WAKER.wake();
+    }
+}
+
+/// Write one context-switch tick to VGA row 1, shifting old blocks left.
+///
+/// Called by the timeline actor from normal (non-ISR) context while holding
+/// the `WRITER` lock.
+pub fn timeline_flush_one(thread_idx: usize) {
     const THREAD_BG: [Color; 6] = [
         Color::LightGreen, Color::LightCyan, Color::LightRed,
         Color::Pink,       Color::Yellow,    Color::LightGray,
     ];
     let bg = THREAD_BG[thread_idx % THREAD_BG.len()];
-    let color_byte = ColorCode::new(Color::Black, bg).0;
+    let color = ColorCode::new(Color::Black, bg);
 
-    // VGA RAM: each cell is a u16 (low byte = character, high byte = colour).
-    // Row 1 starts at offset BUFFER_WIDTH from the base address.
-    let vga = VGA_BASE.load(Ordering::Relaxed) as *mut u16;
-    let row1 = BUFFER_WIDTH; // offset in u16 units
-    unsafe {
-        // Shift the 80-column row left by one position.
-        for col in 0..BUFFER_WIDTH - 1 {
-            let val = core::ptr::read_volatile(vga.add(row1 + col + 1));
-            core::ptr::write_volatile(vga.add(row1 + col), val);
-        }
-        // Append a space at the rightmost column; the background colour fills the cell.
-        let entry: u16 = (color_byte as u16) << 8 | b' ' as u16;
-        core::ptr::write_volatile(vga.add(row1 + BUFFER_WIDTH - 1), entry);
+    let mut w = WRITER.lock();
+    // Shift row 1 left by one column.
+    for col in 0..BUFFER_WIDTH - 1 {
+        let ch = w.buffer.read_cell(1, col + 1);
+        w.buffer.write_cell(1, col, ch);
     }
+    // Append a space with the thread's background colour.
+    w.buffer.write_cell(1, BUFFER_WIDTH - 1, ScreenChar {
+        ascii_character: b' ',
+        color_code: color,
+    });
 }
 
 #[cfg(test)]
