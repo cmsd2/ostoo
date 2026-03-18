@@ -119,6 +119,7 @@ impl Shell {
             "mount"   => self.cmd_mount(rest).await,
             "test"    => self.cmd_test(rest).await,
             "exec"    => self.cmd_exec(rest).await,
+            "md5"     => self.cmd_md5(rest).await,
             other     => println!("unknown command: '{}'  (try 'help')", other),
         }
     }
@@ -341,6 +342,24 @@ impl Shell {
         }
     }
 
+    // ── md5 ──────────────────────────────────────────────────────────────
+    async fn cmd_md5(&self, path: &str) {
+        if path.is_empty() {
+            println!("usage: md5 <path>");
+            return;
+        }
+        let cwd  = self.cwd.lock().clone();
+        let path = resolve_path(&cwd, path);
+
+        match devices::vfs::read_file(&path).await {
+            Ok(data) => {
+                let digest = libkernel::md5::compute(&data);
+                println!("{}  {}", libkernel::md5::hex(&digest), path);
+            }
+            Err(e) => println!("md5: {:?}", e),
+        }
+    }
+
     async fn cmd_driver(&self, rest: &str) {
         let (subcmd, name) = match rest.find(' ') {
             Some(i) => (rest[..i].trim(), rest[i + 1..].trim()),
@@ -413,6 +432,7 @@ fn cmd_help() {
     println!("  mount             list mounted filesystems");
     println!("  mount proc <mp>   mount procfs at <mountpoint>");
     println!("  mount blk <mp>    mount exFAT block device at <mountpoint>");
+    println!("  md5 <path>        print MD5 hash of a file");
     println!("  exec <path>       load and run an ELF binary from the VFS");
     println!("  test ring3        ring-3 write+exit via syscall (spawns process)");
     println!("  test pagefault    ring-3 page fault on unmapped addr (spawns process)");
@@ -423,3 +443,52 @@ fn cmd_help() {
     println!("  idt pci lapic ioapic drivers uptime");
 }
 
+// ---------------------------------------------------------------------------
+// MD5 tests — RFC 1321 test vectors (must live in kernel crate for heap access)
+
+#[test_case]
+fn test_md5_empty() {
+    assert_eq!(libkernel::md5::hex(&libkernel::md5::compute(b"")), "d41d8cd98f00b204e9800998ecf8427e");
+}
+
+#[test_case]
+fn test_md5_a() {
+    assert_eq!(libkernel::md5::hex(&libkernel::md5::compute(b"a")), "0cc175b9c0f1b6a831c399e269772661");
+}
+
+#[test_case]
+fn test_md5_abc() {
+    assert_eq!(libkernel::md5::hex(&libkernel::md5::compute(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
+}
+
+#[test_case]
+fn test_md5_message_digest() {
+    assert_eq!(
+        libkernel::md5::hex(&libkernel::md5::compute(b"message digest")),
+        "f96b697d7cb7938d525a2f31aaf161d0",
+    );
+}
+
+#[test_case]
+fn test_md5_alphabet() {
+    assert_eq!(
+        libkernel::md5::hex(&libkernel::md5::compute(b"abcdefghijklmnopqrstuvwxyz")),
+        "c3fcd3d76192e4007dfb496cca67e13b",
+    );
+}
+
+#[test_case]
+fn test_md5_alphanumeric() {
+    assert_eq!(
+        libkernel::md5::hex(&libkernel::md5::compute(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")),
+        "d174ab98d277d9f5a5611c2c9f419d9f",
+    );
+}
+
+#[test_case]
+fn test_md5_numeric() {
+    assert_eq!(
+        libkernel::md5::hex(&libkernel::md5::compute(b"12345678901234567890123456789012345678901234567890123456789012345678901234567890")),
+        "57edf4a22be3c955ac49da2e2107b67a",
+    );
+}

@@ -32,12 +32,34 @@ pub mod task;
 pub mod syscall;
 pub mod process;
 pub mod elf;
+pub mod md5;
 
 pub fn init() {
     cpuid::init();
     gdt::init();
+    enable_sse();
     interrupts::init();
     x86_64::instructions::interrupts::enable();
+}
+
+/// Enable SSE/SSE2 so user-space (and kernel) code can use XMM registers.
+///
+/// Clears CR0.EM (no x87 emulation), sets CR0.MP (monitor coprocessor),
+/// sets CR4.OSFXSR (enable FXSAVE/FXRSTOR) and CR4.OSXMMEXCPT (enable
+/// unmasked SIMD floating-point exceptions via #XM instead of #UD).
+fn enable_sse() {
+    use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
+    unsafe {
+        let mut cr0 = Cr0::read();
+        cr0.remove(Cr0Flags::EMULATE_COPROCESSOR);   // clear EM
+        cr0.insert(Cr0Flags::MONITOR_COPROCESSOR);    // set MP
+        Cr0::write(cr0);
+
+        let mut cr4 = Cr4::read();
+        cr4.insert(Cr4Flags::OSFXSR);                 // enable FXSAVE/FXRSTOR
+        cr4.insert(Cr4Flags::OSXMMEXCPT_ENABLE);      // enable #XM
+        Cr4::write(cr4);
+    }
 }
 
 #[alloc_error_handler]

@@ -56,12 +56,23 @@ pub struct Process {
     /// Index of this process's thread in the scheduler's thread vec.
     pub thread_idx: Option<usize>,
     pub exit_code: Option<i32>,
+    /// Page-aligned end of the highest PT_LOAD segment (initial program break).
+    pub brk_base: u64,
+    /// Current program break (starts == brk_base).
+    pub brk_current: u64,
+    /// Bump-down pointer for anonymous mmap allocations.
+    pub mmap_next: u64,
+    /// Tracked (vaddr, len) pairs for mmap regions.
+    pub mmap_regions: Vec<(u64, u64)>,
 }
 
 const PROCESS_KERNEL_STACK_SIZE: usize = 64 * 1024;
 
+/// Default mmap region start (bump-down from here).
+const MMAP_BASE: u64 = 0x0000_4000_0000_0000;
+
 impl Process {
-    pub fn new(pml4_phys: PhysAddr, entry_point: u64, user_stack_top: u64) -> Self {
+    pub fn new(pml4_phys: PhysAddr, entry_point: u64, user_stack_top: u64, brk_base: u64) -> Self {
         let pid = alloc_pid();
         let mut kernel_stack = Vec::with_capacity(PROCESS_KERNEL_STACK_SIZE);
         kernel_stack.resize(PROCESS_KERNEL_STACK_SIZE, 0u8);
@@ -77,6 +88,10 @@ impl Process {
             user_stack_top,
             thread_idx: None,
             exit_code: None,
+            brk_base,
+            brk_current: brk_base,
+            mmap_next: MMAP_BASE,
+            mmap_regions: Vec::new(),
         }
     }
 }

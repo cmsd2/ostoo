@@ -108,8 +108,18 @@ syscall_entry:
     mov  gs:8, rsp              /* save user RSP to per_cpu.user_rsp  (offset 8) */
     mov  rsp, gs:0              /* load kernel RSP from per_cpu.kernel_rsp (offset 0) */
 
+    /* Save all user registers that we clobber during the argument shuffle.
+       The Linux syscall ABI preserves everything except rax (return value),
+       rcx (clobbered by SYSCALL hw), and r11 (clobbered by SYSCALL hw).
+       We must restore rdi, rsi, rdx, r8, r9, r10 after syscall_dispatch. */
     push rcx                    /* save user RIP   */
     push r11                    /* save user RFLAGS */
+    push rdi                    /* save user rdi (a1) */
+    push rsi                    /* save user rsi (a2) */
+    push rdx                    /* save user rdx (a3) */
+    push r10                    /* save user r10 (a4) */
+    push r8                     /* save user r8  (a5) */
+    push r9                     /* save user r9  (a6) */
 
     /* Translate syscall ABI -> SysV64 for syscall_dispatch:
        syscall: nr=rax, a1=rdi, a2=rsi, a3=rdx, a4=r10, a5=r8
@@ -122,10 +132,15 @@ syscall_entry:
     mov  rsi, rdi               /* a1 -> 2nd SysV arg (rsi) */
     mov  rdi, rax               /* nr -> 1st SysV arg (rdi) */
 
-    sub  rsp, 8                 /* 16-byte align for call */
     call syscall_dispatch        /* returns i64 in rax */
-    add  rsp, 8
 
+    /* Restore user registers (rax has the return value from dispatch). */
+    pop  r9
+    pop  r8
+    pop  r10
+    pop  rdx
+    pop  rsi
+    pop  rdi
     pop  r11                    /* restore user RFLAGS */
     pop  rcx                    /* restore user RIP    */
 
@@ -142,14 +157,36 @@ syscall_entry:
 extern "sysv64" fn syscall_dispatch(
     nr: u64,
     a1: u64, a2: u64, a3: u64,
-    _a4: u64, _a5: u64,
+    a4: u64, a5: u64,
 ) -> i64 {
     match nr {
-        1       => sys_write(a1, a2, a3),
+        0        => sys_read(a1, a2, a3),
+        1        => sys_write(a1, a2, a3),
+        2        => sys_open(),
+        3        => 0, // close — no-op
+        5        => sys_fstat(a1, a2),
+        9        => sys_mmap(a1, a2, a3, a4, a5),
+        10       => 0, // mprotect — no-op
+        11       => 0, // munmap — stub (leak frames)
+        12       => sys_brk(a1),
+        8        => -(29i64), // lseek — ESPIPE (stdout is not seekable)
+        16       => -25i64, // ioctl — ENOTTY
+        20       => sys_writev(a1, a2, a3),
         60 | 231 => sys_exit(a1 as i32),
-        158     => sys_arch_prctl(a1, a2),
-        _       => -(38i64), // ENOSYS
+        158      => sys_arch_prctl(a1, a2),
+        202      => 0, // futex — stub (single-threaded, lock never contended)
+        218      => sys_set_tid_address(),
+        273      => 0, // set_robust_list — no-op
+        other    => {
+            log::warn!("unhandled syscall nr={} a1={:#x} a2={:#x} a3={:#x}",
+                other, a1, a2, a3);
+            -(38i64) // ENOSYS
+        }
     }
+}
+
+fn sys_open() -> i64 {
+    -(2i64) // ENOENT — no filesystem paths accessible yet
 }
 
 fn sys_write(fd: u64, buf: u64, count: u64) -> i64 {
@@ -192,6 +229,198 @@ fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
             0
         }
         _ => -(22i64), // EINVAL
+    }
+}
+
+fn sys_read(fd: u64, _buf: u64, _count: u64) -> i64 {
+    if fd == 0 {
+        0 // EOF on stdin
+    } else {
+        -(9i64) // EBADF
+    }
+}
+
+fn sys_fstat(_fd: u64, buf: u64) -> i64 {
+    // Zero-fill the 144-byte stat struct, then set st_mode = S_IFCHR|0o666
+    // at offset 24 (mode field in x86_64 Linux stat).
+    const STAT_SIZE: usize = 144;
+    const S_IFCHR: u32 = 0o020000;
+    let stat_ptr = buf as *mut u8;
+    unsafe {
+        core::ptr::write_bytes(stat_ptr, 0, STAT_SIZE);
+        let mode_ptr = stat_ptr.add(24) as *mut u32;
+        mode_ptr.write(S_IFCHR | 0o666);
+    }
+    0
+}
+
+fn sys_set_tid_address() -> i64 {
+    crate::process::current_pid().as_u64() as i64
+}
+
+fn sys_brk(addr: u64) -> i64 {
+    use crate::process;
+    use crate::memory::with_memory;
+    use x86_64::structures::paging::PageTableFlags;
+
+    let pid = process::current_pid();
+    if pid == process::ProcessId::KERNEL {
+        return 0;
+    }
+
+    // Read current brk state (drop lock immediately).
+    let (brk_base, brk_current, pml4_phys) = match process::with_process_ref(pid, |p| {
+        (p.brk_base, p.brk_current, p.pml4_phys)
+    }) {
+        Some(v) => v,
+        None => return 0,
+    };
+
+    // brk(0) or addr below base: return current break.
+    if addr == 0 || addr < brk_base {
+        return brk_current as i64;
+    }
+
+    let new_brk = (addr + 0xFFF) & !0xFFF; // page-align up
+    if new_brk <= brk_current {
+        // Shrinking — just update (don't unmap).
+        process::with_process(pid, |p| p.brk_current = new_brk);
+        return new_brk as i64;
+    }
+
+    // Grow: allocate and map new pages.
+    let pages_needed = ((new_brk - brk_current) / 0x1000) as usize;
+    let ok = with_memory(|mem| {
+        let phys_off = mem.phys_mem_offset();
+        for i in 0..pages_needed {
+            let vaddr = brk_current + (i as u64) * 0x1000;
+            let frame = match mem.alloc_dma_pages(1) {
+                Some(f) => f,
+                None => return false,
+            };
+            // Zero the frame.
+            let dst = phys_off + frame.as_u64();
+            unsafe { core::ptr::write_bytes(dst.as_mut_ptr::<u8>(), 0, 0x1000); }
+            if mem.map_user_page(
+                pml4_phys,
+                VirtAddr::new(vaddr),
+                frame,
+                PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::NO_EXECUTE,
+            ).is_err() {
+                return false;
+            }
+        }
+        true
+    });
+
+    if ok {
+        process::with_process(pid, |p| p.brk_current = new_brk);
+        new_brk as i64
+    } else {
+        brk_current as i64 // return old brk on failure
+    }
+}
+
+fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
+    if fd != 1 && fd != 2 {
+        return -(9i64); // EBADF
+    }
+    let mut total: usize = 0;
+    for i in 0..iovcnt as usize {
+        let iov_addr = iov_ptr + (i * 16) as u64;
+        let iov_base = unsafe { *(iov_addr as *const u64) };
+        let iov_len = unsafe { *((iov_addr + 8) as *const u64) } as usize;
+        if iov_len == 0 {
+            continue;
+        }
+        let bytes = unsafe { core::slice::from_raw_parts(iov_base as *const u8, iov_len) };
+        if let Ok(s) = core::str::from_utf8(bytes) {
+            crate::print!("{}", s);
+        } else {
+            // Fallback: print printable ASCII chars only.
+            for &b in bytes {
+                if (b >= 0x20 && b < 0x7F) || b == b'\n' || b == b'\r' || b == b'\t' {
+                    crate::print!("{}", b as char);
+                }
+            }
+        }
+        total += iov_len;
+    }
+    total as i64
+}
+
+fn sys_mmap(addr: u64, length: u64, _prot: u64, flags: u64, _a5: u64) -> i64 {
+    use crate::process;
+    use crate::memory::with_memory;
+    use x86_64::structures::paging::PageTableFlags;
+
+    const MAP_ANONYMOUS: u64 = 0x20;
+    const MAP_PRIVATE: u64 = 0x02;
+    const MAP_FIXED: u64 = 0x10;
+
+    // Only support MAP_PRIVATE|MAP_ANONYMOUS (with optional MAP_FIXED rejected).
+    if flags & MAP_ANONYMOUS == 0 {
+        return -(38i64); // ENOSYS — file-backed not supported
+    }
+    if flags & MAP_FIXED != 0 && addr != 0 {
+        return -(38i64); // ENOSYS — MAP_FIXED not supported
+    }
+    let _ = MAP_PRIVATE; // always implied
+
+    let pid = process::current_pid();
+    if pid == process::ProcessId::KERNEL {
+        return -(12i64); // ENOMEM
+    }
+
+    let aligned_len = (length + 0xFFF) & !0xFFF;
+    let num_pages = (aligned_len / 0x1000) as usize;
+
+    // Read process state (drop lock before memory alloc).
+    let (mmap_next, pml4_phys) = match process::with_process_ref(pid, |p| {
+        (p.mmap_next, p.pml4_phys)
+    }) {
+        Some(v) => v,
+        None => return -(12i64),
+    };
+
+    let region_base = mmap_next - aligned_len;
+
+    let ok = with_memory(|mem| {
+        let phys_off = mem.phys_mem_offset();
+        for i in 0..num_pages {
+            let vaddr = region_base + (i as u64) * 0x1000;
+            let frame = match mem.alloc_dma_pages(1) {
+                Some(f) => f,
+                None => return false,
+            };
+            let dst = phys_off + frame.as_u64();
+            unsafe { core::ptr::write_bytes(dst.as_mut_ptr::<u8>(), 0, 0x1000); }
+            if mem.map_user_page(
+                pml4_phys,
+                VirtAddr::new(vaddr),
+                frame,
+                PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::NO_EXECUTE,
+            ).is_err() {
+                return false;
+            }
+        }
+        true
+    });
+
+    if ok {
+        process::with_process(pid, |p| {
+            p.mmap_next = region_base;
+            p.mmap_regions.push((region_base, aligned_len));
+        });
+        region_base as i64
+    } else {
+        -(12i64) // ENOMEM
     }
 }
 

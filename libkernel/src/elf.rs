@@ -44,6 +44,7 @@ const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
 const EM_X86_64: u16 = 62;
 const PT_LOAD: u32 = 1;
+const PT_PHDR: u32 = 6;
 
 /// Segment permission flags from the ELF program header.
 pub const PF_X: u32 = 1;
@@ -83,6 +84,12 @@ pub struct LoadSegment {
 pub struct ElfInfo {
     pub entry: u64,
     pub segments: Vec<LoadSegment>,
+    /// Virtual address of the ELF program header table (for AT_PHDR).
+    pub phdr_vaddr: u64,
+    /// Number of program headers (for AT_PHNUM).
+    pub phnum: u16,
+    /// Size of each program header entry (for AT_PHENT).
+    pub phentsize: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +122,7 @@ pub fn parse(data: &[u8]) -> Result<ElfInfo, ElfError> {
 
     let phdr_size = core::mem::size_of::<Elf64Phdr>();
     let mut segments = Vec::new();
+    let mut phdr_vaddr: Option<u64> = None;
 
     for i in 0..ehdr.e_phnum as usize {
         let off = ehdr.e_phoff as usize + i * ehdr.e_phentsize as usize;
@@ -123,6 +131,10 @@ pub fn parse(data: &[u8]) -> Result<ElfInfo, ElfError> {
         }
         let phdr: Elf64Phdr =
             unsafe { core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Phdr) };
+
+        if phdr.p_type == PT_PHDR {
+            phdr_vaddr = Some(phdr.p_vaddr);
+        }
 
         if phdr.p_type != PT_LOAD {
             continue;
@@ -143,8 +155,24 @@ pub fn parse(data: &[u8]) -> Result<ElfInfo, ElfError> {
         });
     }
 
+    // Fallback: if no PT_PHDR, find the PT_LOAD segment containing e_phoff
+    // and compute the virtual address of the program header table.
+    let phdr_vaddr = phdr_vaddr.unwrap_or_else(|| {
+        for seg in &segments {
+            if ehdr.e_phoff >= seg.offset
+                && ehdr.e_phoff < seg.offset + seg.filesz
+            {
+                return seg.vaddr + (ehdr.e_phoff - seg.offset);
+            }
+        }
+        0
+    });
+
     Ok(ElfInfo {
         entry: ehdr.e_entry,
         segments,
+        phdr_vaddr,
+        phnum: ehdr.e_phnum,
+        phentsize: ehdr.e_phentsize,
     })
 }

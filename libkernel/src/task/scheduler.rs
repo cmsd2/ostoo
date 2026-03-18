@@ -107,6 +107,10 @@ static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 /// Saved register frame written to the stack by the timer stub and read back
 /// on context switch.  Must match the push/pop order in `lapic_timer_stub`
 /// exactly: 15 GPRs followed by the hardware iretq frame.
+///
+/// `Thread.saved_rsp` points to the base of the 512-byte FXSAVE area, which
+/// sits immediately below this frame in memory.  The SwitchFrame itself is at
+/// `saved_rsp + FXSAVE_SIZE`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SwitchFrame {
@@ -124,6 +128,7 @@ struct SwitchFrame {
 const KERNEL_CS: u64 = 0x08;
 const KERNEL_SS: u64 = 0;
 const RFLAGS_IF: u64 = 0x202; // IF + reserved bit 1
+const FXSAVE_SIZE: usize = 512;
 
 impl SwitchFrame {
     /// Build a frame for a new kernel thread.  All GPRs are zeroed.
@@ -164,10 +169,12 @@ impl SwitchFrame {
 // Stack alignment analysis at the point of `call preempt_tick`:
 //   CPU pushes SS/RSP/RFLAGS/CS/RIP  → 5 × 8 = 40 bytes
 //   stub pushes 15 GPRs              → 15 × 8 = 120 bytes
-//   total pushed = 160 bytes.
-//   Before interrupt RSP = 16n  →  after 15 pushes RSP = 16n − 160 = 16(n−10)
-//   `call` subtracts 8            →  RSP = 16(n−10) − 8 = 16m − 8
+//   stub subtracts 512 for FXSAVE    → 512 bytes
+//   total pushed = 672 bytes = 42 × 16.
+//   Before interrupt RSP = 16n  →  after pushes RSP = 16n − 672 = 16(n−42)
+//   `call` subtracts 8            →  RSP = 16(n−42) − 8 = 16m − 8
 //   SysV ABI: at function entry RSP + 8 must be 16-byte aligned  ✓
+//   fxsave requires 16-byte aligned operand — RSP is 16-aligned after sub  ✓
 // ---------------------------------------------------------------------------
 // LLVM defaults to Intel (noprefix) syntax for inline assembly, so no
 // .intel_syntax directive is needed.
@@ -178,9 +185,13 @@ core::arch::global_asm!(
     "push rsi", "push rdi", "push rbp",
     "push r8",  "push r9",  "push r10", "push r11",
     "push r12", "push r13", "push r14", "push r15",
+    "sub  rsp, 512",        // allocate FXSAVE area
+    "fxsave [rsp]",         // save x87/MMX/SSE state
     "mov  rdi, rsp",        // current_rsp → first argument (SysV)
     "call preempt_tick",    // returns new rsp in rax
     "mov  rsp, rax",        // switch to (possibly new) thread's stack
+    "fxrstor [rsp]",        // restore x87/MMX/SSE state
+    "add  rsp, 512",        // deallocate FXSAVE area
     "pop r15", "pop r14", "pop r13", "pop r12",
     "pop r11", "pop r10", "pop r9",  "pop r8",
     "pop rbp", "pop rdi", "pop rsi",
@@ -253,9 +264,14 @@ pub fn spawn_thread(entry: fn() -> !) {
     let stack_top = stack_top_raw & !0xF;
 
     let frame = SwitchFrame::new_kernel(entry, stack_top);
-    let saved_rsp = stack_top - core::mem::size_of::<SwitchFrame>() as u64;
-    // Safety: saved_rsp points into our just-allocated, zeroed stack.
-    unsafe { core::ptr::write(saved_rsp as *mut SwitchFrame, frame); }
+    // saved_rsp points to the base of the FXSAVE area; the SwitchFrame sits above it.
+    let saved_rsp = stack_top - core::mem::size_of::<SwitchFrame>() as u64 - FXSAVE_SIZE as u64;
+    unsafe {
+        let frame_ptr = (saved_rsp + FXSAVE_SIZE as u64) as *mut SwitchFrame;
+        core::ptr::write(frame_ptr, frame);
+        // MXCSR default at FXSAVE offset 24: all SSE exceptions masked, round-to-nearest.
+        core::ptr::write((saved_rsp + 24) as *mut u32, 0x1F80);
+    }
 
     let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -300,9 +316,14 @@ pub fn spawn_user_thread(pid: ProcessId, pml4_phys: x86_64::PhysAddr) -> usize {
     // passed via the RDI slot so the trampoline receives it as its first arg.
     let stack_top = kernel_stack_top;
     let frame = SwitchFrame::new_user_trampoline(pid, stack_top);
-    let saved_rsp = stack_top - core::mem::size_of::<SwitchFrame>() as u64;
-    // Safety: saved_rsp points into the process's kernel stack.
-    unsafe { core::ptr::write(saved_rsp as *mut SwitchFrame, frame); }
+    // saved_rsp points to the base of the FXSAVE area; the SwitchFrame sits above it.
+    let saved_rsp = stack_top - core::mem::size_of::<SwitchFrame>() as u64 - FXSAVE_SIZE as u64;
+    unsafe {
+        let frame_ptr = (saved_rsp + FXSAVE_SIZE as u64) as *mut SwitchFrame;
+        core::ptr::write(frame_ptr, frame);
+        // MXCSR default at FXSAVE offset 24: all SSE exceptions masked, round-to-nearest.
+        core::ptr::write((saved_rsp + 24) as *mut u32, 0x1F80);
+    }
 
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut sched = SCHEDULER.lock();
@@ -521,7 +542,8 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
     // thread the iretq RSP should be 8 mod 16 (SysV ABI entry alignment).
     // We check the saved RIP: if it matches a known entry function, this is a
     // first dispatch and we validate RSP alignment.
-    let frame = unsafe { &*(next_rsp as *const SwitchFrame) };
+    // SwitchFrame sits above the FXSAVE area: saved_rsp → FXSAVE (512) → SwitchFrame
+    let frame = unsafe { &*((next_rsp + FXSAVE_SIZE as u64) as *const SwitchFrame) };
     if frame.rip == (process_trampoline as *const () as u64)
         || frame.rsp == next_rsp  // old pattern where RSP == saved_rsp
     {

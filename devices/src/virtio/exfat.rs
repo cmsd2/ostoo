@@ -38,6 +38,9 @@ pub struct DirEntry {
     /// First data cluster — used internally for traversal; not part of the
     /// stable public API surface.
     pub(crate) first_cluster: u32,
+    /// If true, clusters are contiguous from `first_cluster`; do not follow
+    /// the FAT chain.
+    pub(crate) no_fat_chain: bool,
 }
 
 /// Parsed exFAT volume state.
@@ -242,6 +245,7 @@ async fn scan_dir_cluster(
     const MAX_CLUSTERS: usize = 1_000;
 
     'chain: for _ in 0..MAX_CLUSTERS {
+        if current < 2 || current >= 0xFFFF_FFF8 { break; }
         // Collect all sectors of this cluster into a flat buffer so that
         // entry sets crossing sector boundaries are handled naturally.
         let cluster_lba = vol.cluster_heap_lba + (current as u64 - 2) * vol.sectors_per_cluster;
@@ -278,6 +282,7 @@ async fn scan_dir_cluster(
 
                 let mut data_length    = 0u64;
                 let mut first_cluster  = 0u32;
+                let mut no_fat_chain   = false;
                 let mut name_chars: Vec<u16> = Vec::new();
 
                 for j in 1..=secondary_count {
@@ -287,9 +292,11 @@ async fn scan_dir_cluster(
                     match stype {
                         0xC0 => {
                             // Stream Extension:
+                            //   +1       GeneralSecondaryFlags (bit 1 = NoFatChain)
                             //   +8..+16  DataLength   (u64 LE)
                             //   +20..+24 FirstCluster (u32 LE)
                             let s = &cluster_data[off..off + 32];
+                            no_fat_chain  = s[1] & 0x02 != 0;
                             data_length   = u64::from_le_bytes(s[8..16].try_into().unwrap());
                             first_cluster = u32::from_le_bytes(s[20..24].try_into().unwrap());
                         }
@@ -308,7 +315,7 @@ async fn scan_dir_cluster(
 
                 let name = utf16_to_string(&name_chars);
                 if !name.is_empty() {
-                    entries.push(DirEntry { name, is_dir, size: data_length, first_cluster });
+                    entries.push(DirEntry { name, is_dir, size: data_length, first_cluster, no_fat_chain });
                 }
 
                 i += (1 + secondary_count) * 32;
@@ -366,6 +373,7 @@ async fn walk_path(vol: &ExfatVol, inbox: &BlkInbox, path: &str) -> Result<DirEn
         is_dir:        true,
         size:          0,
         first_cluster: vol.root_cluster,
+        no_fat_chain:  false,
     };
 
     for component in &components {
@@ -399,13 +407,13 @@ pub async fn list_dir(
     scan_dir_cluster(vol, inbox, dir.first_cluster).await
 }
 
-/// Read a file into memory.  Capped at 16 KiB to protect the heap.
+/// Read a file into memory.  Capped at 256 KiB to protect the heap.
 pub async fn read_file(
     vol:   &ExfatVol,
     inbox: &BlkInbox,
     path:  &str,
 ) -> Result<Vec<u8>, ExfatError> {
-    const MAX_FILE_SIZE: u64 = 16 * 1024;
+    const MAX_FILE_SIZE: u64 = 256 * 1024;
 
     let file = walk_path(vol, inbox, path).await?;
     if file.is_dir {
@@ -422,7 +430,7 @@ pub async fn read_file(
     const MAX_CLUSTERS: usize = 1_000;
 
     for _ in 0..MAX_CLUSTERS {
-        if bytes_left == 0 || cluster >= 0xFFFF_FFF8 { break; }
+        if bytes_left == 0 || cluster < 2 || cluster >= 0xFFFF_FFF8 { break; }
 
         let cluster_lba = vol.cluster_heap_lba + (cluster as u64 - 2) * vol.sectors_per_cluster;
 
@@ -434,8 +442,13 @@ pub async fn read_file(
             bytes_left     = bytes_left.saturating_sub(to_copy as u64);
         }
 
-        let next = read_fat_entry(vol, inbox, cluster).await?;
-        cluster = next;
+        if file.no_fat_chain {
+            // Contiguous allocation: clusters are sequential.
+            cluster += 1;
+        } else {
+            let next = read_fat_entry(vol, inbox, cluster).await?;
+            cluster = next;
+        }
     }
 
     Ok(data)

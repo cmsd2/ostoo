@@ -421,9 +421,15 @@ extern "x86-interrupt" fn page_fault_handler(
     // Check whether the fault came from ring 3 (RPL field of the saved CS).
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         let pid = crate::process::current_pid();
+        let rip = stack_frame.instruction_pointer.as_u64();
+        let rsp = stack_frame.stack_pointer.as_u64();
+        let fs_base = unsafe {
+            x86_64::registers::model_specific::Msr::new(0xC000_0100).read()
+        };
         error!(
-            "ring-3 page fault at {:?} (pid {}, error: {:?}) — killing process",
-            faulting_addr, pid.as_u64(), error_code
+            "ring-3 page fault at {:?} (pid {}, error: {:?}) — killing process\n  \
+             RIP={:#x} RSP={:#x} FS_BASE={:#x}",
+            faulting_addr, pid.as_u64(), error_code, rip, rsp, fs_base
         );
         if pid != crate::process::ProcessId::KERNEL {
             crate::process::mark_zombie(pid, -11); // SIGSEGV

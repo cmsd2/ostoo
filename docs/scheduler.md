@@ -57,9 +57,13 @@ lapic_timer_stub:
     push rsi; push rdi; push rbp
     push r8;  push r9;  push r10; push r11
     push r12; push r13; push r14; push r15
+    sub  rsp, 512           // allocate FXSAVE area
+    fxsave [rsp]            // save x87/MMX/SSE state
     mov  rdi, rsp           // current_rsp → first argument
     call preempt_tick       // returns new rsp in rax
     mov  rsp, rax           // switch to (possibly new) thread's stack
+    fxrstor [rsp]           // restore x87/MMX/SSE state
+    add  rsp, 512           // deallocate FXSAVE area
     pop r15; pop r14; pop r13; pop r12
     pop r11; pop r10; pop r9;  pop r8
     pop rbp; pop rdi; pop rsi
@@ -68,9 +72,11 @@ lapic_timer_stub:
 ```
 
 The CPU pushes an interrupt frame (SS/RSP/RFLAGS/CS/RIP, 40 bytes) before
-the stub runs.  The stub pushes 15 GPRs (120 bytes).  Together that is
-160 bytes = 10 × 16, so RSP is 16-byte aligned before `call`, satisfying the
-SysV ABI (`RSP + 8` aligned at function entry).
+the stub runs.  The stub pushes 15 GPRs (120 bytes) and then allocates a
+512-byte FXSAVE area for x87/MMX/SSE register state.  Together that is
+672 bytes = 42 × 16, so RSP is 16-byte aligned for both `fxsave [rsp]`
+(requires 16-byte alignment) and the `call` instruction (SysV ABI:
+`RSP + 8` aligned at function entry).
 
 ### `preempt_tick(current_rsp: u64) -> u64`
 
@@ -104,21 +110,28 @@ stack looks like, so the same assembly stub can start a new thread as if it
 were resuming a preempted one.
 
 ```
-high address  ┌──────────────────────┐
-              │  SS   = 0            │  ← null selector, valid for ring-0
-              │  RSP  = stack_top−160│  ← thread's initial stack pointer
-              │  RFLAGS = 0x202      │  ← bit 9 (IF) + bit 1 (reserved)
-              │  CS   = 0x08         │  ← kernel code segment
-              │  RIP  = entry        │  ← thread entry point
-              │  r15  = 0            │
-              │  r14  = 0            │
-              │  …                   │
-              │  rax  = 0            │  ← saved_rsp points here
-low address   └──────────────────────┘
+high address  ┌──────────────────────────┐
+              │  SS   = 0                │  ← null selector, valid for ring-0
+              │  RSP  = stack_top−8      │  ← thread's initial stack pointer
+              │  RFLAGS = 0x202          │  ← bit 9 (IF) + bit 1 (reserved)
+              │  CS   = 0x08             │  ← kernel code segment
+              │  RIP  = entry            │  ← thread entry point
+              ├──────────────────────────┤
+              │  rax  = 0                │  15 GPRs (120 bytes)
+              │  rbx  = 0                │
+              │  …                       │
+              │  r15  = 0                │
+              ├──────────────────────────┤
+              │  FXSAVE area             │  512 bytes (16-byte aligned)
+              │  (x87/MMX/SSE state)     │  MXCSR = 0x1F80 at offset +24
+              │                          │  XMM0-15 at offset +160
+              │                          │  ← saved_rsp points here
+low address   └──────────────────────────┘
 ```
 
-`saved_rsp` = address of the `r15` slot (bottom of the 160-byte region,
-guaranteed 16-byte aligned by rounding `stack_top` down).
+`saved_rsp` = base of the 512-byte FXSAVE area.  The SwitchFrame (GPRs +
+iretq frame) sits at `saved_rsp + 512`.  Total region is 672 bytes,
+guaranteed 16-byte aligned by rounding `stack_top` down.
 
 ---
 

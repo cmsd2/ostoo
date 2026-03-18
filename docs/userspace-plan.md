@@ -12,10 +12,11 @@ through system calls, and eventually linked against a ported musl libc.
 
 ## Progress Summary
 
-Phases 0–3 are **complete**. The kernel can parse ELF binaries, create isolated
+Phases 0–4 are **complete**. The kernel can parse ELF binaries, create isolated
 per-process address spaces, drop to ring 3 via `iretq`, handle SYSCALL/SYSRET,
-and preemptively schedule user processes alongside kernel threads. Ring-3 page
-faults kill the offending process without crashing the kernel.
+preemptively schedule user processes, and run static musl-linked binaries that
+print to the console and exit. The initial user stack is set up with
+`argc/argv/envp/auxv` as musl's `_start` expects.
 
 | Phase | Status | Milestone |
 |-------|--------|-----------|
@@ -23,8 +24,8 @@ faults kill the offending process without crashing the kernel.
 | 1 — Ring-3 + SYSCALL | **Done** | GDT has ring-3 segments; SYSCALL/SYSRET works; `sys_write`, `sys_exit`, `sys_arch_prctl` implemented |
 | 2 — Per-process page tables | **Done** | `create_user_page_table`, `map_user_page`, CR3 switching on context switch; ring-3 page faults kill the process |
 | 3 — Process abstraction | **Done** | `Process` struct, process table, ELF loader, `exec` shell command, zombie reaping |
-| 4 — System call layer | **Not started** | Need `read`, `mmap`, `brk`, `fstat`, `close`, `munmap` for musl hello-world |
-| 5 — Cross-compiler + musl | **Not started** | Need Phase 4 syscalls first |
+| 4 — System call layer | **Done** | 14 syscalls implemented; initial stack with auxv; `brk`/`mmap` for heap; `writev` for musl printf |
+| 5 — Cross-compiler + musl | **Not started** | Phase 4 syscalls are ready; need to build and test a musl binary |
 | 6 — Fork / wait / user shell | **Not started** | Requires CoW page faults, `waitpid` |
 | 7 — Signals | **Not started** | Requires signal frame push/pop, `rt_sigaction`, `rt_sigreturn` |
 
@@ -32,10 +33,24 @@ faults kill the offending process without crashing the kernel.
 
 - Shell command `exec <path>` reads an ELF from the VFS and spawns it as a
   ring-3 process with its own PML4.
-- User code can call `sys_write(1, buf, len)` to print to the VGA console.
-- User code calls `sys_exit(code)` to terminate; the process is marked zombie
-  and reaped on the next `exec` or `spawn_blob`.
-- `sys_arch_prctl(ARCH_SET_FS, addr)` writes `IA32_FS_BASE` (needed by musl TLS).
+- ELF processes get an 8-page (32 KiB) user stack at `0x7FFF_F000_0000` with
+  a proper initial stack layout: `argc`, `argv` (NULL), `envp` (NULL), and
+  an auxiliary vector (`AT_PAGESZ`, `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`,
+  `AT_ENTRY`, `AT_UID`, `AT_RANDOM`, `AT_NULL`). RSP is 16-byte aligned.
+- **14 syscalls** are implemented (see `docs/syscalls/` for per-syscall docs):
+  `read`, `write`, `close`, `fstat`, `mmap`, `mprotect`, `munmap`, `brk`,
+  `ioctl`, `writev`, `exit`/`exit_group`, `arch_prctl`, `set_tid_address`,
+  `set_robust_list`.
+- `writev` (used by musl's `printf`) writes scatter/gather buffers to VGA.
+- `brk` grows the process heap by allocating and mapping zero-filled pages.
+- `mmap` supports anonymous `MAP_PRIVATE` allocations via a bump-down allocator
+  starting at `0x4000_0000_0000`.
+- `Process` tracks `brk_base`/`brk_current` (computed from ELF segment extents)
+  and `mmap_next`/`mmap_regions`.
+- ELF parser extracts `phdr_vaddr`, `phnum`, and `phentsize` for the auxiliary
+  vector (musl reads `AT_PHDR`/`AT_PHNUM`/`AT_PHENT` during startup).
+- Unhandled syscalls log a warning with the syscall number and first 3 args,
+  then return `-ENOSYS`.
 - Ring-3 page faults (e.g. `test pagefault`) log the fault, mark the process
   zombie, restore kernel GS polarity, and kill the thread — no kernel panic.
 - `test isolation` verifies two independently-created PML4s have genuinely
@@ -49,14 +64,15 @@ faults kill the offending process without crashing the kernel.
 | File | Role |
 |------|------|
 | `libkernel/src/gdt.rs` | GDT with kernel + user code/data segments, TSS, `set_kernel_stack` for rsp0 |
-| `libkernel/src/syscall.rs` | SYSCALL MSR init, assembly entry stub, `syscall_dispatch`, per-CPU data |
-| `libkernel/src/process.rs` | `Process` struct, `ProcessId`, process table, zombie marking/reaping |
-| `libkernel/src/elf.rs` | Minimal ELF64 parser (static `ET_EXEC`, x86-64) |
+| `libkernel/src/syscall.rs` | SYSCALL MSR init, assembly entry stub, `syscall_dispatch` (14 syscalls), `brk`/`mmap`/`writev`/`fstat`, per-CPU data |
+| `libkernel/src/process.rs` | `Process` struct (with brk/mmap tracking), `ProcessId`, process table, zombie marking/reaping |
+| `libkernel/src/elf.rs` | ELF64 parser (static `ET_EXEC`, x86-64) with phdr metadata for auxv |
 | `libkernel/src/memory/mod.rs` | `create_user_page_table`, `map_user_page`, `switch_address_space` |
 | `libkernel/src/task/scheduler.rs` | `spawn_user_thread`, `process_trampoline`, CR3 switching in `preempt_tick` |
 | `libkernel/src/interrupts.rs` | Ring-3-aware page fault handler |
-| `kernel/src/ring3.rs` | `spawn_process` (ELF), `spawn_blob` (raw code), test helpers |
+| `kernel/src/ring3.rs` | `spawn_process` (ELF with auxv stack setup), `build_initial_stack`, `spawn_blob` (raw code), test helpers |
 | `devices/src/vfs/proc_vfs.rs` | ProcVfs with 12 virtual files |
+| `docs/syscalls/*.md` | Per-syscall documentation (14 files) |
 
 ---
 
@@ -73,13 +89,15 @@ self-mapping.
 0x0000_0000_0000_0000  ← canonical zero (null pointer trap page, unmapped)
 0x0000_0000_0040_0000  ← ELF load address (4 MiB, standard x86-64)
          ↓ text, data, BSS
-         ↓ brk heap (grows up)
-0x0000_0010_0000_0000
-         ↓ mmap region (grows down from stack)
-0x0000_3FFF_FF00_0000  ← user stack top (grows down)
+         ↓ brk heap (grows up from page-aligned end of highest PT_LOAD segment)
+         ...
+0x0000_4000_0000_0000  ← mmap region (bump-down allocator, grows downward)
+         ...
+0x0000_7FFF_F000_0000  ← ELF user stack base (8 pages = 32 KiB)
+0x0000_7FFF_F000_8000  ← ELF user stack top (RSP starts here minus auxv layout)
 0x0000_7FFF_FFFF_FFFF  ← top of lower canonical half (entire range = user)
                          (non-canonical gap)
-0xFFFF_8000_0000_0000  ← kernel heap        (HEAP_START, 256 KiB)
+0xFFFF_8000_0000_0000  ← kernel heap        (HEAP_START, 512 KiB)
 0xFFFF_8001_0000_0000  ← Local APIC MMIO    (APIC_BASE)
 0xFFFF_8001_0001_0000  ← IO APIC(s)
 0xFFFF_8002_0000_0000  ← MMIO window        (MMIO_VIRT_BASE, 512 GiB)
@@ -369,7 +387,8 @@ different page tables.
 - `kill_current_thread()` marks the thread Dead and spins; timer preemption skips
   dead threads.
 - ELF loader (`libkernel/src/elf.rs`): minimal parser for static `ET_EXEC`
-  x86-64 binaries.  Returns `ElfInfo { entry, segments: Vec<LoadSegment> }`.
+  x86-64 binaries.  Returns `ElfInfo { entry, segments, phdr_vaddr, phnum,
+  phentsize }`.
 - `kernel/src/ring3.rs::spawn_process(elf_data)` — parses ELF, creates user PML4,
   maps all PT_LOAD segments (with correct R/W/X flags) plus a user stack page,
   creates a Process, and spawns a user thread.  Returns `Ok(ProcessId)`.
@@ -447,62 +466,109 @@ fn sys_execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -
 
 ---
 
-## Phase 4 — System Call Layer  ⬜ NOT STARTED
+## Phase 4 — System Call Layer  ✅ COMPLETE
 
 **Goal:** a syscall table wide enough to run a static musl binary that prints
 "Hello, world!" and exits.
 
-**Current state:** Only `write` (nr 1), `exit`/`exit_group` (nr 60/231), and
-`arch_prctl` (nr 158) are implemented.  All other syscall numbers return
-`-ENOSYS`.  No file descriptor table exists yet — `sys_write` checks
-`fd == 1 || fd == 2` and writes directly to the VGA console.
+**What was implemented:**
 
-### 4a. Syscall numbering
+### 4a. ELF parser extensions (`libkernel/src/elf.rs`)
 
-Use Linux x86-64 syscall numbers (`/usr/include/asm/unistd_64.h`) so that
-binaries built with a standard `x86_64-linux-musl` toolchain work without
-patching musl.
+`ElfInfo` now includes `phdr_vaddr`, `phnum`, and `phentsize`.  The parser
+looks for a `PT_PHDR` program header (type 6) to get the phdr virtual address
+directly; fallback computes it from the `PT_LOAD` segment containing `e_phoff`.
+These values populate the auxiliary vector that musl reads during startup.
 
-Priority subset for "Hello, world!":
+### 4b. Process memory tracking (`libkernel/src/process.rs`)
 
-| Nr | Name | Notes |
-|----|------|-------|
-| 0 | `read` | fd 0 (stdin); block until keyboard line |
-| 1 | `write` | fd 1/2: write bytes to VGA console via VFS |
-| 3 | `close` | no-op for now |
-| 5 | `fstat` | return fake stat for stdin/stdout |
-| 9 | `mmap` | anonymous: allocate frames, map into process space |
-| 11 | `munmap` | unmap range |
-| 12 | `brk` | extend heap |
-| 60 | `exit` | terminate process, schedule next |
-| 158 | `arch_prctl` | `ARCH_SET_FS`: set FS_BASE MSR (required by musl TLS) |
-| 231 | `exit_group` | same as exit for single-threaded |
+`Process` gained four new fields:
 
-### 4b. `arch_prctl` / FS_BASE
+| Field | Type | Purpose |
+|-------|------|---------|
+| `brk_base` | `u64` | Page-aligned end of highest PT_LOAD segment (immutable) |
+| `brk_current` | `u64` | Current program break (starts == `brk_base`) |
+| `mmap_next` | `u64` | Bump-down pointer for anonymous mmap (starts at `0x4000_0000_0000`) |
+| `mmap_regions` | `Vec<(u64, u64)>` | Tracked `(vaddr, len)` pairs |
 
-musl sets up thread-local storage via `arch_prctl(ARCH_SET_FS, addr)`.  Handle
-this by writing to the `IA32_FS_BASE` MSR (0xC000_0100).  Save/restore the
-value on every context switch.
+`Process::new()` now takes a `brk_base` parameter.  `spawn_process` computes it
+from `max(seg.vaddr + seg.memsz)` page-aligned up.
 
-### 4c. File descriptor table
+### 4c. Initial stack layout (`kernel/src/ring3.rs`)
 
-```rust
-pub struct FileTable {
-    entries: [Option<Arc<dyn VfsFileHandle>>; 64],
-}
+ELF processes get an 8-page (32 KiB) contiguous stack at `0x7FFF_F000_0000`,
+allocated via `alloc_dma_pages(8)` so the auxv layout can be written through the
+kernel's phys_mem_offset window.  `build_initial_stack()` writes:
+
+```
+[stack_top]
+  16 bytes pseudo-random data (AT_RANDOM target)
+  alignment padding (8 bytes)
+  AT_NULL (0, 0)
+  AT_RANDOM (25, addr)
+  AT_ENTRY (9, entry_point)
+  AT_PHNUM (5, phnum)
+  AT_PHENT (4, phentsize)
+  AT_PHDR (3, phdr_vaddr)
+  AT_PAGESZ (6, 4096)
+  AT_UID (11, 0)
+  NULL                    ← envp terminator
+  NULL                    ← argv terminator
+  0                       ← argc = 0
+[RSP points here, 16-byte aligned]
 ```
 
-Stdin (fd 0), stdout (fd 1), stderr (fd 2) are wired up on process creation:
-- fd 0: a keyboard line buffer implementing `read`
-- fd 1/2: a console writer implementing `write`
+### 4d. Syscall table (`libkernel/src/syscall.rs`)
 
-`sys_open`, `sys_read`, `sys_write`, `sys_close` route through the VFS.
+All syscalls use Linux x86-64 numbers for musl compatibility.  Unhandled
+numbers log a warning and return `-ENOSYS` (-38).
+
+| Nr | Name | Implementation |
+|----|------|---------------|
+| 0 | `read` | Returns 0 (EOF) for fd 0, `-EBADF` otherwise |
+| 1 | `write` | UTF-8 string to VGA for fd 1/2 |
+| 3 | `close` | No-op, returns 0 |
+| 5 | `fstat` | Zero-fills 144-byte stat, sets `st_mode = S_IFCHR\|0666` |
+| 9 | `mmap` | Anonymous `MAP_PRIVATE` only; bump-down allocator; allocates+maps zero-filled pages |
+| 10 | `mprotect` | No-op, returns 0 |
+| 11 | `munmap` | No-op stub, returns 0 (frames leaked) |
+| 12 | `brk` | Query or grow heap; allocates+maps zero-filled pages per-page |
+| 16 | `ioctl` | Returns `-ENOTTY` (-25) |
+| 20 | `writev` | Scatter/gather write to VGA for fd 1/2; UTF-8 with ASCII fallback |
+| 60 | `exit` | Mark zombie, kill thread |
+| 158 | `arch_prctl` | `ARCH_SET_FS` writes `IA32_FS_BASE` MSR |
+| 218 | `set_tid_address` | Returns current PID as TID |
+| 231 | `exit_group` | Same as `exit` (single-threaded) |
+| 273 | `set_robust_list` | No-op, returns 0 |
+
+Lock ordering for `brk` and `mmap`: process table lock acquired/released to
+read state, then memory lock for frame allocation and page mapping, then process
+table lock re-acquired to write updates.  This avoids nested lock deadlocks.
+
+See `docs/syscalls/` for detailed per-syscall documentation.
+
+### 4e. What's still missing (deferred to later phases)
+
+- **File descriptor table**: No per-process fd table exists.  `write`/`writev`
+  check `fd == 1 || fd == 2` directly; `fstat` accepts any fd.
+- **SMAP enforcement**: User pointers in `writev`, `fstat`, `brk` are accessed
+  without `stac`/`clac`.
+- **Page deallocation**: `munmap` and `brk` shrink don't free frames or unmap
+  pages.
+- **`mprotect`**: Doesn't actually update page table flags.
+- **FS_BASE save/restore**: Not saved across context switches; each process sets
+  it fresh via the trampoline, but preemption mid-syscall could lose it.
 
 ---
 
 ## Phase 5 — Cross-Compiler and musl Port  ⬜ NOT STARTED
 
 **Goal:** compile C programs that run as ostoo user processes.
+
+**Prerequisites:** Phase 4 syscalls are all implemented.  The next step is to
+build a static musl hello-world binary, copy it to the FAT image, and test with
+`exec /hello`.  Use `log::warn` output from unhandled syscalls to identify any
+missing syscalls that musl's startup path requires beyond what Phase 4 provides.
 
 ### 5a. Toolchain strategy
 
@@ -516,8 +582,7 @@ Compile with:
 ```sh
 x86_64-linux-musl-gcc -static -o hello hello.c
 ```
-The resulting fully-static ELF should boot on ostoo once the Phase 4 syscalls
-are implemented.
+The resulting fully-static ELF should work on ostoo with the Phase 4 syscalls.
 
 Option B (custom triple): build musl from source with a custom `--target`
 configured for ostoo.  This is useful once ostoo diverges from Linux's ABI
@@ -648,13 +713,13 @@ pub struct SigTable  { actions: [SigAction; 32], pending: SigSet, masked: SigSet
 ## Dependency Graph
 
 ```
-Phase 0  ←─ Phase 1 ←─ Phase 2 ←─ Phase 3 ←─ Phase 4 ←─ Phase 5 (musl)
-(toolchain)   (ring-3,      (address     (Process,        (syscall        (C programs)
-              syscall)      spaces)      ELF loader)      table)
-                                                  ↓
-                                              Phase 6 (fork/exec/shell)
-                                                  ↓
-                                              Phase 7 (signals)
+Phase 0 ✅ ← Phase 1 ✅ ← Phase 2 ✅ ← Phase 3 ✅ ← Phase 4 ✅ ← Phase 5 (musl)
+(toolchain)   (ring-3,       (address     (Process,        (syscall        (C programs)
+               syscall)       spaces)      ELF loader)      layer)
+                                                    ↓
+                                                Phase 6 (fork/exec/shell)
+                                                    ↓
+                                                Phase 7 (signals)
 ```
 
 ---
@@ -694,9 +759,16 @@ shootdown when modifying another process's page table.
 
 ### Heap size
 The kernel heap is 512 KiB.  Process control blocks each consume 64 KiB
-(kernel stack) plus page table frames.  `reap_zombies()` is called before each
-`spawn_process` to recover heap, but loading multiple concurrent processes will
-still require a larger or demand-paged heap.
+(kernel stack) plus page table frames, plus `Vec` storage for `mmap_regions`.
+`reap_zombies()` is called before each `spawn_process` to recover heap, but
+loading multiple concurrent processes will still require a larger or
+demand-paged heap.
+
+### Memory leaks
+Physical frames allocated by `brk` (on shrink), `mmap`, and ELF segment loading
+are never freed when a process exits.  `munmap` is a no-op stub.  This is
+acceptable for the current single-process-at-a-time workflow but must be
+addressed before running multiple long-lived processes.
 
 ---
 
@@ -707,6 +779,7 @@ still require a larger or demand-paged heap.
 | Phase 1 complete | `iretq` drops to ring 3; `syscall` returns to ring 0; "Hello from ring 3!" appears on VGA | ✅ Done |
 | Phase 2 complete | Two user processes have separate address spaces; `test isolation` passes | ✅ Done |
 | Phase 3 complete | `exec /path/to/elf` reads an ELF from the VFS, loads it into a fresh address space, and runs it | ✅ Done |
-| Phase 4 / musl hello world | `hello` compiled with `x86_64-linux-musl-gcc -static` prints and exits cleanly | ⬜ |
+| Phase 4 complete | 14 syscalls, initial stack with auxv, `brk`/`mmap` heap, `writev` for printf | ✅ Done |
+| Phase 5 / musl hello world | `hello` compiled with `x86_64-linux-musl-gcc -static` prints and exits cleanly | ⬜ |
 | Phase 6 complete | User shell forks, execs, and waits for children | ⬜ |
 | Phase 7 complete | `SIGINT` (Ctrl+C) terminates the foreground process | ⬜ |

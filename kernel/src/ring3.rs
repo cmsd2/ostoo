@@ -9,6 +9,13 @@ const USER_CODE_VIRT: u64  = 0x0040_0000;
 const USER_STACK_VIRT: u64 = 0x0050_0000;
 const USER_STACK_TOP: u64  = USER_STACK_VIRT + 0x1000;
 
+/// 8-page (32 KiB) user stack for ELF processes, placed at a high user address.
+const ELF_STACK_PAGES: usize = 8;
+const ELF_STACK_SIZE: u64 = (ELF_STACK_PAGES as u64) * 0x1000;
+const ELF_STACK_VIRT: u64 = 0x0000_7FFF_F000_0000;
+#[allow(dead_code)]
+const ELF_STACK_TOP: u64  = ELF_STACK_VIRT + ELF_STACK_SIZE;
+
 // ---------------------------------------------------------------------------
 // Assembly blobs
 
@@ -97,7 +104,7 @@ fn spawn_blob(code: &[u8]) -> ProcessId {
         pml4_phys
     });
 
-    let proc = libkernel::process::Process::new(pml4_phys, USER_CODE_VIRT, USER_STACK_TOP);
+    let proc = libkernel::process::Process::new(pml4_phys, USER_CODE_VIRT, USER_STACK_TOP, 0);
     let pid = proc.pid;
     libkernel::process::insert(proc);
 
@@ -146,13 +153,17 @@ pub fn spawn_process(elf_data: &[u8]) -> Result<ProcessId, &'static str> {
     // Free kernel stacks of previously exited processes so the heap doesn't run out.
     libkernel::process::reap_zombies();
 
-    let info = elf::parse(elf_data).map_err(|_| "invalid ELF binary")?;
+    let info = elf::parse(elf_data).map_err(|e| {
+        log::error!("ELF parse error: {:?} (data len={}, first 4 bytes={:02x?})",
+            e, elf_data.len(), &elf_data[..elf_data.len().min(4)]);
+        "invalid ELF binary"
+    })?;
 
     if info.segments.is_empty() {
         return Err("ELF has no loadable segments");
     }
 
-    let pml4_phys = with_memory(|mem| {
+    let (pml4_phys, stack_kernel_base) = with_memory(|mem| {
         let pml4_phys = mem.create_user_page_table();
         let phys_off = mem.phys_mem_offset();
 
@@ -217,27 +228,52 @@ pub fn spawn_process(elf_data: &[u8]) -> Result<ProcessId, &'static str> {
             }
         }
 
-        // Map user stack page (RW, NX).
-        let stack_phys = mem.alloc_dma_pages(1)
+        // Map 8-page user stack (RW, NX) using contiguous physical pages
+        // so we can write the initial auxv layout through the phys_mem_offset window.
+        let stack_phys = mem.alloc_dma_pages(ELF_STACK_PAGES)
             .expect("spawn_process: out of frames (stack)");
-        let stack_virt = phys_off + stack_phys.as_u64();
-        unsafe { core::ptr::write_bytes(stack_virt.as_mut_ptr::<u8>(), 0, 0x1000); }
+        let stack_kernel_base = phys_off + stack_phys.as_u64();
+        unsafe {
+            core::ptr::write_bytes(
+                stack_kernel_base.as_mut_ptr::<u8>(), 0,
+                ELF_STACK_SIZE as usize,
+            );
+        }
 
-        mem.map_user_page(
-            pml4_phys,
-            VirtAddr::new(USER_STACK_VIRT),
-            stack_phys,
-            PageTableFlags::PRESENT
-                | PageTableFlags::WRITABLE
-                | PageTableFlags::USER_ACCESSIBLE
-                | PageTableFlags::NO_EXECUTE,
-        ).expect("spawn_process: failed to map stack page");
+        let stack_flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        for i in 0..ELF_STACK_PAGES {
+            let page_phys = x86_64::PhysAddr::new(stack_phys.as_u64() + (i as u64) * 0x1000);
+            let page_virt = VirtAddr::new(ELF_STACK_VIRT + (i as u64) * 0x1000);
+            mem.map_user_page(pml4_phys, page_virt, page_phys, stack_flags)
+                .expect("spawn_process: failed to map stack page");
+        }
 
-        pml4_phys
+        (pml4_phys, stack_kernel_base)
     });
 
+    // Compute brk_base: page-aligned end of highest PT_LOAD segment.
+    let brk_base = {
+        let max_end = info.segments.iter()
+            .map(|s| s.vaddr + s.memsz)
+            .max()
+            .unwrap_or(0);
+        (max_end + 0xFFF) & !0xFFF
+    };
+
+    // Build the initial user stack: argc/argv/envp/auxv.
+    // We write through the kernel's physical memory window (stack_kernel_base).
+    let user_rsp = build_initial_stack(
+        stack_kernel_base,
+        ELF_STACK_VIRT,
+        ELF_STACK_SIZE,
+        &info,
+    );
+
     // Create the process and insert it into the process table.
-    let proc = Process::new(pml4_phys, info.entry, USER_STACK_TOP);
+    let proc = Process::new(pml4_phys, info.entry, user_rsp, brk_base);
     let pid = proc.pid;
     libkernel::process::insert(proc);
 
@@ -251,6 +287,101 @@ pub fn spawn_process(elf_data: &[u8]) -> Result<ProcessId, &'static str> {
         pid.as_u64(), info.entry, pml4_phys.as_u64());
 
     Ok(pid)
+}
+
+// ---------------------------------------------------------------------------
+// Initial stack builder for ELF processes
+
+/// Build the initial user stack layout that musl expects:
+///
+/// ```text
+/// [stack_top]
+///   16 bytes of zeros (AT_RANDOM target)
+///   AT_NULL (0, 0)
+///   AT_RANDOM (25, addr_of_random_bytes)
+///   AT_ENTRY (9, entry_point)
+///   AT_PHNUM (5, phnum)
+///   AT_PHENT (4, phentsize)
+///   AT_PHDR (3, phdr_vaddr)
+///   AT_PAGESZ (6, 4096)
+///   NULL                    <- envp terminator
+///   NULL                    <- argv terminator
+///   0u64                    <- argc = 0
+/// [RSP points here, 16-byte aligned]
+/// ```
+///
+/// `kernel_base` is the kernel-accessible (phys_mem_offset) virtual address of the
+/// stack's physical memory. `user_virt_base` is where the stack is mapped in user space.
+/// Returns the user-space RSP value.
+fn build_initial_stack(
+    kernel_base: VirtAddr,
+    user_virt_base: u64,
+    stack_size: u64,
+    info: &libkernel::elf::ElfInfo,
+) -> u64 {
+    // We build the stack from the top down.
+    let kernel_top = kernel_base.as_u64() + stack_size;
+    let user_top = user_virt_base + stack_size;
+
+    // Helper: write a u64 at a given offset from the top.
+    let mut cursor = kernel_top;
+
+    let push = |cursor: &mut u64, val: u64| {
+        *cursor -= 8;
+        unsafe { *(*cursor as *mut u64) = val; }
+    };
+
+    // 1. AT_RANDOM data: 16 bytes of "random" data at the top.
+    //    (We use a simple counter-based pattern; real randomness not needed for boot.)
+    cursor -= 16;
+    let random_kernel_addr = cursor;
+    let random_user_addr = user_top - 16;
+    unsafe {
+        let p = random_kernel_addr as *mut u8;
+        for i in 0..16u8 {
+            *p.add(i as usize) = i.wrapping_mul(7).wrapping_add(0x42);
+        }
+    }
+
+    // 2. Auxiliary vector (pairs of u64: type, value), terminated by AT_NULL.
+    const AT_NULL: u64 = 0;
+    const AT_PHDR: u64 = 3;
+    const AT_PHENT: u64 = 4;
+    const AT_PHNUM: u64 = 5;
+    const AT_PAGESZ: u64 = 6;
+    const AT_ENTRY: u64 = 9;
+    const AT_UID: u64 = 11;
+    const AT_RANDOM: u64 = 25;
+
+    // Push in reverse order (AT_NULL last pushed = lowest address = first read).
+    // 8 auxv entries (16 u64s) + 3 u64s (envp/argv/argc) = 19 pushes.
+    // Plus 16 bytes random data = 168 bytes from top. 168 % 16 = 8, so add
+    // a padding word to keep RSP 16-byte aligned (20 pushes = 160, +16 = 176).
+    push(&mut cursor, 0); // alignment padding
+    push(&mut cursor, 0); push(&mut cursor, AT_NULL);
+    push(&mut cursor, random_user_addr); push(&mut cursor, AT_RANDOM);
+    push(&mut cursor, info.entry); push(&mut cursor, AT_ENTRY);
+    push(&mut cursor, info.phnum as u64); push(&mut cursor, AT_PHNUM);
+    push(&mut cursor, info.phentsize as u64); push(&mut cursor, AT_PHENT);
+    push(&mut cursor, info.phdr_vaddr); push(&mut cursor, AT_PHDR);
+    push(&mut cursor, 4096); push(&mut cursor, AT_PAGESZ);
+    push(&mut cursor, 0); push(&mut cursor, AT_UID);  // AT_UID = 0 (root)
+
+    // 3. envp: NULL terminator (no environment variables).
+    push(&mut cursor, 0);
+
+    // 4. argv: NULL terminator (no arguments).
+    push(&mut cursor, 0);
+
+    // 5. argc = 0
+    push(&mut cursor, 0);
+
+    // Compute user RSP: same offset from user_top as cursor from kernel_top.
+    let offset_from_top = kernel_top - cursor;
+    let user_rsp = user_top - offset_from_top;
+    debug_assert!(user_rsp % 16 == 0, "user RSP must be 16-byte aligned");
+
+    user_rsp
 }
 
 /// Kernel-mode test: verify that two independently-created PML4s have
