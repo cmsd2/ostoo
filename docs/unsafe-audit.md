@@ -5,22 +5,24 @@ refactoring payoff.
 
 ---
 
-## 1. `libkernel/src/vga_buffer.rs` — Raw pointer to MMIO buffer
+## 1. `libkernel/src/vga_buffer.rs` — Raw pointer to MMIO buffer ✅ DONE
 
-`Writer` stores a raw `*mut Buffer` pointer and dereferences it with
+~~`Writer` stores a raw `*mut Buffer` pointer and dereferences it with
 `unsafe { &mut *self.buffer }` in **7 separate places**.  There is also a
-manual `unsafe impl Send` to paper over the raw pointer.
+manual `unsafe impl Send` to paper over the raw pointer.~~
 
-**Recommendations:**
+**Completed** (commit `75de8c4`):
 
-- Create a safe `VgaBuffer` wrapper that encapsulates the raw pointer and
-  provides bounds-checked `read_cell` / `write_cell` methods.  All `Writer`
-  methods would use the wrapper, eliminating every interior `unsafe` block
-  and the manual `Send` impl.
-- `set_hw_cursor` (currently `unsafe fn`) could become a safe method on the
-  wrapper.
-- The test at lines 503–504 uses `core::mem::transmute` on `u8 → Color` —
-  replace with `TryFrom` or a `from_u8` constructor.
+- Introduced a `VgaBuffer` safe wrapper that encapsulates the raw pointer
+  with `unsafe` confined to construction only.  Safe `read_cell` /
+  `write_cell` / `set_hw_cursor` methods replaced all interior `unsafe`
+  blocks in `Writer` methods and free functions.
+- `unsafe impl Send` moved from `Writer` to `VgaBuffer` with documented
+  invariant.
+- `set_hw_cursor` is now a safe method on `VgaBuffer` (was a standalone
+  `unsafe fn`).
+- `core::mem::transmute` in tests replaced with a new `Color::from_u8()`
+  constructor.
 
 ---
 
@@ -178,7 +180,7 @@ casts like `unsafe { &*((phys_off + addr) as *const PageTable) }`.
 | **High**   | `syscall.rs`              | ~8           | Eliminate `static mut`, validate user pointers   |
 | **High**   | `local_apic/mapped.rs`    | ~18          | Safe methods, unsafe-only construction           |
 | **High**   | `io_apic/mapped.rs`       | ~12          | Same + use `read_volatile` / `write_volatile`    |
-| **Medium** | `vga_buffer.rs`           | ~14          | `VgaBuffer` wrapper around raw pointer           |
+| **Medium** | `vga_buffer.rs`           | ~~~14~~     | ✅ Done — `VgaBuffer` wrapper                   |
 | **Medium** | `kernel_acpi.rs`          | ~16          | Generic volatile MMIO helpers                    |
 | **Medium** | `ring3.rs`                | ~8           | `zero_frame` / `copy_to_frame` on MemoryServices |
 | **Medium** | `gdt.rs`                  | 2            | `UnsafeCell` for TSS mutation                    |
