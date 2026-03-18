@@ -69,34 +69,55 @@ pointer without any validation.
 
 ---
 
-## 4. `apic/src/local_apic/mapped.rs` — Every method is `unsafe`
+## 4. `apic/src/local_apic/mapped.rs` — Every method is `unsafe` ✅ DONE
 
-`MappedLocalApic` has **15 public `unsafe` methods**.  The unsafety stems
+~~`MappedLocalApic` has **15 public `unsafe` methods**.  The unsafety stems
 from MMIO access via raw pointers in `read_reg_32` / `write_reg_32`, but
 the actual invariant is in *construction* (providing a valid base address),
-not in each register read/write.
+not in each register read/write.~~
 
-**Recommendations:**
+**Completed:**
 
-- Make `MappedLocalApic::new()` the sole `unsafe` boundary (with
+- `MappedLocalApic::new()` is now the sole `unsafe` boundary with documented
+  safety invariants.
+- All 15 public methods are now safe; `read_reg_32` / `write_reg_32` trait
+  impl uses `core::ptr::read_volatile` / `write_volatile`.
+- Callers in `apic/src/lib.rs` and `devices/src/vfs/proc_vfs.rs` updated —
+  dozens of `unsafe` blocks removed.
+
+~~**Recommendations:**~~
+
+~~- Make `MappedLocalApic::new()` the sole `unsafe` boundary (with
   documented safety invariants).
 - Register accessors use `read_volatile` / `write_volatile` internally but
   become safe methods.
-- Callers in `apic/src/lib.rs` would lose dozens of `unsafe` blocks.
+- Callers in `apic/src/lib.rs` would lose dozens of `unsafe` blocks.~~
 
 ---
 
-## 5. `apic/src/io_apic/mapped.rs` — Same pattern as local APIC
+## 5. `apic/src/io_apic/mapped.rs` — Same pattern as local APIC ✅ DONE
 
-Same issue — every public method is `unsafe`, and register access helpers
-use raw pointer dereferences without `read_volatile` / `write_volatile`.
+~~Same issue — every public method is `unsafe`, and register access helpers
+use raw pointer dereferences without `read_volatile` / `write_volatile`.~~
 
-**Recommendations:**
+**Completed:**
 
-- Move unsafety to construction; make methods safe.
+- `MappedIoApic::new()` is now the sole `unsafe` boundary with documented
+  safety invariants.  `base_addr` field made private with `base_addr()` getter.
+- All public methods (`mask_all`, `mask_entry`, `set_irq`,
+  `max_redirect_entries`, `read_version_raw`, `read_redirect_entry`) are now
+  safe.  Internal calls to the `IoApic` trait methods remain `unsafe` blocks.
+- `IoApic` trait impl (`read_reg_32` / `write_reg_32` / `read_reg_64` /
+  `write_reg_64`) now uses `core::ptr::read_volatile` / `write_volatile`
+  instead of raw dereferences — correct for MMIO.
+- Callers in `apic/src/lib.rs` and `devices/src/vfs/proc_vfs.rs` updated.
+
+~~**Recommendations:**~~
+
+~~- Move unsafety to construction; make methods safe.
 - Replace raw `*ptr` / `*ptr = val` with `core::ptr::read_volatile` /
   `write_volatile` — MMIO registers **must** use volatile access; plain
-  dereferences can be optimised away by the compiler.
+  dereferences can be optimised away by the compiler.~~
 
 ---
 
@@ -183,8 +204,8 @@ casts like `unsafe { &*((phys_off + addr) as *const PageTable) }`.
 |------------|---------------------------|--------------|-------------------------------------------------|
 | **High**   | `scheduler.rs`            | ~12          | `IretqFrame` struct, `drop_to_ring3` helper     |
 | **High**   | `syscall.rs`              | ~8           | Eliminate `static mut`, validate user pointers   |
-| **High**   | `local_apic/mapped.rs`    | ~18          | Safe methods, unsafe-only construction           |
-| **High**   | `io_apic/mapped.rs`       | ~12          | Same + use `read_volatile` / `write_volatile`    |
+| **High**   | `local_apic/mapped.rs`    | ~~18~~       | ✅ Done — safe methods, unsafe-only construction |
+| **High**   | `io_apic/mapped.rs`       | ~~12~~       | ✅ Done — same + `read_volatile` / `write_volatile` |
 | **Medium** | `vga_buffer.rs`           | ~~~14~~     | ✅ Done — `VgaBuffer` wrapper                   |
 | **Medium** | `kernel_acpi.rs`          | ~16          | Generic volatile MMIO helpers                    |
 | **Medium** | `ring3.rs`                | ~8           | `zero_frame` / `copy_to_frame` on MemoryServices |
