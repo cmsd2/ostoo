@@ -338,7 +338,7 @@ All Tier 1 items were completed in `95da4c0`:
 ### Tier 2: Structural improvements
 
 6. ~~Share path normalization between kernel shell and osl~~ ✅
-7. `ProcessManager` struct to encapsulate process table
+7. ~~`ProcessManager` struct to encapsulate process table~~ ✅
 8. Decompose `on_key` into a `LineEditor` state machine
 9. Decompose `preempt_tick` into smaller functions
 10. Break `sys_brk` / `sys_mmap` into validation + mapping

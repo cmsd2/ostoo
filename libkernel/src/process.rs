@@ -27,12 +27,6 @@ impl ProcessId {
     }
 }
 
-static NEXT_PID: AtomicU64 = AtomicU64::new(1);
-
-fn alloc_pid() -> ProcessId {
-    ProcessId(NEXT_PID.fetch_add(1, Ordering::Relaxed))
-}
-
 // ---------------------------------------------------------------------------
 // Process state
 
@@ -85,7 +79,7 @@ const MMAP_BASE: u64 = 0x0000_4000_0000_0000;
 
 impl Process {
     pub fn new(pml4_phys: PhysAddr, entry_point: u64, user_stack_top: u64, brk_base: u64) -> Self {
-        let pid = alloc_pid();
+        let pid = PROCESSES.alloc_pid();
         let mut kernel_stack = Vec::with_capacity(PROCESS_KERNEL_STACK_SIZE);
         kernel_stack.resize(PROCESS_KERNEL_STACK_SIZE, 0u8);
         let stack_top =
@@ -149,110 +143,152 @@ impl Process {
     }
 }
 
-/// Find a zombie child of `parent_pid` matching `target_pid` (or any if target == -1).
-/// Returns (child_pid, exit_code) if found.
-pub fn find_zombie_child(parent_pid: ProcessId, target_pid: i64) -> Option<(ProcessId, i32)> {
-    let table = PROCESS_TABLE.lock();
-    for p in table.values() {
-        if p.parent_pid != parent_pid || p.state != ProcessState::Zombie {
-            continue;
-        }
-        if target_pid == -1 || p.pid.as_u64() == target_pid as u64 {
-            return Some((p.pid, p.exit_code.unwrap_or(0)));
-        }
-    }
-    None
+// ---------------------------------------------------------------------------
+// ProcessManager — encapsulates the global process table and PID tracking
+
+pub struct ProcessManager {
+    table: Mutex<BTreeMap<ProcessId, Process>>,
+    current_pid: AtomicU64,
+    next_pid: AtomicU64,
 }
 
-/// Check whether `parent_pid` has any children (zombie or not).
-pub fn has_children(parent_pid: ProcessId) -> bool {
-    let table = PROCESS_TABLE.lock();
-    table.values().any(|p| p.parent_pid == parent_pid)
+pub static PROCESSES: ProcessManager = ProcessManager {
+    table: Mutex::new(BTreeMap::new()),
+    current_pid: AtomicU64::new(0),
+    next_pid: AtomicU64::new(1),
+};
+
+impl ProcessManager {
+    fn alloc_pid(&self) -> ProcessId {
+        ProcessId(self.next_pid.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub fn insert(&self, mut proc: Process) -> ProcessId {
+        let pid = proc.pid;
+        // Ensure state is Running on insert.
+        proc.state = ProcessState::Running;
+        self.table.lock().insert(pid, proc);
+        pid
+    }
+
+    pub fn current_pid(&self) -> ProcessId {
+        ProcessId(self.current_pid.load(Ordering::Relaxed))
+    }
+
+    pub fn set_current_pid(&self, pid: ProcessId) {
+        self.current_pid.store(pid.0, Ordering::Relaxed);
+    }
+
+    /// Run `f` with a mutable reference to the process. Returns `None` if not found.
+    pub fn with_process<F, R>(&self, pid: ProcessId, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Process) -> R,
+    {
+        let mut table = self.table.lock();
+        table.get_mut(&pid).map(f)
+    }
+
+    /// Run `f` with an immutable reference to the process.
+    pub fn with_process_ref<F, R>(&self, pid: ProcessId, f: F) -> Option<R>
+    where
+        F: FnOnce(&Process) -> R,
+    {
+        let table = self.table.lock();
+        table.get(&pid).map(f)
+    }
+
+    /// Check whether a process exists and is a zombie.
+    pub fn is_zombie(&self, pid: ProcessId) -> bool {
+        self.table.lock().get(&pid).map_or(false, |p| p.state == ProcessState::Zombie)
+    }
+
+    /// Mark the process as a zombie with the given exit code.
+    pub fn mark_zombie(&self, pid: ProcessId, code: i32) {
+        if let Some(proc) = self.table.lock().get_mut(&pid) {
+            proc.state = ProcessState::Zombie;
+            proc.exit_code = Some(code);
+        }
+    }
+
+    /// Remove the process from the table entirely, freeing its kernel stack.
+    /// In the future this is where we'd deallocate PML4 and user-space frames.
+    pub fn reap(&self, pid: ProcessId) {
+        self.table.lock().remove(&pid);
+    }
+
+    /// Reap all zombie processes whose scheduler threads are Dead.
+    ///
+    /// Safe to call from normal kernel context (not ISR).  Frees kernel stacks
+    /// and process table entries for processes that have fully exited.
+    pub fn reap_zombies(&self) {
+        use crate::task::scheduler;
+
+        let zombie_pids: Vec<ProcessId> = {
+            let table = self.table.lock();
+            table.values()
+                .filter(|p| p.state == ProcessState::Zombie)
+                .filter(|p| {
+                    // Only reap if the scheduler thread is actually Dead,
+                    // meaning it has been fully preempted away from.
+                    p.thread_idx.map_or(true, |idx| scheduler::is_thread_dead(idx))
+                })
+                .map(|p| p.pid)
+                .collect()
+        };
+        // Drop the table lock before reaping (reap takes the lock itself).
+        for pid in zombie_pids {
+            self.reap(pid);
+        }
+    }
+
+    /// Find a zombie child of `parent_pid` matching `target_pid` (or any if target == -1).
+    /// Returns (child_pid, exit_code) if found.
+    pub fn find_zombie_child(&self, parent_pid: ProcessId, target_pid: i64) -> Option<(ProcessId, i32)> {
+        let table = self.table.lock();
+        for p in table.values() {
+            if p.parent_pid != parent_pid || p.state != ProcessState::Zombie {
+                continue;
+            }
+            if target_pid == -1 || p.pid.as_u64() == target_pid as u64 {
+                return Some((p.pid, p.exit_code.unwrap_or(0)));
+            }
+        }
+        None
+    }
+
+    /// Check whether `parent_pid` has any children (zombie or not).
+    pub fn has_children(&self, parent_pid: ProcessId) -> bool {
+        let table = self.table.lock();
+        table.values().any(|p| p.parent_pid == parent_pid)
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Global process table
+// Free-function wrappers — delegate to PROCESSES for backward compatibility
 
-static PROCESS_TABLE: Mutex<BTreeMap<ProcessId, Process>> =
-    Mutex::new(BTreeMap::new());
+pub fn insert(proc: Process) -> ProcessId { PROCESSES.insert(proc) }
+pub fn current_pid() -> ProcessId { PROCESSES.current_pid() }
+pub fn set_current_pid(pid: ProcessId) { PROCESSES.set_current_pid(pid) }
 
-/// PID of the currently running process (0 = kernel thread).
-static CURRENT_PID: AtomicU64 = AtomicU64::new(0);
-
-pub fn insert(mut proc: Process) -> ProcessId {
-    let pid = proc.pid;
-    // Ensure state is Running on insert.
-    proc.state = ProcessState::Running;
-    PROCESS_TABLE.lock().insert(pid, proc);
-    pid
-}
-
-pub fn current_pid() -> ProcessId {
-    ProcessId(CURRENT_PID.load(Ordering::Relaxed))
-}
-
-pub fn set_current_pid(pid: ProcessId) {
-    CURRENT_PID.store(pid.0, Ordering::Relaxed);
-}
-
-/// Run `f` with a mutable reference to the process. Returns `None` if not found.
 pub fn with_process<F, R>(pid: ProcessId, f: F) -> Option<R>
-where
-    F: FnOnce(&mut Process) -> R,
-{
-    let mut table = PROCESS_TABLE.lock();
-    table.get_mut(&pid).map(f)
+where F: FnOnce(&mut Process) -> R {
+    PROCESSES.with_process(pid, f)
 }
 
-/// Run `f` with an immutable reference to the process.
 pub fn with_process_ref<F, R>(pid: ProcessId, f: F) -> Option<R>
-where
-    F: FnOnce(&Process) -> R,
-{
-    let table = PROCESS_TABLE.lock();
-    table.get(&pid).map(f)
+where F: FnOnce(&Process) -> R {
+    PROCESSES.with_process_ref(pid, f)
 }
 
-/// Check whether a process exists and is a zombie.
-pub fn is_zombie(pid: ProcessId) -> bool {
-    PROCESS_TABLE.lock().get(&pid).map_or(false, |p| p.state == ProcessState::Zombie)
+pub fn is_zombie(pid: ProcessId) -> bool { PROCESSES.is_zombie(pid) }
+pub fn mark_zombie(pid: ProcessId, code: i32) { PROCESSES.mark_zombie(pid, code) }
+pub fn reap(pid: ProcessId) { PROCESSES.reap(pid) }
+pub fn reap_zombies() { PROCESSES.reap_zombies() }
+
+pub fn find_zombie_child(parent_pid: ProcessId, target_pid: i64) -> Option<(ProcessId, i32)> {
+    PROCESSES.find_zombie_child(parent_pid, target_pid)
 }
 
-/// Mark the process as a zombie with the given exit code.
-pub fn mark_zombie(pid: ProcessId, code: i32) {
-    if let Some(proc) = PROCESS_TABLE.lock().get_mut(&pid) {
-        proc.state = ProcessState::Zombie;
-        proc.exit_code = Some(code);
-    }
-}
-
-/// Remove the process from the table entirely, freeing its kernel stack.
-/// In the future this is where we'd deallocate PML4 and user-space frames.
-pub fn reap(pid: ProcessId) {
-    PROCESS_TABLE.lock().remove(&pid);
-}
-
-/// Reap all zombie processes whose scheduler threads are Dead.
-///
-/// Safe to call from normal kernel context (not ISR).  Frees kernel stacks
-/// and process table entries for processes that have fully exited.
-pub fn reap_zombies() {
-    use crate::task::scheduler;
-
-    let zombie_pids: Vec<ProcessId> = {
-        let table = PROCESS_TABLE.lock();
-        table.values()
-            .filter(|p| p.state == ProcessState::Zombie)
-            .filter(|p| {
-                // Only reap if the scheduler thread is actually Dead,
-                // meaning it has been fully preempted away from.
-                p.thread_idx.map_or(true, |idx| scheduler::is_thread_dead(idx))
-            })
-            .map(|p| p.pid)
-            .collect()
-    };
-    // Drop the table lock before reaping (reap takes the lock itself).
-    for pid in zombie_pids {
-        reap(pid);
-    }
+pub fn has_children(parent_pid: ProcessId) -> bool {
+    PROCESSES.has_children(parent_pid)
 }
