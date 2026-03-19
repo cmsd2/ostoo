@@ -270,8 +270,8 @@ extern "x86-interrupt" fn invalid_opcode_handler(
     let kernel_gs_base: u64;
     unsafe {
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
-        gs_base = x86_64::registers::model_specific::Msr::new(0xC000_0101).read();
-        kernel_gs_base = x86_64::registers::model_specific::Msr::new(0xC000_0102).read();
+        gs_base = x86_64::registers::model_specific::Msr::new(crate::msr::IA32_GS_BASE).read();
+        kernel_gs_base = x86_64::registers::model_specific::Msr::new(crate::msr::IA32_KERNEL_GS_BASE).read();
     }
     serial_println!("CR3: {:#018x}  GS.BASE: {:#018x}  KERNEL_GS.BASE: {:#018x}",
         cr3, gs_base, kernel_gs_base);
@@ -353,10 +353,8 @@ extern "x86-interrupt" fn double_fault_handler(
         core::arch::asm!("mov {0:r}, ss", out(reg) ss_val, options(nostack, nomem));
         core::arch::asm!("mov {0:r}, ds", out(reg) ds_val, options(nostack, nomem));
         core::arch::asm!("mov {0:r}, es", out(reg) es_val, options(nostack, nomem));
-        // IA32_GS_BASE
-        gs_base = x86_64::registers::model_specific::Msr::new(0xC000_0101).read();
-        // IA32_KERNEL_GS_BASE
-        kernel_gs_base = x86_64::registers::model_specific::Msr::new(0xC000_0102).read();
+        gs_base = x86_64::registers::model_specific::Msr::new(crate::msr::IA32_GS_BASE).read();
+        kernel_gs_base = x86_64::registers::model_specific::Msr::new(crate::msr::IA32_KERNEL_GS_BASE).read();
     }
     serial_println!("CR2 (last page fault addr): {:#018x}", cr2);
     serial_println!("CR3 (active PML4):          {:#018x}", cr3);
@@ -433,7 +431,7 @@ extern "x86-interrupt" fn page_fault_handler(
         let rip = stack_frame.instruction_pointer.as_u64();
         let rsp = stack_frame.stack_pointer.as_u64();
         let fs_base = unsafe {
-            x86_64::registers::model_specific::Msr::new(0xC000_0100).read()
+            x86_64::registers::model_specific::Msr::new(crate::msr::IA32_FS_BASE).read()
         };
         error!(
             "ring-3 page fault at {:?} (pid {}, error: {:?}) — killing process\n  \

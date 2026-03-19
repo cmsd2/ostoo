@@ -1,5 +1,6 @@
 //! ELF process spawning with argv and parent PID support.
 
+use libkernel::consts::{PAGE_SIZE, PAGE_MASK};
 use libkernel::memory::with_memory;
 use libkernel::process::{Process, ProcessId};
 use x86_64::structures::paging::PageTableFlags;
@@ -7,7 +8,7 @@ use x86_64::VirtAddr;
 
 /// 8-page (32 KiB) user stack for ELF processes, placed at a high user address.
 const ELF_STACK_PAGES: usize = 8;
-const ELF_STACK_SIZE: u64 = (ELF_STACK_PAGES as u64) * 0x1000;
+const ELF_STACK_SIZE: u64 = (ELF_STACK_PAGES as u64) * PAGE_SIZE;
 const ELF_STACK_VIRT: u64 = 0x0000_7FFF_F000_0000;
 
 /// Spawn with argv and explicit parent.
@@ -38,18 +39,18 @@ pub fn spawn_process_full(
 
         // Map each PT_LOAD segment.
         for seg in &info.segments {
-            let page_start = seg.vaddr & !0xFFF;
-            let page_end = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
-            let num_pages = ((page_end - page_start) / 0x1000) as usize;
+            let page_start = seg.vaddr & !PAGE_MASK;
+            let page_end = (seg.vaddr + seg.memsz + PAGE_MASK) & !PAGE_MASK;
+            let num_pages = ((page_end - page_start) / PAGE_SIZE) as usize;
 
             for p in 0..num_pages {
-                let page_vaddr = page_start + (p as u64) * 0x1000;
+                let page_vaddr = page_start + (p as u64) * PAGE_SIZE;
                 let frame_phys = mem.alloc_dma_pages(1)
                     .expect("spawn_process: out of frames");
 
                 let dst_base = phys_off + frame_phys.as_u64();
                 unsafe {
-                    core::ptr::write_bytes(dst_base.as_mut_ptr::<u8>(), 0, 0x1000);
+                    libkernel::consts::clear_page(dst_base.as_mut_ptr::<u8>());
                 }
 
                 let page_off_in_seg = page_vaddr.wrapping_sub(seg.vaddr);
@@ -66,7 +67,7 @@ pub fn spawn_process_full(
 
                 if seg_offset_for_page < seg.filesz {
                     let avail = (seg.filesz - seg_offset_for_page) as usize;
-                    let room = 0x1000 - copy_start_in_page;
+                    let room = PAGE_SIZE as usize - copy_start_in_page;
                     let count = avail.min(room);
                     let src = &elf_data[(seg.offset + seg_offset_for_page) as usize..][..count];
                     unsafe {
@@ -103,13 +104,10 @@ pub fn spawn_process_full(
             );
         }
 
-        let stack_flags = PageTableFlags::PRESENT
-            | PageTableFlags::WRITABLE
-            | PageTableFlags::USER_ACCESSIBLE
-            | PageTableFlags::NO_EXECUTE;
+        let stack_flags = crate::dispatch::USER_DATA_FLAGS;
         for i in 0..ELF_STACK_PAGES {
-            let page_phys = x86_64::PhysAddr::new(stack_phys.as_u64() + (i as u64) * 0x1000);
-            let page_virt = VirtAddr::new(ELF_STACK_VIRT + (i as u64) * 0x1000);
+            let page_phys = x86_64::PhysAddr::new(stack_phys.as_u64() + (i as u64) * PAGE_SIZE);
+            let page_virt = VirtAddr::new(ELF_STACK_VIRT + (i as u64) * PAGE_SIZE);
             mem.map_user_page(pml4_phys, page_virt, page_phys, stack_flags)
                 .expect("spawn_process: failed to map stack page");
         }
@@ -123,7 +121,7 @@ pub fn spawn_process_full(
             .map(|s| s.vaddr + s.memsz)
             .max()
             .unwrap_or(0);
-        (max_end + 0xFFF) & !0xFFF
+        (max_end + PAGE_MASK) & !PAGE_MASK
     };
 
     // Build the initial user stack: argc/argv/envp/auxv.
@@ -235,7 +233,7 @@ fn build_initial_stack(
     push(&mut cursor, info.phnum as u64); push(&mut cursor, AT_PHNUM);
     push(&mut cursor, info.phentsize as u64); push(&mut cursor, AT_PHENT);
     push(&mut cursor, info.phdr_vaddr); push(&mut cursor, AT_PHDR);
-    push(&mut cursor, 4096); push(&mut cursor, AT_PAGESZ);
+    push(&mut cursor, PAGE_SIZE); push(&mut cursor, AT_PAGESZ);
     push(&mut cursor, 0); push(&mut cursor, AT_UID);
 
     // 4. envp: NULL terminator (no environment variables).

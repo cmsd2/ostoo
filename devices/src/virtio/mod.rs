@@ -34,7 +34,7 @@ unsafe impl Hal for KernelHal {
 
         let vaddr = phys_mem_offset() + paddr.as_u64() as usize;
         // Zero the allocation.
-        unsafe { core::ptr::write_bytes(vaddr as *mut u8, 0, pages * 4096); }
+        unsafe { core::ptr::write_bytes(vaddr as *mut u8, 0, pages * libkernel::consts::PAGE_SIZE as usize); }
 
         let paddr_usize = paddr.as_u64() as usize;
         (paddr_usize, NonNull::new(vaddr as *mut u8).unwrap())

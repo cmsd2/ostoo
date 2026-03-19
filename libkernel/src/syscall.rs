@@ -36,8 +36,8 @@ impl PerCpuCell {
 
 static PER_CPU: PerCpuCell = PerCpuCell::new();
 
-/// Dedicated kernel stack for SYSCALL entry (64 KiB).
-const SYSCALL_STACK_SIZE: usize = 64 * 1024;
+/// Dedicated kernel stack for SYSCALL entry.
+const SYSCALL_STACK_SIZE: usize = crate::consts::KERNEL_STACK_SIZE;
 #[repr(align(16))]
 struct SyscallStack([u8; SYSCALL_STACK_SIZE]);
 static SYSCALL_STACK: SyscallStack = SyscallStack([0; SYSCALL_STACK_SIZE]);
@@ -61,31 +61,31 @@ pub fn init(kernel_cs: u16, user_cs: u16) {
     unsafe { (*per_cpu_ptr).kernel_rsp = stack_top; }
 
     unsafe {
-        // IA32_GS_BASE (0xC000_0101): GS.BASE in ring 0 = kernel per-CPU.
-        Msr::new(0xC000_0101).write(per_cpu_ptr as u64);
-        // IA32_KERNEL_GS_BASE (0xC000_0102): restored after swapgs = user GS.
+        // IA32_GS_BASE: GS.BASE in ring 0 = kernel per-CPU.
+        Msr::new(crate::msr::IA32_GS_BASE).write(per_cpu_ptr as u64);
+        // IA32_KERNEL_GS_BASE: restored after swapgs = user GS.
         // Initially 0; will be set by arch_prctl(ARCH_SET_GS) when musl TLS
         // is initialised.  The syscall stub swaps on entry and exit.
-        Msr::new(0xC000_0102).write(0);
+        Msr::new(crate::msr::IA32_KERNEL_GS_BASE).write(0);
 
-        // IA32_STAR (0xC000_0081):
+        // IA32_STAR:
         //   bits[47:32] = kernel CS  → SYSCALL sets CS=kernel_cs, SS=kernel_cs+8
         //   bits[63:48] = user CS-16 → SYSRETQ sets CS=(+16)|3, SS=(+8)|3
         let star = ((kernel_cs as u64) << 32)
             | (((user_cs as u64).wrapping_sub(16)) << 48);
-        Msr::new(0xC000_0081).write(star);
+        Msr::new(crate::msr::IA32_STAR).write(star);
 
-        // IA32_LSTAR (0xC000_0082): 64-bit SYSCALL entry point.
-        Msr::new(0xC000_0082).write(syscall_entry as *const () as u64);
+        // IA32_LSTAR: 64-bit SYSCALL entry point.
+        Msr::new(crate::msr::IA32_LSTAR).write(syscall_entry as *const () as u64);
 
-        // IA32_FMASK (0xC000_0084): bits to clear in RFLAGS on SYSCALL.
+        // IA32_FMASK: bits to clear in RFLAGS on SYSCALL.
         // Clear IF (bit 9) to prevent interrupts in the entry stub, and
         // DF (bit 10) for the C ABI string direction convention.
-        Msr::new(0xC000_0084).write(0x0000_0300);
+        Msr::new(crate::msr::IA32_FMASK).write(0x0000_0300);
 
         // Enable SCE (Syscall Enable) in IA32_EFER (bit 0).
-        let efer = Msr::new(0xC000_0080).read();
-        Msr::new(0xC000_0080).write(efer | 1);
+        let efer = Msr::new(crate::msr::IA32_EFER).read();
+        Msr::new(crate::msr::IA32_EFER).write(efer | 1);
     }
 }
 

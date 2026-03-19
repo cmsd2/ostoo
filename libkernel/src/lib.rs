@@ -35,6 +35,8 @@ pub mod elf;
 pub mod md5;
 pub mod file;
 pub mod console;
+pub mod consts;
+pub mod msr;
 
 pub fn init() {
     cpuid::init();

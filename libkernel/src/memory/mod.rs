@@ -115,9 +115,9 @@ impl MemoryServices {
     /// New pages are mapped with PRESENT | WRITABLE | NO_CACHE flags.
     pub fn map_mmio_region(&mut self, phys_start: PhysAddr, size: usize) -> VirtAddr {
         // Work in page-aligned units.
-        let phys_base  = phys_start.as_u64() & !0xFFF; // round down to page
+        let phys_base  = phys_start.as_u64() & !crate::consts::PAGE_MASK; // round down to page
         let page_off   = (phys_start.as_u64() - phys_base) as usize;
-        let num_pages  = (size + page_off + 0xFFF) / 0x1000;
+        let num_pages  = (size + page_off + crate::consts::PAGE_MASK as usize) / crate::consts::PAGE_SIZE as usize;
 
         // Return the cached virtual address if this physical region was already
         // mapped.  The cache key is the page-aligned physical base.
@@ -127,7 +127,7 @@ impl MemoryServices {
 
         // Allocate virtual pages from the MMIO window.
         let virt_base = self.mmio_next;
-        self.mmio_next += num_pages as u64 * 0x1000;
+        self.mmio_next += num_pages as u64 * crate::consts::PAGE_SIZE;
         assert!(
             self.mmio_next <= MMIO_VIRT_BASE + MMIO_VIRT_SIZE,
             "MMIO virtual window exhausted"
@@ -139,9 +139,9 @@ impl MemoryServices {
 
         for i in 0..num_pages as u64 {
             let page = Page::<Size4KiB>::from_start_address(
-                VirtAddr::new(virt_base + i * 0x1000)
+                VirtAddr::new(virt_base + i * crate::consts::PAGE_SIZE)
             ).expect("map_mmio_region: unaligned virt page");
-            let phys  = PhysAddr::new(phys_base + i * 0x1000);
+            let phys  = PhysAddr::new(phys_base + i * crate::consts::PAGE_SIZE);
             let frame = PhysFrame::<Size4KiB>::containing_address(phys);
             unsafe {
                 self.mapper
@@ -168,11 +168,35 @@ impl MemoryServices {
             if i == 0 {
                 base = Some(paddr);
             } else {
-                let expected = PhysAddr::new(base.unwrap().as_u64() + (i as u64) * 4096);
+                let expected = PhysAddr::new(base.unwrap().as_u64() + (i as u64) * crate::consts::PAGE_SIZE);
                 assert_eq!(paddr, expected, "alloc_dma_pages: non-contiguous frames");
             }
         }
         base
+    }
+
+    /// Allocate, zero, and map `count` user pages starting at `vaddr_base`.
+    pub fn alloc_and_map_user_pages(
+        &mut self,
+        count: usize,
+        vaddr_base: u64,
+        pml4_phys: PhysAddr,
+        flags: PageTableFlags,
+    ) -> Result<(), ()> {
+        let phys_off = self.phys_mem_offset;
+        for i in 0..count {
+            let vaddr = vaddr_base + (i as u64) * crate::consts::PAGE_SIZE;
+            let frame = self.alloc_dma_pages(1).ok_or(())?;
+            let dst = phys_off + frame.as_u64();
+            unsafe { crate::consts::clear_page(dst.as_mut_ptr::<u8>()); }
+            self.map_user_page(
+                pml4_phys,
+                VirtAddr::new(vaddr),
+                frame,
+                flags,
+            ).map_err(|_| ())?;
+        }
+        Ok(())
     }
 
     /// `(frames_allocated, total_usable_frames)` since boot.

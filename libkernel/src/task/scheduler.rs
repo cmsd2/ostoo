@@ -83,7 +83,7 @@ struct Thread {
     /// RSP to a single per-CPU slot; we must save/restore it per-thread so
     /// that a blocked syscall resumes with the correct user stack.
     user_rsp: u64,
-    /// Saved FS_BASE (MSR 0xC000_0100).  musl uses FS-relative addressing
+    /// Saved FS_BASE (IA32_FS_BASE MSR).  musl uses FS-relative addressing
     /// for TLS (errno, etc.), so each user process needs its own FS_BASE.
     fs_base: u64,
 }
@@ -215,7 +215,7 @@ core::arch::global_asm!(
 ///
 /// Call once, after the heap allocator is initialised.
 pub fn migrate_to_heap_stack(continuation: fn() -> !) -> ! {
-    const STACK_SIZE: usize = 64 * 1024;
+    const STACK_SIZE: usize = crate::consts::KERNEL_STACK_SIZE;
     let mut stack: Vec<u8> = Vec::with_capacity(STACK_SIZE);
     stack.resize(STACK_SIZE, 0u8);
     let stack_top = (stack.as_ptr() as u64 + stack.len() as u64) & !0xF;
@@ -263,7 +263,7 @@ pub fn init() {
 /// The new thread is placed on the ready queue and will run at the next
 /// context switch.
 pub fn spawn_thread(entry: fn() -> !) {
-    const STACK_SIZE: usize = 64 * 1024; // 64 KiB
+    const STACK_SIZE: usize = crate::consts::KERNEL_STACK_SIZE;
 
     let mut stack: Vec<u8> = Vec::with_capacity(STACK_SIZE);
     // Safety: we immediately zero-initialise via resize.
@@ -420,11 +420,11 @@ unsafe fn drop_to_ring3(
     // polarity is unpredictable: a timer preemption of a previous user process
     // leaves user GS active, while a kernel thread leaves kernel GS active.
     // Writing both MSRs directly avoids this ambiguity.
-    //   IA32_GS_BASE (0xC000_0101) = 0         → user GS for ring 3
-    //   IA32_KERNEL_GS_BASE (0xC000_0102) = per_cpu → restored by syscall swapgs
+    //   IA32_GS_BASE = 0         → user GS for ring 3
+    //   IA32_KERNEL_GS_BASE = per_cpu → restored by syscall swapgs
     core::arch::asm!("cli", options(nostack, nomem));
-    x86_64::registers::model_specific::Msr::new(0xC000_0101).write(0);
-    x86_64::registers::model_specific::Msr::new(0xC000_0102).write(per_cpu);
+    x86_64::registers::model_specific::Msr::new(crate::msr::IA32_GS_BASE).write(0);
+    x86_64::registers::model_specific::Msr::new(crate::msr::IA32_KERNEL_GS_BASE).write(per_cpu);
 
     core::arch::asm!(
         "mov cr3, {pml4}",
@@ -552,7 +552,7 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
     sched.threads[current_idx].saved_rsp = current_rsp;
     sched.threads[current_idx].user_rsp = crate::syscall::get_user_rsp();
     sched.threads[current_idx].fs_base = unsafe {
-        x86_64::registers::model_specific::Msr::new(0xC000_0100).read()
+        x86_64::registers::model_specific::Msr::new(crate::msr::IA32_FS_BASE).read()
     };
 
     // Only re-queue the thread if it's Ready (not Dead or Blocked).
@@ -583,7 +583,7 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
 
     // Restore the incoming thread's saved user RSP and FS_BASE.
     crate::syscall::set_user_rsp(next_user_rsp);
-    unsafe { x86_64::registers::model_specific::Msr::new(0xC000_0100).write(next_fs_base); }
+    unsafe { x86_64::registers::model_specific::Msr::new(crate::msr::IA32_FS_BASE).write(next_fs_base); }
 
     // Update TSS.rsp0 and PER_CPU for user process threads; reset PID for kernel threads.
     match next_kind {

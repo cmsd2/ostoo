@@ -78,7 +78,7 @@ pub struct Process {
     pub wait_thread: Option<usize>,
 }
 
-const PROCESS_KERNEL_STACK_SIZE: usize = 64 * 1024;
+const PROCESS_KERNEL_STACK_SIZE: usize = crate::consts::KERNEL_STACK_SIZE;
 
 /// Default mmap region start (bump-down from here).
 const MMAP_BASE: u64 = 0x0000_4000_0000_0000;

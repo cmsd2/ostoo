@@ -96,7 +96,7 @@ fn run_kernel() -> ! {
     // Map the VGA framebuffer into the kernel high half so it is accessible
     // from isolated user page tables (entries 256–510 are shared).
     let vga_virt = libkernel::memory::with_memory(|mem| {
-        mem.map_mmio_region(x86_64::PhysAddr::new(0xb8000), 0x1000)
+        mem.map_mmio_region(x86_64::PhysAddr::new(0xb8000), libkernel::consts::PAGE_SIZE as usize)
     });
     libkernel::vga_buffer::remap_vga(vga_virt);
 

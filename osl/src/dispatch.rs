@@ -3,9 +3,18 @@
 //! This module lives in `osl` so it can directly access both `libkernel`
 //! (process, memory, scheduler) and `devices` (VFS) without callback trampolines.
 
-use x86_64::VirtAddr;
+use alloc::sync::Arc;
+use x86_64::structures::paging::PageTableFlags;
 
 use crate::errno;
+use crate::syscall_nr::*;
+use libkernel::consts::{PAGE_SIZE, PAGE_MASK};
+use libkernel::file::FileHandle;
+
+pub(crate) const USER_DATA_FLAGS: PageTableFlags = PageTableFlags::PRESENT
+    .union(PageTableFlags::WRITABLE)
+    .union(PageTableFlags::USER_ACCESSIBLE)
+    .union(PageTableFlags::NO_EXECUTE);
 
 /// Called from the assembly stub with the SysV64 calling convention.
 #[no_mangle]
@@ -32,29 +41,30 @@ fn syscall_inner(
     a4: u64, a5: u64,
 ) -> i64 {
     match nr {
-        0        => sys_read(a1, a2, a3),
-        1        => sys_write(a1, a2, a3),
-        2        => sys_open(a1, a2, a3),
-        3        => sys_close(a1),
-        5        => sys_fstat(a1, a2),
-        9        => sys_mmap(a1, a2, a3, a4, a5),
-        10       => 0, // mprotect — no-op
-        11       => 0, // munmap — stub (leak frames)
-        12       => sys_brk(a1),
-        8        => -errno::ESPIPE, // lseek — stdout is not seekable
-        16       => -errno::ENOTTY, // ioctl
-        20       => sys_writev(a1, a2, a3),
-        60 | 231 => sys_exit(a1 as i32),
-        61       => sys_wait4(a1, a2, a3),
-        79       => sys_getcwd(a1, a2),
-        80       => sys_chdir(a1),
-        158      => sys_arch_prctl(a1, a2),
-        202      => 0, // futex — stub (single-threaded, lock never contended)
-        217      => sys_getdents64(a1, a2, a3),
-        218      => sys_set_tid_address(),
-        273      => 0, // set_robust_list — no-op
-        500      => sys_spawn(a1, a2, a3, a4),
-        other    => {
+        SYS_READ           => sys_read(a1, a2, a3),
+        SYS_WRITE          => sys_write(a1, a2, a3),
+        SYS_OPEN           => sys_open(a1, a2, a3),
+        SYS_CLOSE          => sys_close(a1),
+        SYS_FSTAT          => sys_fstat(a1, a2),
+        SYS_LSEEK          => -errno::ESPIPE, // stdout is not seekable
+        SYS_MMAP           => sys_mmap(a1, a2, a3, a4, a5),
+        SYS_MPROTECT       => 0, // no-op
+        SYS_MUNMAP         => 0, // stub (leak frames)
+        SYS_BRK            => sys_brk(a1),
+        SYS_IOCTL          => -errno::ENOTTY,
+        SYS_WRITEV         => sys_writev(a1, a2, a3),
+        SYS_EXIT
+        | SYS_EXIT_GROUP   => sys_exit(a1 as i32),
+        SYS_WAIT4          => sys_wait4(a1, a2, a3),
+        SYS_GETCWD         => sys_getcwd(a1, a2),
+        SYS_CHDIR          => sys_chdir(a1),
+        SYS_ARCH_PRCTL     => sys_arch_prctl(a1, a2),
+        SYS_FUTEX          => 0, // stub (single-threaded, lock never contended)
+        SYS_GETDENTS64     => sys_getdents64(a1, a2, a3),
+        SYS_SET_TID_ADDRESS => sys_set_tid_address(),
+        SYS_SET_ROBUST_LIST => 0, // no-op
+        SYS_SPAWN          => sys_spawn(a1, a2, a3, a4),
+        other              => {
             log::warn!("unhandled syscall nr={} a1={:#x} a2={:#x} a3={:#x}",
                 other, a1, a2, a3);
             -errno::ENOSYS
@@ -85,6 +95,16 @@ fn read_user_string(ptr: u64, max_len: usize) -> Option<alloc::string::String> {
     }
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
     core::str::from_utf8(bytes).ok().map(|s| alloc::string::String::from(s))
+}
+
+/// Get a file handle from the current process's fd table, returning a Linux errno on failure.
+fn get_fd_handle(fd: u64) -> Result<Arc<dyn FileHandle>, i64> {
+    let pid = libkernel::process::current_pid();
+    match libkernel::process::with_process_ref(pid, |p| p.get_fd(fd as usize)) {
+        Some(Ok(h)) => Ok(h),
+        Some(Err(e)) => Err(errno::file_errno(e)),
+        None => Err(-errno::EBADF),
+    }
 }
 
 /// Resolve a path relative to the current process's CWD.
@@ -147,11 +167,9 @@ fn sys_write(fd: u64, buf: u64, count: u64) -> i64 {
     if !validate_user_buf(buf, count) {
         return -errno::EFAULT;
     }
-    let pid = libkernel::process::current_pid();
-    let handle = match libkernel::process::with_process_ref(pid, |p| p.get_fd(fd as usize)) {
-        Some(Ok(h)) => h,
-        Some(Err(e)) => return errno::file_errno(e),
-        None => return -errno::EBADF,
+    let handle = match get_fd_handle(fd) {
+        Ok(h) => h,
+        Err(e) => return e,
     };
     let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, count as usize) };
     match handle.write(bytes) {
@@ -184,7 +202,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
     const ARCH_SET_FS: u64 = 0x1002;
     match code {
         ARCH_SET_FS => {
-            unsafe { x86_64::registers::model_specific::Msr::new(0xC000_0100).write(addr); }
+            unsafe { x86_64::registers::model_specific::Msr::new(libkernel::msr::IA32_FS_BASE).write(addr); }
             0
         }
         _ => -errno::EINVAL,
@@ -196,11 +214,9 @@ fn sys_read(fd: u64, buf: u64, count: u64) -> i64 {
     if !validate_user_buf(buf, count) {
         return -errno::EFAULT;
     }
-    let pid = libkernel::process::current_pid();
-    let handle = match libkernel::process::with_process_ref(pid, |p| p.get_fd(fd as usize)) {
-        Some(Ok(h)) => h,
-        Some(Err(e)) => return errno::file_errno(e),
-        None => return -errno::EBADF,
+    let handle = match get_fd_handle(fd) {
+        Ok(h) => h,
+        Err(e) => return e,
     };
     let user_buf = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count as usize) };
     match handle.read(user_buf) {
@@ -228,7 +244,6 @@ fn sys_set_tid_address() -> i64 {
 fn sys_brk(addr: u64) -> i64 {
     use libkernel::process;
     use libkernel::memory::with_memory;
-    use x86_64::structures::paging::PageTableFlags;
 
     let pid = process::current_pid();
     if pid == process::ProcessId::KERNEL {
@@ -246,36 +261,16 @@ fn sys_brk(addr: u64) -> i64 {
         return brk_current as i64;
     }
 
-    let new_brk = (addr + 0xFFF) & !0xFFF;
+    let new_brk = (addr + PAGE_MASK) & !PAGE_MASK;
     if new_brk <= brk_current {
         process::with_process(pid, |p| p.brk_current = new_brk);
         return new_brk as i64;
     }
 
-    let pages_needed = ((new_brk - brk_current) / 0x1000) as usize;
+    let pages_needed = ((new_brk - brk_current) / PAGE_SIZE) as usize;
     let ok = with_memory(|mem| {
-        let phys_off = mem.phys_mem_offset();
-        for i in 0..pages_needed {
-            let vaddr = brk_current + (i as u64) * 0x1000;
-            let frame = match mem.alloc_dma_pages(1) {
-                Some(f) => f,
-                None => return false,
-            };
-            let dst = phys_off + frame.as_u64();
-            unsafe { core::ptr::write_bytes(dst.as_mut_ptr::<u8>(), 0, 0x1000); }
-            if mem.map_user_page(
-                pml4_phys,
-                VirtAddr::new(vaddr),
-                frame,
-                PageTableFlags::PRESENT
-                    | PageTableFlags::WRITABLE
-                    | PageTableFlags::USER_ACCESSIBLE
-                    | PageTableFlags::NO_EXECUTE,
-            ).is_err() {
-                return false;
-            }
-        }
-        true
+        mem.alloc_and_map_user_pages(pages_needed, brk_current, pml4_phys, USER_DATA_FLAGS)
+            .is_ok()
     });
 
     if ok {
@@ -287,11 +282,9 @@ fn sys_brk(addr: u64) -> i64 {
 }
 
 fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
-    let pid = libkernel::process::current_pid();
-    let handle = match libkernel::process::with_process_ref(pid, |p| p.get_fd(fd as usize)) {
-        Some(Ok(h)) => h,
-        Some(Err(e)) => return errno::file_errno(e),
-        None => return -errno::EBADF,
+    let handle = match get_fd_handle(fd) {
+        Ok(h) => h,
+        Err(e) => return e,
     };
     let mut total: usize = 0;
     for i in 0..iovcnt as usize {
@@ -322,7 +315,6 @@ fn sys_close(fd: u64) -> i64 {
 fn sys_mmap(addr: u64, length: u64, _prot: u64, flags: u64, _a5: u64) -> i64 {
     use libkernel::process;
     use libkernel::memory::with_memory;
-    use x86_64::structures::paging::PageTableFlags;
 
     const MAP_ANONYMOUS: u64 = 0x20;
     const MAP_PRIVATE: u64 = 0x02;
@@ -341,8 +333,8 @@ fn sys_mmap(addr: u64, length: u64, _prot: u64, flags: u64, _a5: u64) -> i64 {
         return -errno::ENOMEM;
     }
 
-    let aligned_len = (length + 0xFFF) & !0xFFF;
-    let num_pages = (aligned_len / 0x1000) as usize;
+    let aligned_len = (length + PAGE_MASK) & !PAGE_MASK;
+    let num_pages = (aligned_len / PAGE_SIZE) as usize;
 
     let (mmap_next, pml4_phys) = match process::with_process_ref(pid, |p| {
         (p.mmap_next, p.pml4_phys)
@@ -354,28 +346,8 @@ fn sys_mmap(addr: u64, length: u64, _prot: u64, flags: u64, _a5: u64) -> i64 {
     let region_base = mmap_next - aligned_len;
 
     let ok = with_memory(|mem| {
-        let phys_off = mem.phys_mem_offset();
-        for i in 0..num_pages {
-            let vaddr = region_base + (i as u64) * 0x1000;
-            let frame = match mem.alloc_dma_pages(1) {
-                Some(f) => f,
-                None => return false,
-            };
-            let dst = phys_off + frame.as_u64();
-            unsafe { core::ptr::write_bytes(dst.as_mut_ptr::<u8>(), 0, 0x1000); }
-            if mem.map_user_page(
-                pml4_phys,
-                VirtAddr::new(vaddr),
-                frame,
-                PageTableFlags::PRESENT
-                    | PageTableFlags::WRITABLE
-                    | PageTableFlags::USER_ACCESSIBLE
-                    | PageTableFlags::NO_EXECUTE,
-            ).is_err() {
-                return false;
-            }
-        }
-        true
+        mem.alloc_and_map_user_pages(num_pages, region_base, pml4_phys, USER_DATA_FLAGS)
+            .is_ok()
     });
 
     if ok {
@@ -443,11 +415,9 @@ fn sys_getdents64(fd: u64, buf: u64, count: u64) -> i64 {
     if !validate_user_buf(buf, count) {
         return -errno::EFAULT;
     }
-    let pid = libkernel::process::current_pid();
-    let handle = match libkernel::process::with_process_ref(pid, |p| p.get_fd(fd as usize)) {
-        Some(Ok(h)) => h,
-        Some(Err(e)) => return errno::file_errno(e),
-        None => return -errno::EBADF,
+    let handle = match get_fd_handle(fd) {
+        Ok(h) => h,
+        Err(e) => return e,
     };
     let user_buf = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count as usize) };
     match handle.getdents64(user_buf) {

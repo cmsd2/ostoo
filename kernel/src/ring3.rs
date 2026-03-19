@@ -1,5 +1,6 @@
 //! Ring-3 execution: test helpers and ELF process spawning.
 
+use libkernel::consts::PAGE_SIZE;
 use libkernel::memory::with_memory;
 use libkernel::process::ProcessId;
 use x86_64::structures::paging::PageTableFlags;
@@ -7,7 +8,7 @@ use x86_64::VirtAddr;
 
 const USER_CODE_VIRT: u64  = 0x0040_0000;
 const USER_STACK_VIRT: u64 = 0x0050_0000;
-const USER_STACK_TOP: u64  = USER_STACK_VIRT + 0x1000;
+const USER_STACK_TOP: u64  = USER_STACK_VIRT + PAGE_SIZE;
 
 
 // ---------------------------------------------------------------------------
@@ -62,19 +63,19 @@ fn spawn_blob(code: &[u8]) -> ProcessId {
     // Free kernel stacks of previously exited processes so the heap doesn't run out.
     libkernel::process::reap_zombies();
 
-    assert!(code.len() <= 0x1000, "ring3 code blob exceeds one page");
+    assert!(code.len() <= PAGE_SIZE as usize, "ring3 code blob exceeds one page");
 
     let pml4_phys = with_memory(|mem| {
         let code_phys = mem.alloc_dma_pages(1).expect("ring3: out of frames (code)");
         let dst = mem.phys_mem_offset() + code_phys.as_u64();
         unsafe {
-            core::ptr::write_bytes(dst.as_mut_ptr::<u8>(), 0, 0x1000);
+            libkernel::consts::clear_page(dst.as_mut_ptr::<u8>());
             core::ptr::copy_nonoverlapping(code.as_ptr(), dst.as_mut_ptr::<u8>(), code.len());
         }
 
         let stack_phys = mem.alloc_dma_pages(1).expect("ring3: out of frames (stack)");
         let stack_dst = mem.phys_mem_offset() + stack_phys.as_u64();
-        unsafe { core::ptr::write_bytes(stack_dst.as_mut_ptr::<u8>(), 0, 0x1000); }
+        unsafe { libkernel::consts::clear_page(stack_dst.as_mut_ptr::<u8>()); }
 
         let pml4_phys = mem.create_user_page_table();
 
