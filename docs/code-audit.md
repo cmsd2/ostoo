@@ -243,17 +243,12 @@ methods (`submit`, `backspace`, `delete_forward`, `move_left/right`,
 `history_up/down`, etc.).  `on_key` is now a thin one-liner-per-key
 dispatch table.
 
-### 4.2 `scheduler.rs:preempt_tick` — 102 lines
+### ~~4.2 `scheduler.rs:preempt_tick` — 102 lines~~ ✅ DONE
 
-The timer ISR does everything: tick → save context → select next →
-restore context → switch address space → update tracking.
-
-**Fix:** Decompose into:
-
-- `save_current_context(idx: usize)`
-- `select_next_thread() -> usize`
-- `restore_thread(idx: usize)`
-- `switch_address_space_if_needed(prev_pml4, next_pml4)`
+**Fixed** alongside item 9.  Decomposed into `save_current_context()`,
+`restore_thread_state()` (via `SwitchTarget` struct), and
+`debug_check_initial_alignment()`.  `preempt_tick` itself has zero direct
+`unsafe` blocks.
 
 ### 4.3 `dispatch.rs:sys_mmap` — 68 lines
 
@@ -276,15 +271,10 @@ single nesting level.
 
 ## 5. Other Code Smells
 
-### 5.1 Repeated runnable-state check
+### ~~5.1 Repeated runnable-state check~~ ✅ DONE
 
-`scheduler.rs` lines 543 and 559 both check:
-
-```rust
-if cur_state != ThreadState::Dead && cur_state != ThreadState::Blocked { ... }
-```
-
-**Fix:** `fn is_runnable(state: ThreadState) -> bool`
+**Fixed** alongside item 9.  `ThreadState::is_runnable()` method replaces
+the two identical `!= Dead && != Blocked` checks.
 
 ### 5.2 VFS blocking wrappers
 
@@ -319,7 +309,7 @@ All Tier 1 items were completed in `95da4c0`:
 6. ~~Share path normalization between kernel shell and osl~~ ✅
 7. ~~`ProcessManager` struct to encapsulate process table~~ ✅
 8. ~~Decompose `on_key` into a `LineEditor` state machine~~ ✅
-9. Decompose `preempt_tick` into smaller functions
+9. ~~Decompose `preempt_tick` into smaller functions~~ ✅
 10. Break `sys_brk` / `sys_mmap` into validation + mapping
 
 ### Tier 3: Architectural refinements

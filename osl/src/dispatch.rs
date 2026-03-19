@@ -174,7 +174,9 @@ fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
     const ARCH_SET_FS: u64 = 0x1002;
     match code {
         ARCH_SET_FS => {
-            unsafe { x86_64::registers::model_specific::Msr::new(libkernel::msr::IA32_FS_BASE).write(addr); }
+            // Safety: `addr` comes from userspace via arch_prctl(ARCH_SET_FS)
+            // and will be used as the TLS base for FS-relative accesses.
+            unsafe { libkernel::msr::write_fs_base(addr); }
             0
         }
         _ => -errno::EINVAL,

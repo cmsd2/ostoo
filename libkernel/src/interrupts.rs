@@ -430,9 +430,7 @@ extern "x86-interrupt" fn page_fault_handler(
         let pid = process::current_pid();
         let rip = stack_frame.instruction_pointer.as_u64();
         let rsp = stack_frame.stack_pointer.as_u64();
-        let fs_base = unsafe {
-            x86_64::registers::model_specific::Msr::new(crate::msr::IA32_FS_BASE).read()
-        };
+        let fs_base = crate::msr::read_fs_base();
         error!(
             "ring-3 page fault at {:?} (pid {}, error: {:?}) — killing process\n  \
              RIP={:#x} RSP={:#x} FS_BASE={:#x}",

@@ -55,6 +55,13 @@ enum ThreadState {
     Dead,
 }
 
+impl ThreadState {
+    /// Returns `true` if the thread can be scheduled (not Dead or Blocked).
+    fn is_runnable(self) -> bool {
+        self != ThreadState::Dead && self != ThreadState::Blocked
+    }
+}
+
 /// What kind of schedulable entity this thread represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedulableKind {
@@ -514,6 +521,79 @@ pub fn unblock(thread_idx: usize) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// preempt_tick helpers — extracted to shrink the unsafe surface
+
+/// Save the current thread's RSP, user RSP, and FS_BASE.
+fn save_current_context(thread: &mut Thread, current_rsp: u64) {
+    thread.saved_rsp = current_rsp;
+    thread.user_rsp = crate::syscall::get_user_rsp();
+    thread.fs_base = crate::msr::read_fs_base();
+}
+
+/// Snapshot of the state needed to restore a thread after the scheduler lock
+/// is released.
+struct SwitchTarget {
+    next_rsp: u64,
+    next_user_rsp: u64,
+    next_fs_base: u64,
+    cur_pml4: u64,
+    next_pml4: u64,
+    next_kind: SchedulableKind,
+    next_kstack_top: u64,
+    next_idx: usize,
+}
+
+/// Restore CPU state for the incoming thread: user RSP, FS_BASE, TSS rsp0,
+/// PER_CPU kernel RSP, current PID, and address space.
+fn restore_thread_state(target: &SwitchTarget) {
+    crate::syscall::set_user_rsp(target.next_user_rsp);
+    // Safety: `next_fs_base` was saved from a valid thread's FS_BASE in
+    // `save_current_context` and is being restored to the same thread.
+    unsafe { crate::msr::write_fs_base(target.next_fs_base); }
+
+    match target.next_kind {
+        SchedulableKind::UserProcess(pid) => {
+            crate::gdt::set_kernel_stack(x86_64::VirtAddr::new(target.next_kstack_top));
+            crate::syscall::set_kernel_rsp(target.next_kstack_top);
+            crate::process::set_current_pid(pid);
+        }
+        SchedulableKind::Kernel => {
+            crate::process::set_current_pid(ProcessId::KERNEL);
+        }
+    }
+
+    if target.next_pml4 != target.cur_pml4 {
+        // Safety: `next_pml4` was read from the Thread struct and is a valid
+        // PML4 physical address set up during process creation.
+        unsafe {
+            crate::memory::switch_address_space(x86_64::PhysAddr::new(target.next_pml4));
+        }
+    }
+
+    CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
+    CURRENT_THREAD_IDX_ATOMIC.store(target.next_idx, Ordering::Relaxed);
+    crate::vga_buffer::timeline_append(target.next_idx);
+}
+
+/// Sanity-check alignment for a brand-new thread's first dispatch.
+///
+/// The stub will pop 15 GPRs then iretq.  For a new thread the iretq RSP
+/// should be 8 mod 16 (SysV ABI entry alignment).
+fn debug_check_initial_alignment(next_rsp: u64, next_idx: usize) {
+    // Safety: `next_rsp + FXSAVE_SIZE` points to a SwitchFrame that was
+    // written by `spawn_thread` / `spawn_user_thread` on a valid kernel stack.
+    let frame = unsafe { &*((next_rsp + FXSAVE_SIZE as u64) as *const SwitchFrame) };
+    if frame.rip == (process_trampoline as *const () as u64)
+        || frame.rsp == next_rsp
+    {
+        if frame.rsp & 0xF != 8 {
+            serial_println!("[preempt_tick] WARNING: thread {} initial iretq RSP={:#x} (mod16={}) — MISALIGNED!",
+                next_idx, frame.rsp, frame.rsp & 0xF);
+        }
+    }
+}
+
 /// Called by the LAPIC timer assembly stub on every tick.
 ///
 /// Receives the current thread's RSP (pointing to the saved-register area on
@@ -525,9 +605,7 @@ pub fn unblock(thread_idx: usize) {
 /// disabled (the CPU clears IF on IDT dispatch).
 #[no_mangle]
 unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
-    // Advance the global tick counter and wake any sleeping tasks.
     crate::task::timer::tick();
-    // Acknowledge the interrupt so the LAPIC can deliver the next one.
     crate::interrupts::lapic_eoi();
 
     let mut sched = SCHEDULER.lock();
@@ -540,24 +618,17 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
 
     // Decrement the running thread's quantum; keep running if ticks remain
     // (unless the thread is Dead or Blocked, in which case we must switch away).
-    let cur_state = sched.threads[current_idx].state;
-    if cur_state != ThreadState::Dead && cur_state != ThreadState::Blocked {
+    if sched.threads[current_idx].state.is_runnable() {
         sched.threads[current_idx].ticks_remaining -= 1;
         if sched.threads[current_idx].ticks_remaining > 0 {
             return current_rsp;
         }
     }
 
-    // Save context of the current thread.
-    sched.threads[current_idx].saved_rsp = current_rsp;
-    sched.threads[current_idx].user_rsp = crate::syscall::get_user_rsp();
-    sched.threads[current_idx].fs_base = unsafe {
-        x86_64::registers::model_specific::Msr::new(crate::msr::IA32_FS_BASE).read()
-    };
+    save_current_context(&mut sched.threads[current_idx], current_rsp);
 
-    // Only re-queue the thread if it's Ready (not Dead or Blocked).
-    let cur_state = sched.threads[current_idx].state;
-    if cur_state != ThreadState::Dead && cur_state != ThreadState::Blocked {
+    // Only re-queue the thread if it's runnable (not Dead or Blocked).
+    if sched.threads[current_idx].state.is_runnable() {
         sched.threads[current_idx].state = ThreadState::Ready;
         sched.ready_queue.push_back(current_idx);
     }
@@ -565,64 +636,27 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
     // Round-robin: pop from the front of the ready queue.
     let next_idx = match sched.ready_queue.pop_front() {
         Some(idx) => idx,
-        None => return current_rsp, // no other thread ready; stay on current
+        None => return current_rsp,
     };
 
     sched.current_idx = next_idx;
     sched.threads[next_idx].state = ThreadState::Running;
     sched.threads[next_idx].ticks_remaining = QUANTUM_TICKS;
 
-    let next_rsp         = sched.threads[next_idx].saved_rsp;
-    let next_user_rsp    = sched.threads[next_idx].user_rsp;
-    let next_fs_base     = sched.threads[next_idx].fs_base;
-    let cur_pml4         = sched.threads[current_idx].pml4_phys;
-    let next_pml4        = sched.threads[next_idx].pml4_phys;
-    let next_kind        = sched.threads[next_idx].kind;
-    let next_kstack_top  = sched.threads[next_idx].kernel_stack_top;
-    drop(sched); // release before touching other subsystems
+    let target = SwitchTarget {
+        next_rsp:       sched.threads[next_idx].saved_rsp,
+        next_user_rsp:  sched.threads[next_idx].user_rsp,
+        next_fs_base:   sched.threads[next_idx].fs_base,
+        cur_pml4:       sched.threads[current_idx].pml4_phys,
+        next_pml4:      sched.threads[next_idx].pml4_phys,
+        next_kind:      sched.threads[next_idx].kind,
+        next_kstack_top: sched.threads[next_idx].kernel_stack_top,
+        next_idx,
+    };
+    drop(sched);
 
-    // Restore the incoming thread's saved user RSP and FS_BASE.
-    crate::syscall::set_user_rsp(next_user_rsp);
-    unsafe { x86_64::registers::model_specific::Msr::new(crate::msr::IA32_FS_BASE).write(next_fs_base); }
+    restore_thread_state(&target);
+    debug_check_initial_alignment(target.next_rsp, target.next_idx);
 
-    // Update TSS.rsp0 and PER_CPU for user process threads; reset PID for kernel threads.
-    match next_kind {
-        SchedulableKind::UserProcess(pid) => {
-            crate::gdt::set_kernel_stack(x86_64::VirtAddr::new(next_kstack_top));
-            crate::syscall::set_kernel_rsp(next_kstack_top);
-            crate::process::set_current_pid(pid);
-        }
-        SchedulableKind::Kernel => {
-            crate::process::set_current_pid(ProcessId::KERNEL);
-        }
-    }
-
-    // Switch address space when the new thread lives in a different PML4.
-    // Kernel threads all share the boot PML4 so this is a no-op for them.
-    if next_pml4 != cur_pml4 {
-        unsafe {
-            crate::memory::switch_address_space(x86_64::PhysAddr::new(next_pml4));
-        }
-    }
-
-    CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
-    CURRENT_THREAD_IDX_ATOMIC.store(next_idx, Ordering::Relaxed);
-    crate::vga_buffer::timeline_append(next_idx);
-
-    // Sanity-check: the stub will pop 15 GPRs then iretq.  For a brand-new
-    // thread the iretq RSP should be 8 mod 16 (SysV ABI entry alignment).
-    // We check the saved RIP: if it matches a known entry function, this is a
-    // first dispatch and we validate RSP alignment.
-    // SwitchFrame sits above the FXSAVE area: saved_rsp → FXSAVE (512) → SwitchFrame
-    let frame = unsafe { &*((next_rsp + FXSAVE_SIZE as u64) as *const SwitchFrame) };
-    if frame.rip == (process_trampoline as *const () as u64)
-        || frame.rsp == next_rsp  // old pattern where RSP == saved_rsp
-    {
-        if frame.rsp & 0xF != 8 {
-            serial_println!("[preempt_tick] WARNING: thread {} initial iretq RSP={:#x} (mod16={}) — MISALIGNED!",
-                next_idx, frame.rsp, frame.rsp & 0xF);
-        }
-    }
-
-    next_rsp
+    target.next_rsp
 }
