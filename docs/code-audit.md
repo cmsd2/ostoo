@@ -109,12 +109,11 @@ write non-zero data were not replaced.)
 **Fixed in** `95da4c0`.  `USER_DATA_FLAGS` constant in
 `osl/src/dispatch.rs` replaces 3 identical flag expressions.
 
-### 2.5 Path normalization — duplicated between crates
+### ~~2.5 Path normalization — duplicated between crates~~ ✅ DONE
 
-`kernel/src/shell.rs:34-68` and `osl/src/dispatch.rs:105-124` both
-implement path normalization (handling `.`, `..`, leading `/`, etc.).
-
-**Fix:** Move to `libkernel/src/path.rs` and import from both.
+**Fixed in** `libkernel/src/path.rs`.  `normalize()` and `resolve()` are
+now shared; `kernel/src/shell.rs` and `osl/src/dispatch.rs` both delegate
+to `libkernel::path`.
 
 ### 2.6 History entry restoration — `keyboard_actor.rs`
 
@@ -338,7 +337,7 @@ All Tier 1 items were completed in `95da4c0`:
 
 ### Tier 2: Structural improvements
 
-6. Share path normalization between kernel shell and osl
+6. ~~Share path normalization between kernel shell and osl~~ ✅
 7. `ProcessManager` struct to encapsulate process table
 8. Decompose `on_key` into a `LineEditor` state machine
 9. Decompose `preempt_tick` into smaller functions

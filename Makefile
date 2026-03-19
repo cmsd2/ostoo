@@ -18,6 +18,7 @@ run-disk: build
 	scripts/run-disk.sh
 
 test:
+	cargo test --manifest-path libkernel/Cargo.toml
 	cargo test --manifest-path kernel/Cargo.toml
 
 clean:

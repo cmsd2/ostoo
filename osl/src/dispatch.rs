@@ -112,35 +112,7 @@ fn resolve_user_path(path: &str) -> alloc::string::String {
     let pid = libkernel::process::current_pid();
     let cwd = libkernel::process::with_process_ref(pid, |p| p.cwd.clone())
         .unwrap_or_else(|| alloc::string::String::from("/"));
-    if path.starts_with('/') {
-        normalize_path(path)
-    } else {
-        let mut base = cwd;
-        if !base.ends_with('/') { base.push('/'); }
-        base.push_str(path);
-        normalize_path(&base)
-    }
-}
-
-fn normalize_path(path: &str) -> alloc::string::String {
-    let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
-    for seg in path.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => { parts.pop(); }
-            s => parts.push(s),
-        }
-    }
-    if parts.is_empty() {
-        alloc::string::String::from("/")
-    } else {
-        let mut out = alloc::string::String::new();
-        for p in &parts {
-            out.push('/');
-            out.push_str(p);
-        }
-        out
-    }
+    libkernel::path::resolve(&cwd, path)
 }
 
 // ---------------------------------------------------------------------------

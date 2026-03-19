@@ -121,6 +121,7 @@ vs `$` for the userspace shell).
 | [`docs/lapic-timer.md`](docs/lapic-timer.md) | LAPIC timer calibration |
 | [`docs/paging.md`](docs/paging.md) | Paging and memory management |
 | [`docs/cross-compiling-c.md`](docs/cross-compiling-c.md) | Cross-compiling C for the kernel |
+| [`docs/testing.md`](docs/testing.md) | Testing strategy and infrastructure |
 | [`docs/code-audit.md`](docs/code-audit.md) | Code quality audit and improvement tracking |
 
 ## License
