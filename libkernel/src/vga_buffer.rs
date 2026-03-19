@@ -474,6 +474,74 @@ pub fn print_status_bar(args: fmt::Arguments) {
 }
 
 // ---------------------------------------------------------------------------
+// Boot progress bar (row 2)
+
+const PROGRESS_ROW: usize = 2;
+const BAR_LEFT: usize = 2;   // " ["
+const BAR_WIDTH: usize = 30;
+const BAR_RIGHT: usize = BAR_LEFT + BAR_WIDTH; // "] "
+const LABEL_START: usize = BAR_RIGHT + 2;
+
+/// Draw a boot progress bar on VGA row 2.
+///
+/// `step` is 1-based (1 = first step done).  The bar fills proportionally.
+/// `label` describes the step just completed (or in progress).
+/// Call with `step == total` on the final step; call [`boot_progress_done`]
+/// afterwards to clear the row.
+pub fn boot_progress(step: usize, total: usize, label: &str) {
+    let mut w = WRITER.lock();
+
+    let filled = if total == 0 { 0 } else { (step * BAR_WIDTH) / total };
+    let bar_fg = ColorCode::new(Color::LightGreen, Color::Black);
+    let bar_bg = ColorCode::new(Color::DarkGray, Color::Black);
+    let bracket_color = ColorCode::new(Color::White, Color::Black);
+    let label_color = ColorCode::new(Color::LightGray, Color::Black);
+    let blank = ScreenChar { ascii_character: b' ', color_code: label_color };
+
+    // " ["
+    w.buffer.write_cell(PROGRESS_ROW, 0, ScreenChar { ascii_character: b' ', color_code: bracket_color });
+    w.buffer.write_cell(PROGRESS_ROW, 1, ScreenChar { ascii_character: b'[', color_code: bracket_color });
+
+    // Bar: filled portion uses 0xDB (█), empty uses 0xB0 (░)
+    for i in 0..BAR_WIDTH {
+        let (ch, color) = if i < filled { (0xDB, bar_fg) } else { (0xB0, bar_bg) };
+        w.buffer.write_cell(PROGRESS_ROW, BAR_LEFT + i, ScreenChar {
+            ascii_character: ch,
+            color_code: color,
+        });
+    }
+
+    // "] "
+    w.buffer.write_cell(PROGRESS_ROW, BAR_RIGHT, ScreenChar { ascii_character: b']', color_code: bracket_color });
+    w.buffer.write_cell(PROGRESS_ROW, BAR_RIGHT + 1, ScreenChar { ascii_character: b' ', color_code: bracket_color });
+
+    // Label text (pad/truncate to fill the rest of the row)
+    let label_bytes = label.as_bytes();
+    for col in LABEL_START..BUFFER_WIDTH {
+        let i = col - LABEL_START;
+        if i < label_bytes.len() {
+            let b = label_bytes[i];
+            let ch = if (0x20..=0x7e).contains(&b) { b } else { b'?' };
+            w.buffer.write_cell(PROGRESS_ROW, col, ScreenChar { ascii_character: ch, color_code: label_color });
+        } else {
+            w.buffer.write_cell(PROGRESS_ROW, col, blank);
+        }
+    }
+}
+
+/// Clear the boot progress row after init is complete.
+pub fn boot_progress_done() {
+    let mut w = WRITER.lock();
+    let blank = ScreenChar {
+        ascii_character: b' ',
+        color_code: ColorCode::new(Color::Yellow, Color::Black),
+    };
+    for col in 0..BUFFER_WIDTH {
+        w.buffer.write_cell(PROGRESS_ROW, col, blank);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Timeline event queue — ISR producer, async actor consumer
 
 static TIMELINE_QUEUE: OnceCell<ArrayQueue<usize>> = OnceCell::uninit();

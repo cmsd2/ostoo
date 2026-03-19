@@ -102,13 +102,38 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
 // Kernel main (runs on heap stack)
 
 fn run_kernel() -> ! {
+    const BOOT_STEPS: usize = 7;
+    let progress = |step, label| libkernel::vga_buffer::boot_progress(step, BOOT_STEPS, label);
+
+    progress(0, "Remapping VGA...");
     init_vga_remap();
+    progress(1, "VGA remapped");
+
+    progress(1, "Configuring interrupts...");
     init_apic();
+    progress(2, "Interrupts configured");
+
+    progress(2, "Scanning PCI bus...");
     init_pci();
+    progress(3, "PCI bus scanned");
+
+    progress(3, "Probing virtio-blk...");
     init_virtio_blk();
+    progress(4, "virtio-blk done");
+
+    progress(4, "Probing virtio-9p...");
     let p9_client = init_virtio_9p();
+    progress(5, "virtio-9p done");
+
+    progress(5, "Mounting filesystems...");
     init_vfs_mounts(p9_client);
+    progress(6, "Filesystems mounted");
+
+    progress(6, "Starting actors...");
     init_actors();
+    progress(7, "Ready");
+
+    libkernel::vga_buffer::boot_progress_done();
 
     #[cfg(test)]
     test_main();

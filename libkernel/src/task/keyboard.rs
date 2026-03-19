@@ -97,7 +97,7 @@ pub(crate) fn add_scancode(scancode: u8) {
             WAKER.wake();
         }
     } else {
-        println!("WARNING: scancode queue uninitialized");
+        log::info!("scancode queue not yet initialized; dropping input");
     }
 }
 
