@@ -108,9 +108,49 @@ fn resolve(path: &str) -> Option<(Arc<AnyVfs>, String)> {
 }
 
 /// List a directory through the VFS.  `path` must be absolute.
+///
+/// After querying the underlying filesystem, synthetic directory entries are
+/// injected for any mount points that are direct children of `path`.
 pub async fn list_dir(path: &str) -> Result<Vec<VfsDirEntry>, VfsError> {
     let (fs, rel) = resolve(path).ok_or(VfsError::NoFilesystem)?;
-    fs.list_dir(&rel).await
+    let mut entries = fs.list_dir(&rel).await?;
+
+    // Collect child mount names (lock released before any await).
+    let child_mounts = child_mount_names(path);
+    for name in child_mounts {
+        if !entries.iter().any(|e| e.name == name) {
+            entries.push(VfsDirEntry { name, is_dir: true, size: 0 });
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Return the names of mount points that are direct children of `dir`.
+/// e.g. for dir="/", mounts at "/proc" and "/host" yield ["proc", "host"].
+fn child_mount_names(dir: &str) -> Vec<String> {
+    let mounts = MOUNTS.lock();
+    let mut names = Vec::new();
+    let prefix = if dir == "/" { "/" } else { dir };
+    for (mp, _) in mounts.iter() {
+        // Skip the mount at dir itself.
+        if mp == dir { continue; }
+        // Check if mp is a direct child: starts with prefix and has no
+        // further '/' after the prefix.
+        let tail = if prefix == "/" {
+            // Root: child of "/" is "/foo" → tail = "foo"
+            mp.strip_prefix('/')
+        } else {
+            // Non-root: child of "/a" is "/a/foo" → tail = "foo"
+            mp.strip_prefix(prefix).and_then(|s| s.strip_prefix('/'))
+        };
+        if let Some(name) = tail {
+            if !name.contains('/') && !name.is_empty() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
 }
 
 /// Read a file through the VFS.  `path` must be absolute.
