@@ -10,97 +10,25 @@ Date: 2026-03-19
 
 ## 1. Magic Numbers
 
-### 1.1 Syscall numbers — `osl/src/dispatch.rs:35-56`
+### ~~1.1 Syscall numbers — `osl/src/dispatch.rs`~~ ✅ DONE
 
-The main dispatch match uses bare integer literals for all 22 syscall
-numbers.  Adding or reordering syscalls is error-prone.
+**Fixed in** `95da4c0`.  Named constants in `osl/src/syscall_nr.rs`;
+dispatch match now uses `SYS_READ`, `SYS_WRITE`, etc.
 
-```rust
-// Current:
-match nr {
-    0 => sys_read(...),
-    1 => sys_write(...),
-    ...
-    500 => sys_spawn(...),
-}
-```
+### ~~1.2 MSR addresses~~ ✅ DONE
 
-**Fix:** Create `osl/src/syscall_nr.rs` with named constants:
+**Fixed in** `95da4c0`.  Named constants in `libkernel/src/msr.rs`
+(`IA32_FS_BASE`, `IA32_EFER`, etc.); all 12+ inline uses replaced.
 
-```rust
-pub const SYS_READ: u64 = 0;
-pub const SYS_WRITE: u64 = 1;
-pub const SYS_OPEN: u64 = 2;
-pub const SYS_CLOSE: u64 = 3;
-pub const SYS_FSTAT: u64 = 5;
-pub const SYS_LSEEK: u64 = 8;
-pub const SYS_MMAP: u64 = 9;
-pub const SYS_MPROTECT: u64 = 10;
-pub const SYS_MUNMAP: u64 = 11;
-pub const SYS_BRK: u64 = 12;
-pub const SYS_IOCTL: u64 = 16;
-pub const SYS_WRITEV: u64 = 20;
-pub const SYS_EXIT: u64 = 60;
-pub const SYS_WAIT4: u64 = 61;
-pub const SYS_GETCWD: u64 = 79;
-pub const SYS_CHDIR: u64 = 80;
-pub const SYS_ARCH_PRCTL: u64 = 158;
-pub const SYS_FUTEX: u64 = 202;
-pub const SYS_GETDENTS64: u64 = 217;
-pub const SYS_SET_TID_ADDRESS: u64 = 218;
-pub const SYS_EXIT_GROUP: u64 = 231;
-pub const SYS_SET_ROBUST_LIST: u64 = 273;
-pub const SYS_SPAWN: u64 = 500;
-```
+### ~~1.3 Page size~~ ✅ DONE
 
-### 1.2 MSR addresses — 12+ inline uses across 4 files
+**Fixed in** `95da4c0`.  `PAGE_SIZE` and `PAGE_MASK` in
+`libkernel/src/consts.rs`; all 20+ inline uses replaced.
 
-MSR numbers like `0xC000_0100` (FS.BASE), `0xC000_0101` (GS.BASE),
-`0xC000_0102` (KERNEL_GS.BASE), `0xC000_0080` (EFER), `0xC000_0081`
-(STAR), `0xC000_0082` (LSTAR), `0xC000_0084` (FMASK) appear in:
+### ~~1.4 Stack sizes~~ ✅ DONE
 
-- `libkernel/src/syscall.rs:65,69,76,79,84,88`
-- `libkernel/src/task/scheduler.rs:426,427,555,586`
-- `libkernel/src/interrupts.rs:273,274,436`
-- `osl/src/dispatch.rs:187`
-
-**Fix:** Create `libkernel/src/msr.rs`:
-
-```rust
-pub const IA32_FS_BASE: u32 = 0xC000_0100;
-pub const IA32_GS_BASE: u32 = 0xC000_0101;
-pub const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
-pub const IA32_EFER: u32 = 0xC000_0080;
-pub const IA32_STAR: u32 = 0xC000_0081;
-pub const IA32_LSTAR: u32 = 0xC000_0082;
-pub const IA32_FMASK: u32 = 0xC000_0084;
-```
-
-### 1.3 Page size — 20+ inline uses
-
-`0x1000`, `0xFFF`, and `4096` are used for page arithmetic in:
-
-- `osl/src/spawn.rs:41,42,43,46,52,69,112`
-- `osl/src/dispatch.rs:249,255,259,265,344,345,359,365`
-- `libkernel/src/memory/mod.rs:118,120,130,142,144`
-- `kernel/src/main.rs:99`
-- `kernel/src/ring3.rs:65,71,77`
-- `devices/src/virtio/mod.rs:37`
-
-**Fix:** Define once in libkernel, import everywhere:
-
-```rust
-pub const PAGE_SIZE: u64 = 0x1000;
-pub const PAGE_MASK: u64 = 0xFFF;
-```
-
-### 1.4 Stack sizes — 4 locations use `64 * 1024`
-
-- `libkernel/src/syscall.rs:40`
-- `libkernel/src/process.rs:81`
-- `libkernel/src/task/scheduler.rs:218,266`
-
-**Fix:** `pub const KERNEL_STACK_SIZE: usize = 64 * 1024;` in one place.
+**Fixed in** `95da4c0`.  `KERNEL_STACK_SIZE` in `libkernel/src/consts.rs`;
+all 4 locations updated.
 
 ### 1.5 I/O port addresses — interrupts.rs
 
@@ -120,15 +48,16 @@ const PIT_MODE_RATE_GEN: u8 = 0x34;
 const PIT_100HZ_RELOAD: u16 = 11932;
 ```
 
-### 1.6 stat struct layout — `osl/src/dispatch.rs:213-219`
+### ~~1.6 stat struct layout~~ ✅ DONE (partial)
 
-Magic offsets `144`, `24`, `0o020000`, `0o666` for fstat.
+**Fixed in** `95da4c0`.  `STAT_SIZE` and `S_IFCHR` are now named constants
+in `sys_fstat`.  `0o666` (permission mode) remains inline — acceptable as a
+well-known octal literal.
 
-**Fix:** Named constants or a `#[repr(C)]` `LinuxStat` struct.
+### 1.7 VirtIO vendor/device IDs — `kernel/src/main.rs`
 
-### 1.7 VirtIO vendor/device IDs — `kernel/src/main.rs:149,151`
-
-`0x1AF4`, `0x1042`, `0x1001` used inline in PCI scan.
+`0x1AF4`, `0x1042`, `0x1001` used inline in the virtio-blk PCI scan.
+Now also `0x1049`, `0x1009` for virtio-9p.
 
 **Fix:**
 
@@ -136,6 +65,8 @@ Magic offsets `144`, `24`, `0o020000`, `0o666` for fstat.
 const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
 const VIRTIO_BLK_MODERN_DEVICE_ID: u16 = 0x1042;
 const VIRTIO_BLK_LEGACY_DEVICE_ID: u16 = 0x1001;
+const VIRTIO_9P_MODERN_DEVICE_ID: u16 = 0x1049;
+const VIRTIO_9P_LEGACY_DEVICE_ID: u16 = 0x1009;
 ```
 
 ### 1.8 Other notable magic numbers
@@ -155,77 +86,28 @@ const VIRTIO_BLK_LEGACY_DEVICE_ID: u16 = 0x1001;
 
 ## 2. Duplicated Code
 
-### 2.1 FD table retrieval — `osl/src/dispatch.rs` (4 copies)
+### ~~2.1 FD table retrieval~~ ✅ DONE
 
-Lines 151-155, 200-204, 291-295, 447-451 all have this identical block:
+**Fixed in** `95da4c0`.  `get_fd_handle()` helper in `osl/src/dispatch.rs`
+eliminates 4 identical fd-lookup blocks.
 
-```rust
-let handle = match libkernel::process::with_process_ref(pid, |p| p.get_fd(fd as usize)) {
-    Some(Ok(h)) => h,
-    Some(Err(e)) => return errno::file_errno(e),
-    None => return -errno::EBADF,
-};
-```
+### ~~2.2 Page alloc + zero + map loop~~ ✅ DONE
 
-**Fix:** Extract helper:
+**Fixed in** `95da4c0`.  `MemoryServices::alloc_and_map_user_pages()` in
+`libkernel/src/memory/mod.rs` replaces the alloc+zero+map loops in
+`sys_brk` and `sys_mmap`.  (The `spawn.rs` loop is slightly different —
+it writes ELF segment data — so it was not collapsed.)
 
-```rust
-fn get_fd_handle(fd: u64) -> Result<Arc<dyn FileHandle>, i64> {
-    let pid = libkernel::process::current_pid();
-    match libkernel::process::with_process_ref(pid, |p| p.get_fd(fd as usize)) {
-        Some(Ok(h)) => Ok(h),
-        Some(Err(e)) => Err(errno::file_errno(e)),
-        None => Err(-errno::EBADF),
-    }
-}
-```
+### ~~2.3 Page clearing~~ ✅ DONE
 
-### 2.2 Page alloc + zero + map loop — 3 copies
+**Fixed in** `95da4c0`.  `clear_page()` in `libkernel/src/consts.rs`
+replaces 6 inline `write_bytes` calls.  (Some calls in `spawn.rs` that
+write non-zero data were not replaced.)
 
-`sys_brk` (dispatch.rs:256-279), `sys_mmap` (dispatch.rs:358-377), and
-`spawn_process_full` (spawn.rs:45-92) all have near-identical loops:
+### ~~2.4 PageTableFlags construction~~ ✅ DONE
 
-```rust
-for i in 0..pages_needed {
-    let frame = mem.alloc_dma_pages(1)?;
-    let dst = phys_off + frame.as_u64();
-    unsafe { core::ptr::write_bytes(dst.as_mut_ptr::<u8>(), 0, 0x1000); }
-    mem.map_user_page(vaddr, frame, pml4_phys, flags)?;
-}
-```
-
-**Fix:** Add to `MemoryServices`:
-
-```rust
-pub fn alloc_and_map_user_pages(
-    &mut self,
-    count: usize,
-    vaddr_base: u64,
-    pml4_phys: PhysAddr,
-    flags: PageTableFlags,
-) -> Result<(), ()>
-```
-
-### 2.3 Page clearing — 8 locations
-
-`core::ptr::write_bytes(ptr, 0, 0x1000)` appears in dispatch.rs (3x),
-spawn.rs (3x), ring3.rs (2x).
-
-**Fix:** `pub fn clear_page(addr: VirtAddr)` utility in libkernel.
-
-### 2.4 PageTableFlags construction — 3 copies
-
-This identical 4-line flags expression appears in sys_brk, sys_mmap,
-and spawn.rs stack mapping:
-
-```rust
-PageTableFlags::PRESENT
-    | PageTableFlags::WRITABLE
-    | PageTableFlags::USER_ACCESSIBLE
-    | PageTableFlags::NO_EXECUTE
-```
-
-**Fix:** `pub const USER_DATA_FLAGS: PageTableFlags = ...;`
+**Fixed in** `95da4c0`.  `USER_DATA_FLAGS` constant in
+`osl/src/dispatch.rs` replaces 3 identical flag expressions.
 
 ### 2.5 Path normalization — duplicated between crates
 
@@ -444,13 +326,15 @@ unblock-parent as separate steps.  This should be a single
 
 ## Summary — Recommended Priority
 
-### Tier 1: Easy wins with high readability payoff
+### Tier 1: Easy wins with high readability payoff — ✅ ALL DONE
 
-1. Named constants for syscall numbers, MSRs, page sizes
-2. Extract `get_fd_handle()` helper (eliminates 4 copies)
-3. Extract `alloc_and_map_user_pages()` (eliminates 3 copies)
-4. `const USER_DATA_FLAGS` for page table flags
-5. `clear_page()` utility (eliminates 8 copies)
+All Tier 1 items were completed in `95da4c0`:
+
+1. ~~Named constants for syscall numbers, MSRs, page sizes~~ ✅
+2. ~~Extract `get_fd_handle()` helper (eliminates 4 copies)~~ ✅
+3. ~~Extract `alloc_and_map_user_pages()` (eliminates 3 copies)~~ ✅
+4. ~~`const USER_DATA_FLAGS` for page table flags~~ ✅
+5. ~~`clear_page()` utility (eliminates 8 copies)~~ ✅
 
 ### Tier 2: Structural improvements
 
