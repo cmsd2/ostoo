@@ -88,9 +88,9 @@ impl Shell {
         use crate::keyboard_actor::{KeyboardMsg, KeyboardInfo};
 
         let cwd = self.cwd.lock().clone();
-        let mut prompt = String::from("ostoo:");
+        let mut prompt = String::from("kernel:");
         prompt.push_str(&cwd);
-        prompt.push_str("> ");
+        prompt.push_str("# ");
 
         // Notify the keyboard actor so it uses the correct column for cursor
         // positioning and can reprint the prompt on Ctrl+C / Ctrl+L.
