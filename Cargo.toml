@@ -32,6 +32,6 @@ raw-cpuid     = "7.0.3"
 snafu         = { version = "0.8", default-features = false }
 spin          = { version = "0.9", features = ["mutex", "rwlock"] }
 uart_16550    = "0.3"
-virtio-drivers = { version = "0.7", default-features = false, features = ["alloc"] }
+virtio-drivers = { version = "0.13", default-features = false, features = ["alloc"] }
 volatile      = "0.2.6"
 x86_64        = "0.15"

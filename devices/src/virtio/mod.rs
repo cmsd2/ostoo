@@ -2,13 +2,15 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use virtio_drivers::{BufferDirection, Hal, PhysAddr};
-use virtio_drivers::transport::pci::bus::{Cam, PciRoot};
+use virtio_drivers::transport::pci::bus::{Cam, MmioCam, PciRoot};
 use virtio_drivers::transport::pci::PciTransport;
 
 use libkernel::memory;
 
 pub mod blk;
 pub mod exfat;
+pub mod p9_proto;
+pub mod p9;
 pub use exfat::{BlkInbox, DirEntry, ExfatError, ExfatVol,
                 open_exfat, list_dir, read_file};
 
@@ -36,8 +38,7 @@ unsafe impl Hal for KernelHal {
         // Zero the allocation.
         unsafe { core::ptr::write_bytes(vaddr as *mut u8, 0, pages * libkernel::consts::PAGE_SIZE as usize); }
 
-        let paddr_usize = paddr.as_u64() as usize;
-        (paddr_usize, NonNull::new(vaddr as *mut u8).unwrap())
+        (paddr.as_u64(), NonNull::new(vaddr as *mut u8).unwrap())
     }
 
     /// Deallocate DMA pages.  Our frame allocator has no free; leak is OK for MVP.
@@ -67,7 +68,7 @@ unsafe impl Hal for KernelHal {
         memory::with_memory(|mem| {
             mem.translate_virt(vaddr)
                 .expect("virtio share: buffer virtual address not mapped")
-                .as_u64() as usize
+                .as_u64()
         })
     }
 
@@ -91,10 +92,11 @@ pub fn set_ecam_base(virt_base: u64) {
 /// # Safety
 /// `ECAM_VIRT_BASE` must have been set by `set_ecam_base` and the region
 /// must be fully mapped and valid.
-unsafe fn create_pci_root() -> PciRoot {
+unsafe fn create_pci_root() -> PciRoot<MmioCam<'static>> {
     let base = ECAM_VIRT_BASE.load(Ordering::Relaxed);
-    // Safety: caller guarantees the mapping is valid.
-    PciRoot::new(base as *mut u8, Cam::Ecam)
+    // Safety: caller guarantees the mapping is valid and the ECAM region
+    // lives for the lifetime of the kernel ('static).
+    PciRoot::new(MmioCam::new(base as *mut u8, Cam::Ecam))
 }
 
 // ---------------------------------------------------------------------------
@@ -103,11 +105,16 @@ unsafe fn create_pci_root() -> PciRoot {
 /// Attempt to create a VirtIO PCI transport for the device at the given
 /// bus/device/function coordinates.  Returns `None` if the transport cannot
 /// be initialised (capability parsing failed, etc.).
-pub fn create_blk_transport(bus: u8, device: u8, function: u8) -> Option<PciTransport> {
+pub fn create_pci_transport(bus: u8, device: u8, function: u8) -> Option<PciTransport> {
     use virtio_drivers::transport::pci::bus::DeviceFunction;
     let df = DeviceFunction { bus, device, function };
     let mut root = unsafe { create_pci_root() };
-    PciTransport::new::<KernelHal>(&mut root, df).ok()
+    PciTransport::new::<KernelHal, _>(&mut root, df).ok()
+}
+
+/// Legacy alias for `create_pci_transport`.
+pub fn create_blk_transport(bus: u8, device: u8, function: u8) -> Option<PciTransport> {
+    create_pci_transport(bus, device, function)
 }
 
 // ---------------------------------------------------------------------------

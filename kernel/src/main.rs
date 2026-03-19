@@ -172,17 +172,67 @@ fn run_kernel() -> ! {
         info!("[kernel] no virtio-blk device found");
     }
 
+    // ── virtio-9p probe ─────────────────────────────────────────────────────
+    let p9_dev = devices::pci::find_devices(0x1AF4, 0x1049)  // modern
+        .into_iter()
+        .chain(devices::pci::find_devices(0x1AF4, 0x1009))   // legacy
+        .next();
+
+    let p9_client: Option<alloc::sync::Arc<devices::virtio::p9::P9Client>> =
+        if let Some(pci_dev) = p9_dev {
+            info!("[kernel] found virtio-9p at {:02x}:{:02x}.{}",
+                pci_dev.bus, pci_dev.device, pci_dev.function);
+            devices::virtio::create_pci_transport(
+                pci_dev.bus, pci_dev.device, pci_dev.function,
+            ).and_then(|transport| {
+                match devices::virtio::p9::P9Client::new(transport) {
+                    Ok(client) => {
+                        info!("[kernel] 9p client initialised");
+                        Some(alloc::sync::Arc::new(client))
+                    }
+                    Err(e) => {
+                        warn!("[kernel] 9p client init failed: {:?}", e);
+                        None
+                    }
+                }
+            })
+        } else {
+            info!("[kernel] no virtio-9p device found");
+            None
+        };
+
+    if let Some(ref client) = p9_client {
+        devices::vfs::mount("/host",
+            devices::vfs::AnyVfs::Plan9(
+                devices::vfs::Plan9Vfs::new(alloc::sync::Arc::clone(client))));
+        info!("[kernel] 9p filesystem mounted at /host");
+    }
+
     // Always mount /proc (no block device required).
     devices::vfs::mount("/proc", devices::vfs::AnyVfs::Proc(devices::vfs::ProcVfs));
 
     // Mount exFAT at / if virtio-blk was registered.
-    if let Some(inbox) = libkernel::task::registry::get::<
+    let have_blk = if let Some(inbox) = libkernel::task::registry::get::<
         devices::virtio::blk::VirtioBlkMsg,
         devices::virtio::blk::VirtioBlkInfo,
     >("virtio-blk") {
         devices::vfs::mount("/", devices::vfs::AnyVfs::Exfat(
             devices::vfs::ExfatVfs::new(inbox)
         ));
+        true
+    } else {
+        false
+    };
+
+    // If no block device but 9p is available, mount 9p at / as fallback
+    // so /shell auto-launch works without a disk image.
+    if !have_blk {
+        if let Some(client) = p9_client {
+            devices::vfs::mount("/",
+                devices::vfs::AnyVfs::Plan9(
+                    devices::vfs::Plan9Vfs::new(client)));
+            info!("[kernel] 9p filesystem mounted at / (fallback)");
+        }
     }
 
     let (dummy_driver, dummy_inbox) =

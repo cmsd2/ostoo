@@ -303,7 +303,7 @@ impl Writer {
         for byte in s.bytes() {
             match byte {
                 // printable ASCII byte or newline
-                0x20..=0x7e | b'\n' => self.write_byte(byte),
+                0x20..=0x7e | b'\n' | 0x08 => self.write_byte(byte),
                 // not part of printable ASCII range
                 _ => self.write_byte(0xfe),
             }
@@ -314,6 +314,7 @@ impl Writer {
     pub fn write_byte(&mut self, byte: u8) {
         match byte {
             b'\n' => self.new_line(),
+            0x08 => self.do_backspace(),
             byte => {
                 if self.column_position >= BUFFER_WIDTH {
                     self.new_line();
@@ -347,16 +348,14 @@ impl Writer {
         self.buffer.set_hw_cursor(((BUFFER_HEIGHT - 1) * BUFFER_WIDTH) as u16);
     }
 
-    /// Erase the last character on the current line (if any).
+    /// Move the cursor back one column (BS / 0x08).  Does not erase —
+    /// the caller is expected to overwrite the cell explicitly (standard
+    /// terminal semantics: `\b` is cursor-left, not erase).
     fn do_backspace(&mut self) {
         if self.column_position > 0 {
             self.column_position -= 1;
-            let row = BUFFER_HEIGHT - 1;
-            let col = self.column_position;
-            self.buffer.write_cell(row, col, ScreenChar {
-                ascii_character: b' ',
-                color_code: self.color_code,
-            });
+            let hw_col = self.column_position.min(BUFFER_WIDTH - 1);
+            self.buffer.set_hw_cursor(((BUFFER_HEIGHT - 1) * BUFFER_WIDTH + hw_col) as u16);
         }
     }
 

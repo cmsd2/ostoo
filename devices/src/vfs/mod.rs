@@ -5,9 +5,11 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 pub mod exfat_vfs;
+pub mod plan9_vfs;
 pub mod proc_vfs;
 
 pub use exfat_vfs::ExfatVfs;
+pub use plan9_vfs::Plan9Vfs;
 pub use proc_vfs::ProcVfs;
 
 // ---------------------------------------------------------------------------
@@ -35,6 +37,7 @@ pub enum VfsError {
 
 pub enum AnyVfs {
     Exfat(ExfatVfs),
+    Plan9(Plan9Vfs),
     Proc(ProcVfs),
 }
 
@@ -42,6 +45,7 @@ impl AnyVfs {
     pub async fn list_dir(&self, path: &str) -> Result<Vec<VfsDirEntry>, VfsError> {
         match self {
             AnyVfs::Exfat(fs) => fs.list_dir(path).await,
+            AnyVfs::Plan9(fs) => fs.list_dir(path).await,
             AnyVfs::Proc(fs)  => fs.list_dir(path).await,
         }
     }
@@ -49,6 +53,7 @@ impl AnyVfs {
     pub async fn read_file(&self, path: &str) -> Result<Vec<u8>, VfsError> {
         match self {
             AnyVfs::Exfat(fs) => fs.read_file(path).await,
+            AnyVfs::Plan9(fs) => fs.read_file(path).await,
             AnyVfs::Proc(fs)  => fs.read_file(path).await,
         }
     }
@@ -56,6 +61,7 @@ impl AnyVfs {
     pub fn fs_type(&self) -> &'static str {
         match self {
             AnyVfs::Exfat(_) => "exfat",
+            AnyVfs::Plan9(_) => "9p",
             AnyVfs::Proc(_)  => "proc",
         }
     }
