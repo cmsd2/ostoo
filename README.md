@@ -3,6 +3,8 @@
 A hobby x86-64 kernel written in Rust with a userspace shell, VFS, syscall
 layer, and virtio drivers.
 
+![Boot and shell demo](media/console.gif)
+
 ## Requirements
 
 - Rust nightly (rustc, cargo, rustup)
