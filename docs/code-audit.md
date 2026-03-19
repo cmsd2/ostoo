@@ -115,12 +115,10 @@ write non-zero data were not replaced.)
 now shared; `kernel/src/shell.rs` and `osl/src/dispatch.rs` both delegate
 to `libkernel::path`.
 
-### 2.6 History entry restoration — `keyboard_actor.rs`
+### ~~2.6 History entry restoration — `keyboard_actor.rs`~~ ✅ DONE
 
-Lines 234-241 (history up) and 262-268 (history down) have identical
-buffer-copy logic.
-
-**Fix:** `LineState::restore_from_history(&mut self, entry: &str)`
+**Fixed** alongside item 8.  `LineState::restore_from_history(&mut self, idx)`
+eliminates the duplicated buffer-copy logic.
 
 ### 2.7 `read_user_string` → path error wrapping — 2 copies
 
@@ -238,25 +236,12 @@ pub struct KernelVirtAddr(u64);
 
 ## 4. Long Functions / Deep Nesting
 
-### 4.1 `keyboard_actor.rs:on_key` — 238 lines
+### ~~4.1 `keyboard_actor.rs:on_key` — 238 lines~~ ✅ DONE
 
-A massive match statement inside a mutex lock.  Handles 20+ key types
-in one function.
-
-**Fix:** Extract a `LineEditor` state machine with one method per key
-type.  The `on_key` method becomes a thin dispatch:
-
-```rust
-fn on_key(&self, key: Key) {
-    let mut editor = self.editor.lock();
-    match key {
-        Key::Backspace => editor.backspace(),
-        Key::Delete => editor.delete(),
-        Key::ArrowLeft => editor.move_left(),
-        ...
-    }
-}
-```
+**Fixed** alongside item 8.  Key-handling logic moved to `LineState`
+methods (`submit`, `backspace`, `delete_forward`, `move_left/right`,
+`history_up/down`, etc.).  `on_key` is now a thin one-liner-per-key
+dispatch table.
 
 ### 4.2 `scheduler.rs:preempt_tick` — 102 lines
 
@@ -281,17 +266,11 @@ Validation, allocation, and mapping all in one function.
 
 Same issue as `sys_mmap` — does too many things.
 
-### 4.5 Deep nesting in `keyboard_actor.rs:159-331`
+### ~~4.5 Deep nesting in `keyboard_actor.rs:159-331`~~ ✅ DONE
 
-```
-async fn on_key
-  └─ if foreground == 0
-       └─ let mut st = self.line.lock()
-            └─ match key
-                 └─ Key::Enter => ...
-```
-
-Four levels deep before reaching the actual logic.
+**Fixed** alongside item 8.  Each match arm is now a one-liner calling
+a `LineState` method; the actual logic lives in those methods at a
+single nesting level.
 
 ---
 
@@ -339,7 +318,7 @@ All Tier 1 items were completed in `95da4c0`:
 
 6. ~~Share path normalization between kernel shell and osl~~ ✅
 7. ~~`ProcessManager` struct to encapsulate process table~~ ✅
-8. Decompose `on_key` into a `LineEditor` state machine
+8. ~~Decompose `on_key` into a `LineEditor` state machine~~ ✅
 9. Decompose `preempt_tick` into smaller functions
 10. Break `sys_brk` / `sys_mmap` into validation + mapping
 

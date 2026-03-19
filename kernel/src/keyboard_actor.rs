@@ -40,6 +40,17 @@ pub struct KeyboardInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Action — computed inside the mutex, executed outside
+
+enum Action {
+    Redraw,
+    Submit(alloc::string::String),
+    ClearScreen,
+    Interrupt,
+    Ignore,
+}
+
+// ---------------------------------------------------------------------------
 // Line editor state
 
 struct LineState {
@@ -77,17 +88,154 @@ impl LineState {
             core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
         )
     }
-}
 
-// ---------------------------------------------------------------------------
-// Action — computed inside the mutex, executed outside
+    /// Copy a history entry into the edit buffer, avoiding aliasing issues.
+    fn restore_from_history(&mut self, idx: usize) {
+        let mut tmp = [0u8; MAX_LINE];
+        let n = {
+            let entry = self.history[idx].as_bytes();
+            let n = entry.len().min(MAX_LINE);
+            tmp[..n].copy_from_slice(&entry[..n]);
+            n
+        };
+        self.buf[..n].copy_from_slice(&tmp[..n]);
+        self.len = n;
+        self.cursor = n;
+    }
 
-enum Action {
-    Redraw,
-    Submit(alloc::string::String),
-    ClearScreen,
-    Interrupt,
-    Ignore,
+    // ── Key handlers ─────────────────────────────────────────────────────
+
+    fn submit(&mut self) -> Action {
+        let s = self.current_as_string();
+        let trimmed = alloc::string::String::from(s.trim());
+        self.len = 0; self.cursor = 0; self.hist_idx = None;
+        if !trimmed.is_empty() {
+            self.push_history(&trimmed);
+            Action::Submit(trimmed)
+        } else {
+            Action::Redraw
+        }
+    }
+
+    fn backspace(&mut self) -> Action {
+        if self.cursor > 0 {
+            let (src, dst) = (self.cursor, self.cursor - 1);
+            let end = self.len;
+            self.buf.copy_within(src..end, dst);
+            self.cursor -= 1;
+            self.len   -= 1;
+            Action::Redraw
+        } else { Action::Ignore }
+    }
+
+    fn delete_forward(&mut self) -> Action {
+        if self.cursor < self.len {
+            let (src, dst, end) = (self.cursor + 1, self.cursor, self.len);
+            self.buf.copy_within(src..end, dst);
+            self.len -= 1;
+            Action::Redraw
+        } else { Action::Ignore }
+    }
+
+    fn move_left(&mut self) -> Action {
+        if self.cursor > 0 { self.cursor -= 1; Action::Redraw }
+        else { Action::Ignore }
+    }
+
+    fn move_right(&mut self) -> Action {
+        if self.cursor < self.len { self.cursor += 1; Action::Redraw }
+        else { Action::Ignore }
+    }
+
+    fn move_home(&mut self) -> Action {
+        self.cursor = 0; Action::Redraw
+    }
+
+    fn move_end(&mut self) -> Action {
+        self.cursor = self.len; Action::Redraw
+    }
+
+    fn history_up(&mut self) -> Action {
+        let hlen = self.history.len();
+        if hlen == 0 {
+            return Action::Ignore;
+        }
+        let new_idx = match self.hist_idx {
+            None => {
+                self.saved_buf = self.buf;
+                self.saved_len = self.len;
+                hlen - 1
+            }
+            Some(0)  => 0,
+            Some(i)  => i - 1,
+        };
+        self.restore_from_history(new_idx);
+        self.hist_idx = Some(new_idx);
+        Action::Redraw
+    }
+
+    fn history_down(&mut self) -> Action {
+        match self.hist_idx {
+            None => Action::Ignore,
+            Some(i) if i + 1 >= self.history.len() => {
+                self.buf = self.saved_buf;
+                self.len = self.saved_len;
+                self.cursor = self.len;
+                self.hist_idx = None;
+                Action::Redraw
+            }
+            Some(i) => {
+                let new_idx = i + 1;
+                self.restore_from_history(new_idx);
+                self.hist_idx = Some(new_idx);
+                Action::Redraw
+            }
+        }
+    }
+
+    fn kill_to_end(&mut self) -> Action {
+        self.len = self.cursor; Action::Redraw
+    }
+
+    fn kill_to_start(&mut self) -> Action {
+        let (src, end) = (self.cursor, self.len);
+        self.buf.copy_within(src..end, 0);
+        self.len   -= src;
+        self.cursor = 0;
+        Action::Redraw
+    }
+
+    fn delete_word(&mut self) -> Action {
+        let mut i = self.cursor;
+        while i > 0 && self.buf[i - 1] == b' ' { i -= 1; }
+        while i > 0 && self.buf[i - 1] != b' ' { i -= 1; }
+        let removed = self.cursor - i;
+        let (src, end) = (self.cursor, self.len);
+        self.buf.copy_within(src..end, i);
+        self.len   -= removed;
+        self.cursor = i;
+        Action::Redraw
+    }
+
+    fn interrupt(&mut self) -> Action {
+        self.len = 0; self.cursor = 0; self.hist_idx = None;
+        Action::Interrupt
+    }
+
+    fn insert_char(&mut self, c: char, max_input: usize) -> Action {
+        if self.len < max_input {
+            let b = c as u8;
+            let cur = self.cursor;
+            let end = self.len;
+            if cur < end {
+                self.buf.copy_within(cur..end, cur + 1);
+            }
+            self.buf[cur] = b;
+            self.cursor += 1;
+            self.len   += 1;
+            Action::Redraw
+        } else { Action::Ignore }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -159,174 +307,22 @@ impl KeyboardActor {
         let action = {
             let mut st = self.line.lock();
             match key {
-                // ── Submit ───────────────────────────────────────────
-                Key::Unicode('\n') | Key::Unicode('\r') => {
-                    let s = st.current_as_string();
-                    let trimmed = alloc::string::String::from(s.trim());
-                    st.len = 0; st.cursor = 0; st.hist_idx = None;
-                    if !trimmed.is_empty() {
-                        st.push_history(&trimmed);
-                        Action::Submit(trimmed)
-                    } else {
-                        Action::Redraw
-                    }
-                }
-
-                // ── Backspace / Ctrl+H ───────────────────────────────
-                Key::Unicode('\x08') => {
-                    if st.cursor > 0 {
-                        let (src, dst) = (st.cursor, st.cursor - 1);
-                        let end = st.len;
-                        st.buf.copy_within(src..end, dst);
-                        st.cursor -= 1;
-                        st.len   -= 1;
-                        Action::Redraw
-                    } else { Action::Ignore }
-                }
-
-                // ── Delete (forward) ─────────────────────────────────
-                Key::RawKey(KeyCode::Delete) => {
-                    if st.cursor < st.len {
-                        let (src, dst, end) = (st.cursor + 1, st.cursor, st.len);
-                        st.buf.copy_within(src..end, dst);
-                        st.len -= 1;
-                        Action::Redraw
-                    } else { Action::Ignore }
-                }
-
-                // ── Arrow left / Ctrl+B ──────────────────────────────
-                Key::RawKey(KeyCode::ArrowLeft) | Key::Unicode('\x02') => {
-                    if st.cursor > 0 { st.cursor -= 1; Action::Redraw }
-                    else { Action::Ignore }
-                }
-
-                // ── Arrow right / Ctrl+F ─────────────────────────────
-                Key::RawKey(KeyCode::ArrowRight) | Key::Unicode('\x06') => {
-                    if st.cursor < st.len { st.cursor += 1; Action::Redraw }
-                    else { Action::Ignore }
-                }
-
-                // ── Home / Ctrl+A ────────────────────────────────────
-                Key::RawKey(KeyCode::Home) | Key::Unicode('\x01') => {
-                    st.cursor = 0; Action::Redraw
-                }
-
-                // ── End / Ctrl+E ─────────────────────────────────────
-                Key::RawKey(KeyCode::End) | Key::Unicode('\x05') => {
-                    st.cursor = st.len; Action::Redraw
-                }
-
-                // ── History up / Ctrl+P ──────────────────────────────
-                Key::RawKey(KeyCode::ArrowUp) | Key::Unicode('\x10') => {
-                    let hlen = st.history.len();
-                    if hlen == 0 {
-                        Action::Ignore
-                    } else {
-                        let new_idx = match st.hist_idx {
-                            None => {
-                                st.saved_buf = st.buf;
-                                st.saved_len = st.len;
-                                hlen - 1
-                            }
-                            Some(0)  => 0,
-                            Some(i)  => i - 1,
-                        };
-                        // Copy history entry into a temporary to avoid aliasing.
-                        let mut tmp = [0u8; MAX_LINE];
-                        let n = {
-                            let entry = st.history[new_idx].as_bytes();
-                            let n = entry.len().min(MAX_LINE);
-                            tmp[..n].copy_from_slice(&entry[..n]);
-                            n
-                        };
-                        st.buf[..n].copy_from_slice(&tmp[..n]);
-                        st.len = n; st.cursor = n;
-                        st.hist_idx = Some(new_idx);
-                        Action::Redraw
-                    }
-                }
-
-                // ── History down / Ctrl+N ────────────────────────────
-                Key::RawKey(KeyCode::ArrowDown) | Key::Unicode('\x0E') => {
-                    match st.hist_idx {
-                        None => Action::Ignore,
-                        Some(i) if i + 1 >= st.history.len() => {
-                            st.buf = st.saved_buf;
-                            st.len = st.saved_len;
-                            st.cursor = st.len;
-                            st.hist_idx = None;
-                            Action::Redraw
-                        }
-                        Some(i) => {
-                            let new_idx = i + 1;
-                            let mut tmp = [0u8; MAX_LINE];
-                            let n = {
-                                let entry = st.history[new_idx].as_bytes();
-                                let n = entry.len().min(MAX_LINE);
-                                tmp[..n].copy_from_slice(&entry[..n]);
-                                n
-                            };
-                            st.buf[..n].copy_from_slice(&tmp[..n]);
-                            st.len = n; st.cursor = n;
-                            st.hist_idx = Some(new_idx);
-                            Action::Redraw
-                        }
-                    }
-                }
-
-                // ── Kill to end / Ctrl+K ─────────────────────────────
-                Key::Unicode('\x0B') => {
-                    st.len = st.cursor; Action::Redraw
-                }
-
-                // ── Kill to start / Ctrl+U ───────────────────────────
-                Key::Unicode('\x15') => {
-                    let (src, end) = (st.cursor, st.len);
-                    st.buf.copy_within(src..end, 0);
-                    st.len   -= src;
-                    st.cursor = 0;
-                    Action::Redraw
-                }
-
-                // ── Delete previous word / Ctrl+W ────────────────────
-                Key::Unicode('\x17') => {
-                    let mut i = st.cursor;
-                    while i > 0 && st.buf[i - 1] == b' ' { i -= 1; }
-                    while i > 0 && st.buf[i - 1] != b' ' { i -= 1; }
-                    let removed = st.cursor - i;
-                    let (src, end) = (st.cursor, st.len);
-                    st.buf.copy_within(src..end, i);
-                    st.len   -= removed;
-                    st.cursor = i;
-                    Action::Redraw
-                }
-
-                // ── Ctrl+L (clear screen) ────────────────────────────
-                Key::Unicode('\x0C') => Action::ClearScreen,
-
-                // ── Ctrl+C (interrupt / clear line) ──────────────────
-                Key::Unicode('\x03') => {
-                    st.len = 0; st.cursor = 0; st.hist_idx = None;
-                    Action::Interrupt
-                }
-
-                // ── Printable ASCII (with insertion) ─────────────────
-                Key::Unicode(c) if c.is_ascii() && !c.is_control() => {
-                    if st.len < max_input {
-                        let b = c as u8;
-                        let cur = st.cursor;
-                        let end = st.len;
-                        if cur < end {
-                            st.buf.copy_within(cur..end, cur + 1);
-                        }
-                        st.buf[cur] = b;
-                        st.cursor += 1;
-                        st.len   += 1;
-                        Action::Redraw
-                    } else { Action::Ignore }
-                }
-
-                _ => Action::Ignore,
+                Key::Unicode('\n') | Key::Unicode('\r')                  => st.submit(),
+                Key::Unicode('\x08')                                     => st.backspace(),
+                Key::RawKey(KeyCode::Delete)                             => st.delete_forward(),
+                Key::RawKey(KeyCode::ArrowLeft)  | Key::Unicode('\x02') => st.move_left(),
+                Key::RawKey(KeyCode::ArrowRight) | Key::Unicode('\x06') => st.move_right(),
+                Key::RawKey(KeyCode::Home)       | Key::Unicode('\x01') => st.move_home(),
+                Key::RawKey(KeyCode::End)        | Key::Unicode('\x05') => st.move_end(),
+                Key::RawKey(KeyCode::ArrowUp)    | Key::Unicode('\x10') => st.history_up(),
+                Key::RawKey(KeyCode::ArrowDown)  | Key::Unicode('\x0E') => st.history_down(),
+                Key::Unicode('\x0B')                                     => st.kill_to_end(),
+                Key::Unicode('\x15')                                     => st.kill_to_start(),
+                Key::Unicode('\x17')                                     => st.delete_word(),
+                Key::Unicode('\x0C')                                     => Action::ClearScreen,
+                Key::Unicode('\x03')                                     => st.interrupt(),
+                Key::Unicode(c) if c.is_ascii() && !c.is_control()      => st.insert_char(c, max_input),
+                _                                                        => Action::Ignore,
             }
         }; // mutex released here
 
