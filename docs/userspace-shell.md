@@ -1,18 +1,27 @@
 # Userspace Shell Design
 
+## Status
+
+**All phases are complete.**  The userspace shell runs as the primary user
+interface on boot.  The kernel shell remains as a fallback when no `/shell`
+binary is found on the filesystem.
+
 ## Context
 
-The shell currently runs as a kernel actor (`kernel/src/shell.rs`) receiving complete lines from a keyboard actor. To move toward a proper userspace model, we need to make the shell a ring-3 process — a C program compiled with musl that reads raw keypresses from stdin, does its own line editing, and uses syscalls for file I/O and process management.
+The shell was migrated from a kernel actor (`kernel/src/shell.rs`) to a
+ring-3 process — a C program (`user/shell.c`) compiled with musl that reads
+raw keypresses from stdin, does its own line editing, and uses syscalls for
+file I/O and process management.
 
 **Scope decisions:**
 - Raw keypresses to userspace (no kernel line editing for foreground user processes)
-- Minimal commands: echo, ls, cat, pwd, cd, exit, and running programs by name
+- Minimal commands: echo, ls, cat, pwd, cd, exit, help, and running programs by name
 - Kernel shell kept as fallback (dormant when userspace shell is foreground)
 - No pipes yet
 
 ---
 
-## Phase 1: Scheduler Blocking Support
+## Phase 1: Scheduler Blocking Support  ✅ COMPLETE
 
 **Goal:** Add `Blocked` thread state so threads can sleep waiting for I/O.
 
@@ -27,7 +36,7 @@ The shell currently runs as a kernel actor (`kernel/src/shell.rs`) receiving com
 
 ---
 
-## Phase 2: File Descriptor Table
+## Phase 2: File Descriptor Table  ✅ COMPLETE
 
 **Goal:** Per-process FD table with `FileHandle` trait, refactor existing syscalls.
 
@@ -60,7 +69,7 @@ The shell currently runs as a kernel actor (`kernel/src/shell.rs`) receiving com
 
 ---
 
-## Phase 3: Console Input (Raw Keypresses)
+## Phase 3: Console Input (Raw Keypresses)  ✅ COMPLETE
 
 **Goal:** Route decoded keypresses to a buffer that `read(0)` consumes, with blocking.
 
@@ -97,7 +106,7 @@ The shell currently runs as a kernel actor (`kernel/src/shell.rs`) receiving com
 
 ---
 
-## Phase 4: VFS Syscalls
+## Phase 4: VFS Syscalls  ✅ COMPLETE
 
 **Goal:** `open`, `read` (files), `close`, `getdents64` so userspace can read files and list directories.
 
@@ -150,7 +159,7 @@ Spawns the async VFS operation as a kernel task, blocks the user thread, unblock
 
 ---
 
-## Phase 5: Process Management Syscalls
+## Phase 5: Process Management Syscalls  ✅ COMPLETE
 
 **Goal:** chdir/getcwd, spawn, waitpid.
 
@@ -204,7 +213,7 @@ Signature: `spawn(path_ptr, path_len, argv_ptr, argv_count) -> pid`
 
 ---
 
-## Phase 6: Userspace Shell Binary
+## Phase 6: Userspace Shell Binary  ✅ COMPLETE
 
 **Goal:** Write shell.c, compile with musl, deploy.
 

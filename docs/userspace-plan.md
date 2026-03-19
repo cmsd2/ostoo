@@ -12,11 +12,12 @@ through system calls, and eventually linked against a ported musl libc.
 
 ## Progress Summary
 
-Phases 0–4 are **complete**. The kernel can parse ELF binaries, create isolated
-per-process address spaces, drop to ring 3 via `iretq`, handle SYSCALL/SYSRET,
-preemptively schedule user processes, and run static musl-linked binaries that
-print to the console and exit. The initial user stack is set up with
-`argc/argv/envp/auxv` as musl's `_start` expects.
+Phases 0–6 are **complete** (Phase 6 without `fork`).  The kernel runs a
+musl-linked C shell (`user/shell.c`) as its primary user interface.  The
+shell auto-launches on boot, supports line editing, built-in commands
+(`echo`, `pwd`, `cd`, `ls`, `cat`, `exit`, `help`), and spawning external
+programs via a custom `spawn` syscall + `waitpid`.  21 syscalls are
+implemented.
 
 | Phase | Status | Milestone |
 |-------|--------|-----------|
@@ -25,34 +26,50 @@ print to the console and exit. The initial user stack is set up with
 | 2 — Per-process page tables | **Done** | `create_user_page_table`, `map_user_page`, CR3 switching on context switch; ring-3 page faults kill the process |
 | 3 — Process abstraction | **Done** | `Process` struct, process table, ELF loader, `exec` shell command, zombie reaping |
 | 4 — System call layer | **Done** | 14 syscalls implemented; initial stack with auxv; `brk`/`mmap` for heap; `writev` for musl printf |
-| 5 — Cross-compiler + musl | **Not started** | Phase 4 syscalls are ready; need to build and test a musl binary |
-| 6 — Fork / wait / user shell | **Not started** | Requires CoW page faults, `waitpid` |
+| 5 — Cross-compiler + musl | **Done** | Docker-based musl cross-compiler (`scripts/user-build.sh`); static musl binaries run on ostoo |
+| 6 — Spawn / wait / user shell | **Done** | Custom `spawn` syscall (nr 500) + `wait4`; userspace C shell with line editing, auto-launched on boot; `fork` deferred |
 | 7 — Signals | **Not started** | Requires signal frame push/pop, `rt_sigaction`, `rt_sigreturn` |
 
 ### What works today
 
-- Shell command `exec <path>` reads an ELF from the VFS and spawns it as a
-  ring-3 process with its own PML4.
-- ELF processes get an 8-page (32 KiB) user stack at `0x7FFF_F000_0000` with
-  a proper initial stack layout: `argc`, `argv` (NULL), `envp` (NULL), and
-  an auxiliary vector (`AT_PAGESZ`, `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`,
-  `AT_ENTRY`, `AT_UID`, `AT_RANDOM`, `AT_NULL`). RSP is 16-byte aligned.
-- **14 syscalls** are implemented (see `docs/syscalls/` for per-syscall docs):
-  `read`, `write`, `close`, `fstat`, `mmap`, `mprotect`, `munmap`, `brk`,
-  `ioctl`, `writev`, `exit`/`exit_group`, `arch_prctl`, `set_tid_address`,
-  `set_robust_list`.
+- **Userspace shell** (`user/shell.c`): musl-linked C shell compiled via
+  Docker cross-compiler, deployed to disk image at `/shell`.  Auto-launched
+  from `kernel/src/main.rs` on boot; falls back to kernel shell if not found.
+- Line editing in the shell: read char-by-char, echo, backspace, Ctrl+C
+  (cancel line), Ctrl+D (exit on empty line).
+- Built-in commands: `echo`, `pwd`, `cd`, `ls`, `cat`, `exit`, `help`.
+- External programs: `spawn(path)` + `waitpid` from the shell.
+- Raw keypress delivery to userspace via `libkernel/src/console.rs`:
+  foreground PID routing, blocking `read(0)`, keyboard ISR wakeup.
+- Per-process FD table (fds 0–2 = `ConsoleHandle`); `FileHandle` trait with
+  `ConsoleHandle`, `VfsHandle`, and `DirHandle` implementations.
+- **21 syscalls** implemented (see `docs/syscalls/` for per-syscall docs):
+  `read`, `write`, `open`, `close`, `fstat`, `lseek`, `mmap`, `mprotect`,
+  `munmap`, `brk`, `ioctl`, `writev`, `exit`/`exit_group`, `wait4`,
+  `getcwd`, `chdir`, `arch_prctl`, `futex`, `getdents64`,
+  `set_tid_address`, `set_robust_list`, `spawn` (custom nr 500).
+- `open` resolves paths relative to process CWD; supports both files
+  (`VfsHandle`) and directories (`DirHandle` with `O_DIRECTORY`).
+- `getdents64` returns `linux_dirent64` structs from `DirHandle`.
+- `spawn` reads an ELF from VFS, creates a child process with argv, sets
+  child as foreground.  `wait4` blocks parent until child exits/zombies.
 - `writev` (used by musl's `printf`) writes scatter/gather buffers to VGA.
 - `brk` grows the process heap by allocating and mapping zero-filled pages.
 - `mmap` supports anonymous `MAP_PRIVATE` allocations via a bump-down allocator
   starting at `0x4000_0000_0000`.
-- `Process` tracks `brk_base`/`brk_current` (computed from ELF segment extents)
-  and `mmap_next`/`mmap_regions`.
+- `Process` tracks `brk_base`/`brk_current` (computed from ELF segment extents),
+  `mmap_next`/`mmap_regions`, `fd_table`, `cwd`, `parent_pid`, `wait_thread`.
 - ELF parser extracts `phdr_vaddr`, `phnum`, and `phentsize` for the auxiliary
   vector (musl reads `AT_PHDR`/`AT_PHNUM`/`AT_PHENT` during startup).
+- `spawn_process_full` (in `osl/src/spawn.rs`) builds the initial stack with
+  `argc`, `argv` strings, `envp` (NULL), and auxiliary vector.
+- Async-to-sync bridge (`osl/src/blocking.rs`): spawns async VFS operations
+  as kernel tasks, blocks the user thread, unblocks on completion.
 - Unhandled syscalls log a warning with the syscall number and first 3 args,
   then return `-ENOSYS`.
-- Ring-3 page faults (e.g. `test pagefault`) log the fault, mark the process
-  zombie, restore kernel GS polarity, and kill the thread — no kernel panic.
+- Ring-3 page faults, GPFs, and invalid opcodes log the fault, mark the
+  process zombie, wake the parent's wait thread, restore kernel GS polarity,
+  and kill the thread — no kernel panic.
 - `test isolation` verifies two independently-created PML4s have genuinely
   independent user-space mappings at the same virtual address.
 - System info commands (cpuinfo, meminfo, memmap, pmap, threads, tasks, idt,
@@ -65,19 +82,23 @@ print to the console and exit. The initial user stack is set up with
 |------|------|
 | `libkernel/src/gdt.rs` | GDT with kernel + user code/data segments, TSS, `set_kernel_stack` for rsp0 |
 | `libkernel/src/syscall.rs` | SYSCALL MSR init, assembly entry stub, per-CPU data |
-| `osl/src/dispatch.rs` | `syscall_dispatch` (all syscall implementations) |
+| `libkernel/src/file.rs` | `FileHandle` trait, `FileError` enum, `ConsoleHandle` |
+| `libkernel/src/console.rs` | Console input buffer, foreground PID routing, blocking read |
+| `libkernel/src/process.rs` | `Process` struct (fd_table, cwd, brk/mmap, parent/wait), `ProcessManager`, zombie lifecycle |
+| `libkernel/src/elf.rs` | ELF64 parser (static `ET_EXEC`, x86-64) with phdr metadata for auxv |
+| `libkernel/src/memory/mod.rs` | `create_user_page_table`, `map_user_page`, `switch_address_space` |
+| `libkernel/src/task/scheduler.rs` | `spawn_user_thread`, `process_trampoline`, CR3 switching in `preempt_tick`, block/unblock |
+| `libkernel/src/interrupts.rs` | Ring-3-aware page fault, GPF, and invalid opcode handlers |
+| `osl/src/dispatch.rs` | `syscall_dispatch` (all 21 syscall implementations) |
 | `osl/src/errno.rs` | Linux errno constants, `file_errno()` / `vfs_errno()` converters |
 | `osl/src/file.rs` | `VfsHandle`, `DirHandle` (VFS-backed file handles) |
 | `osl/src/blocking.rs` | Async-to-sync bridge for VFS calls |
-| `osl/src/spawn.rs` | `spawn_process_full` (ELF spawning with argv) |
-| `libkernel/src/file.rs` | `FileHandle` trait, `FileError` enum, `ConsoleHandle` |
-| `libkernel/src/process.rs` | `Process` struct (with brk/mmap/fd tracking), `ProcessId`, process table, zombie marking/reaping |
-| `libkernel/src/elf.rs` | ELF64 parser (static `ET_EXEC`, x86-64) with phdr metadata for auxv |
-| `libkernel/src/memory/mod.rs` | `create_user_page_table`, `map_user_page`, `switch_address_space` |
-| `libkernel/src/task/scheduler.rs` | `spawn_user_thread`, `process_trampoline`, CR3 switching in `preempt_tick` |
-| `libkernel/src/interrupts.rs` | Ring-3-aware page fault handler |
+| `osl/src/spawn.rs` | `spawn_process_full` (ELF spawning with argv and parent PID) |
 | `kernel/src/ring3.rs` | Legacy `spawn_process` wrapper, `spawn_blob` (raw code), test helpers |
+| `kernel/src/keyboard_actor.rs` | Foreground routing: raw bytes to console or kernel line editor |
+| `kernel/src/main.rs` | Auto-launch `/shell` on boot |
 | `devices/src/vfs/proc_vfs.rs` | ProcVfs with 12 virtual files |
+| `user/shell.c` | Userspace shell (musl, static) |
 | `docs/syscalls/*.md` | Per-syscall documentation |
 
 ---
@@ -532,21 +553,29 @@ in `osl/src/errno.rs`; libkernel uses `FileError` for structured errors.
 
 | Nr | Name | Implementation |
 |----|------|---------------|
-| 0 | `read` | Returns 0 (EOF) for fd 0, `-EBADF` otherwise |
-| 1 | `write` | UTF-8 string to VGA for fd 1/2 |
-| 3 | `close` | No-op, returns 0 |
-| 5 | `fstat` | Zero-fills 144-byte stat, sets `st_mode = S_IFCHR\|0666` |
-| 9 | `mmap` | Anonymous `MAP_PRIVATE` only; bump-down allocator; allocates+maps zero-filled pages |
+| 0 | `read` | Via fd_table → `FileHandle::read`; `ConsoleHandle` blocks on empty input |
+| 1 | `write` | Via fd_table → `FileHandle::write` |
+| 2 | `open` | VFS `read_file` or `list_dir` → `VfsHandle`/`DirHandle`; path resolution relative to CWD |
+| 3 | `close` | Via fd_table |
+| 5 | `fstat` | `S_IFCHR` for console fds |
+| 8 | `lseek` | Returns `-ESPIPE` (not seekable) |
+| 9 | `mmap` | Anonymous `MAP_PRIVATE` only; bump-down allocator |
 | 10 | `mprotect` | No-op, returns 0 |
 | 11 | `munmap` | No-op stub, returns 0 (frames leaked) |
-| 12 | `brk` | Query or grow heap; allocates+maps zero-filled pages per-page |
-| 16 | `ioctl` | Returns `-ENOTTY` (-25) |
-| 20 | `writev` | Scatter/gather write to VGA for fd 1/2; UTF-8 with ASCII fallback |
-| 60 | `exit` | Mark zombie, kill thread |
+| 12 | `brk` | Query or grow heap; allocates+maps zero-filled pages |
+| 16 | `ioctl` | Returns `-ENOTTY` |
+| 20 | `writev` | Via fd_table; scatter/gather write |
+| 60 | `exit` | Mark zombie, wake parent wait_thread, kill thread |
+| 61 | `wait4` | Find zombie child, block if none, reap and return |
+| 72 | `futex` | No-op stub (single-threaded, lock never contended) |
+| 79 | `getcwd` | Copy `process.cwd` to user buffer |
+| 80 | `chdir` | Validate path via VFS `list_dir`, update `process.cwd` |
 | 158 | `arch_prctl` | `ARCH_SET_FS` writes `IA32_FS_BASE` MSR |
+| 217 | `getdents64` | Via `DirHandle::getdents64` |
 | 218 | `set_tid_address` | Returns current PID as TID |
 | 231 | `exit_group` | Same as `exit` (single-threaded) |
 | 273 | `set_robust_list` | No-op, returns 0 |
+| 500 | `spawn` (custom) | Path + argv; read ELF from VFS; `osl::spawn::spawn_process_full` |
 
 Lock ordering for `brk` and `mmap`: process table lock acquired/released to
 read state, then memory lock for frame allocation and page mapping, then process
@@ -561,19 +590,21 @@ See `docs/syscalls/` for detailed per-syscall documentation.
 - **Page deallocation**: `munmap` and `brk` shrink don't free frames or unmap
   pages.
 - **`mprotect`**: Doesn't actually update page table flags.
-- **FS_BASE save/restore**: Not saved across context switches; each process sets
-  it fresh via the trampoline, but preemption mid-syscall could lose it.
+- ~~**FS_BASE save/restore**~~: ✅ Fixed — FS_BASE is saved/restored per-thread
+  in `preempt_tick` via `save_current_context` / `restore_thread_state`.
 
 ---
 
-## Phase 5 — Cross-Compiler and musl Port  ⬜ NOT STARTED
+## Phase 5 — Cross-Compiler and musl Port  ✅ COMPLETE
 
 **Goal:** compile C programs that run as ostoo user processes.
 
-**Prerequisites:** Phase 4 syscalls are all implemented.  The next step is to
-build a static musl hello-world binary, copy it to the FAT image, and test with
-`exec /hello`.  Use `log::warn` output from unhandled syscalls to identify any
-missing syscalls that musl's startup path requires beyond what Phase 4 provides.
+**What was implemented:**
+- Docker-based build environment (`scripts/user-build.sh`) using
+  `x86_64-linux-musl-cross` toolchain.
+- `user/Makefile` compiles `*.c` files to static musl-linked ELF binaries.
+- `user/shell.c` is the primary musl binary (see Phase 6).
+- Binaries are deployed to the exFAT disk image or shared via virtio-9p.
 
 ### 5a. Toolchain strategy
 
@@ -641,56 +672,50 @@ pub extern "C" fn main() {
 
 ---
 
-## Phase 6 — Fork, Wait, and a Minimal Shell  ⬜ NOT STARTED
+## Phase 6 — Spawn, Wait, and a Minimal Shell  ✅ COMPLETE
 
-**Goal:** a user-mode shell that can `fork` + `exec` child programs.
+**Goal:** a user-mode shell that can launch and wait for child programs.
 
-### 6a. `fork`
+**What was implemented:**
 
-```rust
-fn sys_fork() -> ProcessId {
-    let child = current_process().clone_for_fork(mem);
-    // clone_for_fork: allocate new PML4, copy-on-write all user pages
-    //   (mark them read-only in both parent and child; CoW fault handler
-    //    does the actual copy when a write occurs)
-    enqueue_process(child);
-    child.pid    // returned in parent; 0 returned in child
-}
-```
+Instead of `fork` + `exec` (which requires CoW page faults), a custom
+`spawn` syscall (nr 500) combines process creation and ELF loading in a
+single kernel call.  This avoids the complexity of CoW while providing the
+same end-user functionality.
 
-CoW page fault handler:
-```rust
-if fault is a write to a CoW page {
-    allocate new frame
-    copy old frame content
-    remap the faulting page as writable in the current process
-    resume
-}
-```
+### 6a. `spawn` syscall (nr 500)
 
-### 6b. `waitpid`
+`spawn(path_ptr, path_len, argv_ptr, argv_count) -> child_pid`
 
-When a process calls `sys_exit(code)`:
-1. Mark it `Zombie`, store exit code.
-2. Wake any parent blocked in `waitpid`.
-3. Parent collects exit code; child's resources are freed.
+- Reads path and argv strings from userspace
+- Reads ELF from VFS via `osl::blocking::blocking()`
+- Calls `osl::spawn::spawn_process_full()` with argv and parent PID
+- Sets child as foreground process (`console::set_foreground`)
+- Returns child PID (or negative errno)
 
-### 6c. User-mode shell
+### 6b. `wait4` (syscall 61)
 
-Once fork/exec/wait work, a minimal C shell is straightforward:
-```c
-while (1) {
-    char line[256];
-    write(1, "$ ", 2);
-    read(0, line, sizeof line);
-    if (fork() == 0) {
-        execve(line, argv, envp);
-        write(2, "exec failed\n", 12);
-        _exit(1);
-    }
-    waitpid(-1, &status, 0);
-}
-```
+- `sys_wait4(pid, status_ptr, options)` — find zombie child, write exit
+  status, reap, return child PID
+- If no zombie found: register `wait_thread` on parent, block, retry on wake
+- `sys_exit` wakes parent's `wait_thread` via `scheduler::unblock()`
+
+### 6c. Userspace shell (`user/shell.c`)
+
+- Compiled with musl (static), deployed at `/shell`
+- Line editing: read char-by-char, echo, backspace, Ctrl+C, Ctrl+D
+- Built-in commands: `echo`, `pwd`, `cd`, `ls`, `cat`, `exit`, `help`
+- External programs: `spawn(path)` + `waitpid(child, &status, 0)`
+- Auto-launched from `kernel/src/main.rs`; falls back to kernel shell if
+  `/shell` is not found on the filesystem
+
+### 6d. What's deferred
+
+- **`fork` + CoW page faults** — standard POSIX `fork` is not implemented.
+  Adding it would require: marking all user pages read-only in both parent
+  and child, a CoW page fault handler that copies on write, and reference
+  counting on physical frames.  The `spawn` syscall covers the primary use
+  case (launching programs) without this complexity.
 
 ---
 
@@ -718,13 +743,11 @@ pub struct SigTable  { actions: [SigAction; 32], pending: SigSet, masked: SigSet
 ## Dependency Graph
 
 ```
-Phase 0 ✅ ← Phase 1 ✅ ← Phase 2 ✅ ← Phase 3 ✅ ← Phase 4 ✅ ← Phase 5 (musl)
-(toolchain)   (ring-3,       (address     (Process,        (syscall        (C programs)
-               syscall)       spaces)      ELF loader)      layer)
-                                                    ↓
-                                                Phase 6 (fork/exec/shell)
-                                                    ↓
-                                                Phase 7 (signals)
+Phase 0 ✅ ← Phase 1 ✅ ← Phase 2 ✅ ← Phase 3 ✅ ← Phase 4 ✅ ← Phase 5 ✅ ← Phase 6 ✅
+(toolchain)   (ring-3,       (address     (Process,        (syscall        (musl)       (spawn/wait/
+               syscall)       spaces)      ELF loader)      layer)                       shell)
+                                                                                  ↓
+                                                                           Phase 7 (signals)
 ```
 
 ---
@@ -763,17 +786,16 @@ per-CPU `CURRENT_PID`, per-CPU kernel stacks in the TSS, and IPI-based TLB
 shootdown when modifying another process's page table.
 
 ### Heap size
-The kernel heap is 512 KiB.  Process control blocks each consume 64 KiB
+The kernel heap is 1 MiB.  Process control blocks each consume 64 KiB
 (kernel stack) plus page table frames, plus `Vec` storage for `mmap_regions`.
-`reap_zombies()` is called before each `spawn_process` to recover heap, but
-loading multiple concurrent processes will still require a larger or
-demand-paged heap.
+Zombie processes are reaped via `wait4` + `reap()`, but loading multiple
+concurrent processes will still pressure the heap.
 
 ### Memory leaks
-Physical frames allocated by `brk` (on shrink), `mmap`, and ELF segment loading
-are never freed when a process exits.  `munmap` is a no-op stub.  This is
-acceptable for the current single-process-at-a-time workflow but must be
-addressed before running multiple long-lived processes.
+Physical frames allocated by `brk`, `mmap`, and ELF segment loading are
+never freed when a process exits.  `munmap` is a no-op stub.  This is
+acceptable for the current one-process-at-a-time shell workflow but must
+be addressed before running multiple concurrent long-lived processes.
 
 ---
 
@@ -785,6 +807,6 @@ addressed before running multiple long-lived processes.
 | Phase 2 complete | Two user processes have separate address spaces; `test isolation` passes | ✅ Done |
 | Phase 3 complete | `exec /path/to/elf` reads an ELF from the VFS, loads it into a fresh address space, and runs it | ✅ Done |
 | Phase 4 complete | 14 syscalls, initial stack with auxv, `brk`/`mmap` heap, `writev` for printf | ✅ Done |
-| Phase 5 / musl hello world | `hello` compiled with `x86_64-linux-musl-gcc -static` prints and exits cleanly | ⬜ |
-| Phase 6 complete | User shell forks, execs, and waits for children | ⬜ |
+| Phase 5 complete | `hello` compiled with `x86_64-linux-musl-gcc -static` prints and exits cleanly | ✅ Done |
+| Phase 6 complete | Userspace shell spawns children and waits for them; auto-launches on boot | ✅ Done |
 | Phase 7 complete | `SIGINT` (Ctrl+C) terminates the foreground process | ⬜ |

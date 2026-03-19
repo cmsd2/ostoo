@@ -143,10 +143,33 @@ Toolchain: current nightly (floating, `rust-toolchain.toml`).
 The macro generates a unified `poll_fn` loop when `#[on_tick]` or `#[on_stream]`
 are present, racing all event sources in a single future.
 
-### Shell (`kernel/src/shell.rs`)
-- `#[actor]`-based shell actor with persistent CWD state (`spin::Mutex<String>`).
+### User Space and Process Isolation
+- Full ring-3 process support with per-process page tables, SYSCALL/SYSRET,
+  and preemptive scheduling.
+- 21 Linux-compatible syscalls in `osl/src/dispatch.rs`.
+- Per-process FD table, CWD tracking, parent/child relationships, zombie
+  lifecycle with `wait4`/`reap`.
+- ELF loader for static x86-64 binaries; initial stack with `argc/argv/auxv`.
+- Custom `spawn` syscall (nr 500) for launching child processes.
+- Console input buffer with foreground PID routing and blocking `read(0)`.
+- Async-to-sync bridge (`osl/src/blocking.rs`) for VFS calls from syscall
+  context.
+- See [`docs/userspace-plan.md`](userspace-plan.md) for the full roadmap
+  (Phases 0–6 complete; Phase 7 signals not yet started).
+
+### Userspace Shell (`user/shell.c`)
+- Primary user interface: musl-linked C binary, auto-launched on boot from
+  `/shell` via `kernel/src/main.rs`.
+- Line editing: read char-by-char, echo, backspace, Ctrl+C (cancel), Ctrl+D
+  (exit on empty line).
+- Built-in commands: `echo`, `pwd`, `cd`, `ls`, `cat`, `exit`, `help`.
+- External programs: `spawn(path)` + `waitpid`.
+- Built with Docker-based musl cross-compiler (`scripts/user-build.sh`).
+- See [`docs/userspace-shell.md`](userspace-shell.md) for full design.
+
+### Kernel Shell (`kernel/src/shell.rs`) — fallback
+- `#[actor]`-based shell actor, active when no userspace shell is running.
 - Prompt includes CWD: `ostoo:/path> `.
-- `resolve_path` / `normalize_path` handle relative paths and `..` components.
 - Commands: `help`, `echo`, `driver <start|stop|info>`, `blk <info|read|ls|cat>`,
   `ls`, `cat`, `pwd`, `cd`, `mount`, `exec`, `test`.
 - Info commands (cpuinfo, meminfo, etc.) migrated to `/proc`; accessible via
@@ -154,13 +177,15 @@ are present, racing all event sources in a single future.
 
 ### Keyboard Actor (`kernel/src/keyboard_actor.rs`)
 - `#[actor]` + `#[on_stream(key_stream)]`; registered as `"keyboard"`.
-- Full readline-style line editing:
+- Foreground routing: when a user process is foreground, raw keypresses are
+  delivered to `console::push_input()` for userspace `read(0)`.
+- When kernel is foreground: full readline-style line editing:
   - Cursor movement: ← → / Ctrl+B/F, Home/End / Ctrl+A/E
   - Editing: Backspace, Delete, Ctrl+K (kill to end), Ctrl+U (kill to start),
     Ctrl+W (delete word)
   - History: ↑↓ / Ctrl+P/N, 50-entry `VecDeque`, live-buffer save/restore
   - Ctrl+C clears the line; Ctrl+L clears the screen
-- Dispatches complete lines to the shell via `ShellMsg::KeyLine`.
+- Dispatches complete lines to the kernel shell via `ShellMsg::KeyLine`.
 
 ### virtio-blk Block Device (`devices/src/virtio/`)
 - `virtio-drivers` 0.13 crate provides the virtio protocol; the kernel supplies
@@ -273,10 +298,10 @@ are present, racing all event sources in a single future.
 ## Known Issues / Technical Debt
 
 ### Heap Size
-The heap is a fixed 512 KiB at `0xFFFF_8000_0000_0000`. This accommodates two
+The heap is a fixed 1 MiB at `0xFFFF_8000_0000_0000`. This accommodates two
 64 KiB thread stacks (threads 0 and 1), per-process 64 KiB kernel stacks, plus
-driver and task allocations. `reap_zombies()` reclaims process heap on the next
-`spawn_process`, but concurrent processes will still pressure the heap. The
+driver and task allocations. Zombie processes are reaped via `wait4` + `reap()`,
+but concurrent processes will still pressure the heap. The
 `DumbVmemAllocator` has no reclamation path, so virtual address space for
 MMIO/ACPI mappings is also consumed monotonically.
 
@@ -303,25 +328,29 @@ output but functionally harmless.
 
 ## Possible Next Steps
 
-1. **IRQ-driven virtio-blk** — wire `IRQ_PENDING` to an `AtomicWaker` so
+1. **Signals** — `rt_sigaction`, `rt_sigreturn`, signal frame push/pop.
+   Ctrl+C (`SIGINT`) should terminate the foreground process.  See
+   [`docs/userspace-plan.md`](userspace-plan.md) Phase 7.
+
+2. **Page deallocation on process exit** — physical frames from `brk`,
+   `mmap`, and ELF segment loading are never freed.  `munmap` is a no-op
+   stub.  Must be addressed before running multiple long-lived processes.
+
+3. **IRQ-driven virtio-blk** — wire `IRQ_PENDING` to an `AtomicWaker` so
    `CompletionFuture` parks instead of busy-polling.
 
-2. **Larger / growable heap** — demand-paged heap that grows on fault, or at
-   minimum a larger static allocation.
+4. **`fork` + CoW page faults** — standard POSIX `fork`.  Currently bypassed
+   by the custom `spawn` syscall.  Requires CoW page fault handler and
+   frame reference counting.
 
-3. **exFAT write support** — directory entry creation, FAT chain allocation,
+5. **exFAT write support** — directory entry creation, FAT chain allocation,
    and sector writes to enable `touch`, `mkdir`, `cp`, `rm`.
 
-4. **New filesystem drivers** — a RAM-based tmpfs (`TmpVfs`) or a simple
-   flat-file initrd would exercise the VFS extension path without requiring
-   block I/O.
+6. **Larger / growable heap** — demand-paged heap that grows on fault, or a
+   larger static allocation.  1 MiB is tight with concurrent processes.
 
-5. **Multi-sector DMA** — batch multiple sectors per virtio request to reduce
+7. **Multi-sector DMA** — batch multiple sectors per virtio request to reduce
    queue round-trips for directory scans and file reads.
 
-6. **User space Phase 4: syscall layer** — implement `read`, `mmap`, `brk`,
-   `fstat`, `close`, `munmap` to run a static musl "Hello, world!" binary.
-   See [`docs/userspace-plan.md`](userspace-plan.md) for the full roadmap.
-
-7. **Reclaiming virtual address space** — replace `DumbVmemAllocator` with a
+8. **Reclaiming virtual address space** — replace `DumbVmemAllocator` with a
    proper free-list allocator so MMIO mappings can be released.
