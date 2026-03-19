@@ -7,6 +7,8 @@
 extern crate alloc;
 extern crate osl;
 
+use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::panic::PanicInfo;
 use bootloader::{BootInfo, entry_point};
 use libkernel::{println, init};
@@ -18,7 +20,7 @@ use libkernel::task::executor;
 use libkernel::task::scheduler;
 use libkernel::task::timer::{Delay, ticks};
 use x86_64::VirtAddr;
-use log::{debug, info, warn, error};
+use log::{info, warn};
 use acpi::platform::interrupt::InterruptModel;
 
 // Expose task_driver at crate root so #[actor]-generated code
@@ -31,13 +33,27 @@ mod ring3;
 mod shell;
 mod timeline_actor;
 
-pub const APIC_BASE: u64 = 0xFFFF_8001_0000_0000;
+// ---------------------------------------------------------------------------
+// Constants
+
+const APIC_BASE: u64 = 0xFFFF_8001_0000_0000;
+const VGA_PHYS: u64 = 0xB8000;
+const ECAM_PHYS: u64 = 0xB000_0000;
+const ECAM_SIZE: usize = 1024 * 1024;
+
+const VIRTIO_VENDOR: u16 = 0x1AF4;
+const VIRTIO_BLK_MODERN: u16 = 0x1042;
+const VIRTIO_BLK_LEGACY: u16 = 0x1001;
+const VIRTIO_9P_MODERN: u16 = 0x1049;
+const VIRTIO_9P_LEGACY: u16 = 0x1009;
+
+// ---------------------------------------------------------------------------
+// Panic handlers
 
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("{}", info);
-
     hlt_loop();
 }
 
@@ -47,6 +63,9 @@ fn panic(info: &PanicInfo) -> ! {
     libkernel::test_panic_handler(info)
 }
 
+// ---------------------------------------------------------------------------
+// Entry point and early init
+
 entry_point!(libkernel_main);
 
 pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
@@ -54,15 +73,7 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     use libkernel::allocator;
 
     libkernel::vga_buffer::init_display();
-
     logger::init().expect("logger");
-    debug!("debug");
-    info!("info");
-    warn!("warn");
-    error!("error");
-
-    println!("Hello World{}", "!");
-
     init();
 
     // Set up SYSCALL/SYSRET mechanism (must come after GDT/IDT are live).
@@ -80,212 +91,188 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
     allocator::init_heap(&mut mapper, &mut frame_allocator)
         .expect("heap initialization failed");
 
-    // Hand ownership to the global memory services so drivers can map memory
-    // at runtime via libkernel::memory::with_memory().
-    libkernel::memory::init_services(mapper, frame_allocator, phys_mem_offset, &boot_info.memory_map);
+    memory::init_services(mapper, frame_allocator, phys_mem_offset, &boot_info.memory_map);
 
-    // The bootloader's stack lives in the lower canonical half.  Migrate
-    // thread 0 to a heap-allocated stack (PML4 entry 256, high half) so
-    // that it survives CR3 switches into user page tables.
+    // Migrate thread 0 to a heap-allocated stack (high half) so it
+    // survives CR3 switches into user page tables.
     scheduler::migrate_to_heap_stack(run_kernel);
 }
 
-fn run_kernel() -> ! {
-    use alloc::{boxed::Box, vec, vec::Vec, rc::Rc};
+// ---------------------------------------------------------------------------
+// Kernel main (runs on heap stack)
 
-    // Map the VGA framebuffer into the kernel high half so it is accessible
-    // from isolated user page tables (entries 256–510 are shared).
+fn run_kernel() -> ! {
+    init_vga_remap();
+    init_apic();
+    init_pci();
+    init_virtio_blk();
+    let p9_client = init_virtio_9p();
+    init_vfs_mounts(p9_client);
+    init_actors();
+
+    #[cfg(test)]
+    test_main();
+
+    executor::spawn(Task::new(timer_task()));
+    executor::spawn(Task::new(status_task()));
+    executor::spawn(Task::new(launch_userspace_shell()));
+
+    scheduler::init();
+    scheduler::spawn_thread(|| executor::run_worker());
+    executor::run_worker();
+}
+
+// ---------------------------------------------------------------------------
+// Init helpers
+
+/// Remap the VGA framebuffer into the kernel high half so it is accessible
+/// from isolated user page tables (entries 256–510 are shared).
+fn init_vga_remap() {
     let vga_virt = libkernel::memory::with_memory(|mem| {
-        mem.map_mmio_region(x86_64::PhysAddr::new(0xb8000), libkernel::consts::PAGE_SIZE as usize)
+        mem.map_mmio_region(x86_64::PhysAddr::new(VGA_PHYS), libkernel::consts::PAGE_SIZE as usize)
     });
     libkernel::vga_buffer::remap_vga(vga_virt);
+}
 
+/// Parse ACPI tables and configure APIC (or fall back to legacy PIC).
+fn init_apic() {
     let phys_mem_offset = libkernel::memory::with_memory(|mem| mem.phys_mem_offset());
-
-    let heap_value = Box::new(41);
-    println!("heap_value at {:p}", heap_value);
-
-    // create a dynamically sized vector
-    let mut vec = Vec::new();
-    for i in 0..500 {
-        vec.push(i);
-    }
-    println!("vec at {:p}", vec.as_slice());
-
-    // create a reference counted vector -> will be freed when count reaches 0
-    let reference_counted = Rc::new(vec![1, 2, 3]);
-    let cloned_reference = reference_counted.clone();
-    println!("current reference count is {}", Rc::strong_count(&cloned_reference));
-    core::mem::drop(reference_counted);
-    println!("reference count is {} now", Rc::strong_count(&cloned_reference));
-
     let interrupt_model = unsafe {
         kernel_acpi::read_acpi(phys_mem_offset).expect("acpi")
     };
 
-    println!("interrupt model: {:?}", interrupt_model);
-
     if let InterruptModel::Apic(_) = interrupt_model {
-        info!("[kernel] init configuring apic");
+        info!("[kernel] configuring APIC");
         libkernel::memory::with_memory(|mem| {
             apic::init(&interrupt_model, VirtAddr::new(APIC_BASE), mem);
         });
         libkernel::interrupts::disable_pic();
         apic::calibrate_and_start_lapic_timer();
     } else {
-        info!("[kernel] init configuring pic");
+        info!("[kernel] configuring PIC (legacy)");
     }
+}
 
-    // Map the PCIe ECAM region (Q35 machine: 1 MiB at phys 0xB000_0000 for bus 0).
+/// Map the PCIe ECAM region and scan for devices.
+fn init_pci() {
     let ecam_virt = libkernel::memory::with_memory(|mem| {
-        mem.map_mmio_region(x86_64::PhysAddr::new(0xB000_0000), 1024 * 1024)
+        mem.map_mmio_region(x86_64::PhysAddr::new(ECAM_PHYS), ECAM_SIZE)
     });
     devices::virtio::set_ecam_base(ecam_virt.as_u64());
-
     devices::pci::init();
+}
 
-    // ── virtio-blk probe ─────────────────────────────────────────────────────
-    // Probe legacy (0x1001) and modern-transitional (0x1042) virtio-blk devices.
-    let blk_dev = devices::pci::find_devices(0x1AF4, 0x1042)
+/// Find the first PCI device matching the given vendor and either device ID.
+fn find_virtio_device(modern_id: u16, legacy_id: u16) -> Option<devices::pci::PciDevice> {
+    devices::pci::find_devices(VIRTIO_VENDOR, modern_id)
         .into_iter()
-        .chain(devices::pci::find_devices(0x1AF4, 0x1001))
-        .next();
+        .chain(devices::pci::find_devices(VIRTIO_VENDOR, legacy_id))
+        .next()
+}
 
-    if let Some(pci_dev) = blk_dev {
-        info!("[kernel] found virtio-blk at {:02x}:{:02x}.{}",
-            pci_dev.bus, pci_dev.device, pci_dev.function);
-        match devices::virtio::create_blk_transport(
-            pci_dev.bus, pci_dev.device, pci_dev.function,
-        ) {
-            Some(transport) => {
-                let actor = devices::virtio::blk::VirtioBlkActor::new(transport);
-                let (drv, inbox) =
-                    devices::virtio::blk::VirtioBlkActorDriver::new(actor);
-                devices::driver::register(Box::new(drv));
-                libkernel::task::registry::register("virtio-blk", inbox);
-                devices::driver::start_driver("virtio-blk").ok();
-                info!("[kernel] virtio-blk registered");
-            }
-            None => warn!("[kernel] virtio-blk transport init failed"),
+/// Probe, initialise, and register the virtio-blk actor.
+fn init_virtio_blk() {
+    let pci_dev = match find_virtio_device(VIRTIO_BLK_MODERN, VIRTIO_BLK_LEGACY) {
+        Some(d) => d,
+        None => { info!("[kernel] no virtio-blk device found"); return; }
+    };
+
+    info!("[kernel] found virtio-blk at {:02x}:{:02x}.{}",
+        pci_dev.bus, pci_dev.device, pci_dev.function);
+
+    let transport = match devices::virtio::create_pci_transport(
+        pci_dev.bus, pci_dev.device, pci_dev.function,
+    ) {
+        Some(t) => t,
+        None => { warn!("[kernel] virtio-blk transport init failed"); return; }
+    };
+
+    let actor = devices::virtio::blk::VirtioBlkActor::new(transport);
+    let (drv, inbox) = devices::virtio::blk::VirtioBlkActorDriver::new(actor);
+    devices::driver::register(Box::new(drv));
+    libkernel::task::registry::register("virtio-blk", inbox);
+    devices::driver::start_driver("virtio-blk").ok();
+    info!("[kernel] virtio-blk registered");
+}
+
+/// Probe and initialise the virtio-9p client (if present).
+fn init_virtio_9p() -> Option<Arc<devices::virtio::p9::P9Client>> {
+    let pci_dev = match find_virtio_device(VIRTIO_9P_MODERN, VIRTIO_9P_LEGACY) {
+        Some(d) => d,
+        None => { info!("[kernel] no virtio-9p device found"); return None; }
+    };
+
+    info!("[kernel] found virtio-9p at {:02x}:{:02x}.{}",
+        pci_dev.bus, pci_dev.device, pci_dev.function);
+
+    let transport = devices::virtio::create_pci_transport(
+        pci_dev.bus, pci_dev.device, pci_dev.function,
+    )?;
+
+    match devices::virtio::p9::P9Client::new(transport) {
+        Ok(client) => {
+            info!("[kernel] 9p client initialised");
+            Some(Arc::new(client))
         }
-    } else {
-        info!("[kernel] no virtio-blk device found");
-    }
-
-    // ── virtio-9p probe ─────────────────────────────────────────────────────
-    let p9_dev = devices::pci::find_devices(0x1AF4, 0x1049)  // modern
-        .into_iter()
-        .chain(devices::pci::find_devices(0x1AF4, 0x1009))   // legacy
-        .next();
-
-    let p9_client: Option<alloc::sync::Arc<devices::virtio::p9::P9Client>> =
-        if let Some(pci_dev) = p9_dev {
-            info!("[kernel] found virtio-9p at {:02x}:{:02x}.{}",
-                pci_dev.bus, pci_dev.device, pci_dev.function);
-            devices::virtio::create_pci_transport(
-                pci_dev.bus, pci_dev.device, pci_dev.function,
-            ).and_then(|transport| {
-                match devices::virtio::p9::P9Client::new(transport) {
-                    Ok(client) => {
-                        info!("[kernel] 9p client initialised");
-                        Some(alloc::sync::Arc::new(client))
-                    }
-                    Err(e) => {
-                        warn!("[kernel] 9p client init failed: {:?}", e);
-                        None
-                    }
-                }
-            })
-        } else {
-            info!("[kernel] no virtio-9p device found");
+        Err(e) => {
+            warn!("[kernel] 9p client init failed: {:?}", e);
             None
-        };
+        }
+    }
+}
 
+/// Set up VFS mount table: /host (9p), /proc, / (exfat or 9p fallback).
+fn init_vfs_mounts(p9_client: Option<Arc<devices::virtio::p9::P9Client>>) {
     if let Some(ref client) = p9_client {
         devices::vfs::mount("/host",
             devices::vfs::AnyVfs::Plan9(
-                devices::vfs::Plan9Vfs::new(alloc::sync::Arc::clone(client))));
+                devices::vfs::Plan9Vfs::new(Arc::clone(client))));
         info!("[kernel] 9p filesystem mounted at /host");
     }
 
-    // Always mount /proc (no block device required).
     devices::vfs::mount("/proc", devices::vfs::AnyVfs::Proc(devices::vfs::ProcVfs));
 
-    // Mount exFAT at / if virtio-blk was registered.
-    let have_blk = if let Some(inbox) = libkernel::task::registry::get::<
+    // / — exFAT if disk present, else 9p fallback
+    if let Some(inbox) = libkernel::task::registry::get::<
         devices::virtio::blk::VirtioBlkMsg,
         devices::virtio::blk::VirtioBlkInfo,
     >("virtio-blk") {
         devices::vfs::mount("/", devices::vfs::AnyVfs::Exfat(
-            devices::vfs::ExfatVfs::new(inbox)
-        ));
-        true
-    } else {
-        false
-    };
-
-    // If no block device but 9p is available, mount 9p at / as fallback
-    // so /shell auto-launch works without a disk image.
-    if !have_blk {
-        if let Some(client) = p9_client {
-            devices::vfs::mount("/",
-                devices::vfs::AnyVfs::Plan9(
-                    devices::vfs::Plan9Vfs::new(client)));
-            info!("[kernel] 9p filesystem mounted at / (fallback)");
-        }
+            devices::vfs::ExfatVfs::new(inbox)));
+    } else if let Some(client) = p9_client {
+        devices::vfs::mount("/",
+            devices::vfs::AnyVfs::Plan9(
+                devices::vfs::Plan9Vfs::new(client)));
+        info!("[kernel] 9p filesystem mounted at / (fallback)");
     }
+}
 
-    let (dummy_driver, dummy_inbox) =
-        devices::dummy::DummyDriver::new(devices::dummy::Dummy::new());
-    devices::driver::register(Box::new(dummy_driver));
-    libkernel::task::registry::register("dummy", dummy_inbox);
+/// Register and start the built-in actors (dummy, shell, keyboard, timeline).
+fn init_actors() {
+    let (drv, inbox) = devices::dummy::DummyDriver::new(devices::dummy::Dummy::new());
+    devices::driver::register(Box::new(drv));
+    libkernel::task::registry::register("dummy", inbox);
 
-    let (shell_driver, shell_inbox) =
-        shell::ShellDriver::new(shell::Shell::new());
-    devices::driver::register(Box::new(shell_driver));
-    libkernel::task::registry::register("shell", shell_inbox.clone());
+    let (drv, inbox) = shell::ShellDriver::new(shell::Shell::new());
+    devices::driver::register(Box::new(drv));
+    libkernel::task::registry::register("shell", inbox.clone());
     devices::driver::start_driver("shell").ok();
 
-    let (kb_driver, kb_inbox) =
+    let (drv, inbox) =
         keyboard_actor::KeyboardActorDriver::new(keyboard_actor::KeyboardActor::new());
-    devices::driver::register(Box::new(kb_driver));
-    libkernel::task::registry::register("keyboard", kb_inbox);
+    devices::driver::register(Box::new(drv));
+    libkernel::task::registry::register("keyboard", inbox);
     devices::driver::start_driver("keyboard").ok();
 
-    let (tl_driver, tl_inbox) =
+    let (drv, inbox) =
         timeline_actor::TimelineActorDriver::new(timeline_actor::TimelineActor::new());
-    devices::driver::register(Box::new(tl_driver));
-    libkernel::task::registry::register("timeline", tl_inbox);
+    devices::driver::register(Box::new(drv));
+    libkernel::task::registry::register("timeline", inbox);
     devices::driver::start_driver("timeline").ok();
-
-    #[cfg(test)]
-    test_main();
-
-    executor::spawn(Task::new(example_task()));
-    executor::spawn(Task::new(timer_task()));
-    executor::spawn(Task::new(status_task()));
-    executor::spawn(Task::new(launch_userspace_shell()));
-
-    // Register the current context as thread 0 of the preemptive scheduler.
-    scheduler::init();
-
-    // Spawn thread 1 — also runs the executor, demonstrating multi-threaded
-    // task dispatch.  Both threads compete for tasks from the shared queue.
-    scheduler::spawn_thread(|| executor::run_worker());
-
-    // Thread 0 enters the executor loop.  The LAPIC timer will preempt it
-    // every 10 ms regardless of what the running async task is doing.
-    executor::run_worker();
 }
 
-async fn async_number() -> u32 {
-    42
-}
-
-async fn example_task() {
-    let number = async_number().await;
-    info!("async number: {}", number);
-}
+// ---------------------------------------------------------------------------
+// Async tasks
 
 async fn timer_task() {
     loop {
@@ -297,39 +284,36 @@ async fn timer_task() {
 async fn status_task() {
     loop {
         Delay::from_millis(250).await;
-        let ctx = scheduler::context_switches();
-        let rdy = executor::ready_count();
-        let wait = executor::wait_count();
-        let secs = ticks() / libkernel::task::timer::TICKS_PER_SECOND;
         libkernel::status_bar!(
             " T{} | ctx:{:6} | rdy:{} wait:{} | up:{:6}s",
-            scheduler::current_thread_idx(), ctx, rdy, wait, secs
+            scheduler::current_thread_idx(),
+            scheduler::context_switches(),
+            executor::ready_count(),
+            executor::wait_count(),
+            ticks() / libkernel::task::timer::TICKS_PER_SECOND,
         );
     }
 }
 
-// ---------------------------------------------------------------------------
-// Auto-launch userspace shell
-
 async fn launch_userspace_shell() {
-    // Wait a bit for VFS to be ready.
-    Delay::from_millis(100).await;
+    Delay::from_millis(100).await; // let VFS settle
 
-    match devices::vfs::read_file("/shell").await {
-        Ok(data) => {
-            match ring3::spawn_process(&data) {
-                Ok(pid) => {
-                    info!("[kernel] launched /shell as pid {}", pid.as_u64());
-                    libkernel::console::set_foreground(pid);
-                }
-                Err(e) => {
-                    warn!("[kernel] failed to spawn /shell: {}", e);
-                    info!("[kernel] falling back to kernel shell");
-                }
-            }
-        }
+    let data = match devices::vfs::read_file("/shell").await {
+        Ok(d) => d,
         Err(e) => {
             info!("[kernel] /shell not found ({:?}), using kernel shell", e);
+            return;
+        }
+    };
+
+    match ring3::spawn_process(&data) {
+        Ok(pid) => {
+            info!("[kernel] launched /shell as pid {}", pid.as_u64());
+            libkernel::console::set_foreground(pid);
+        }
+        Err(e) => {
+            warn!("[kernel] failed to spawn /shell: {}", e);
+            info!("[kernel] falling back to kernel shell");
         }
     }
 }
