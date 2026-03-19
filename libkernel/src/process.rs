@@ -213,6 +213,11 @@ where
     table.get(&pid).map(f)
 }
 
+/// Check whether a process exists and is a zombie.
+pub fn is_zombie(pid: ProcessId) -> bool {
+    PROCESS_TABLE.lock().get(&pid).map_or(false, |p| p.state == ProcessState::Zombie)
+}
+
 /// Mark the process as a zombie with the given exit code.
 pub fn mark_zombie(pid: ProcessId, code: i32) {
     if let Some(proc) = PROCESS_TABLE.lock().get_mut(&pid) {

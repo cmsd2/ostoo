@@ -331,14 +331,40 @@ async fn launch_userspace_shell() {
         }
     };
 
-    match ring3::spawn_process(&data) {
+    let pid = match ring3::spawn_process(&data) {
         Ok(pid) => {
             info!("[kernel] launched /shell as pid {}", pid.as_u64());
             libkernel::console::set_foreground(pid);
+            pid
         }
         Err(e) => {
             warn!("[kernel] failed to spawn /shell: {}", e);
             info!("[kernel] falling back to kernel shell");
+            return;
+        }
+    };
+
+    wait_and_reap(pid).await;
+    println!("\n[kernel] userspace shell exited — type 'help' for kernel commands");
+
+    // Tell the kernel shell actor to redraw its prompt.
+    if let Some(inbox) = libkernel::task::registry::get::<
+        shell::ShellMsg, (),
+    >("shell") {
+        use libkernel::task::mailbox::ActorMsg;
+        inbox.send(ActorMsg::Inner(shell::ShellMsg::Reprompt));
+    }
+}
+
+/// Poll until `pid` becomes a zombie, then reap it and reset the foreground
+/// back to the kernel shell.
+async fn wait_and_reap(pid: libkernel::process::ProcessId) {
+    loop {
+        Delay::from_millis(50).await;
+        if libkernel::process::is_zombie(pid) {
+            break;
         }
     }
+    libkernel::process::reap(pid);
+    libkernel::console::set_foreground(libkernel::process::ProcessId::KERNEL);
 }

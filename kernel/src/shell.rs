@@ -11,6 +11,8 @@ use libkernel::{print, println};
 pub enum ShellMsg {
     /// A complete line of input from the keyboard actor.
     KeyLine(String),
+    /// Redraw the prompt (e.g. after returning from a userspace process).
+    Reprompt,
 }
 
 // ---------------------------------------------------------------------------
@@ -76,10 +78,15 @@ impl Shell {
         self.print_prompt();
     }
 
-    // ── Message handler ───────────────────────────────────────────────────
+    // ── Message handlers ──────────────────────────────────────────────────
     #[on_message(KeyLine)]
     async fn on_key_line(&self, line: String) {
         self.execute_command(&line).await;
+        self.print_prompt();
+    }
+
+    #[on_message(Reprompt)]
+    async fn on_reprompt(&self) {
         self.print_prompt();
     }
 
@@ -331,15 +338,19 @@ impl Shell {
         let cwd  = self.cwd.lock().clone();
         let path = resolve_path(&cwd, path);
 
-        match devices::vfs::read_file(&path).await {
-            Ok(data) => {
-                match crate::ring3::spawn_process(&data) {
-                    Ok(pid) => println!("[exec] spawned pid {}", pid.as_u64()),
-                    Err(e)  => println!("exec: {}", e),
-                }
-            }
-            Err(e) => println!("exec: {:?}", e),
-        }
+        let data = match devices::vfs::read_file(&path).await {
+            Ok(d) => d,
+            Err(e) => { println!("exec: {:?}", e); return; }
+        };
+
+        let pid = match crate::ring3::spawn_process(&data) {
+            Ok(pid) => pid,
+            Err(e) => { println!("exec: {}", e); return; }
+        };
+
+        println!("[exec] spawned pid {}", pid.as_u64());
+        libkernel::console::set_foreground(pid);
+        crate::wait_and_reap(pid).await;
     }
 
     // ── md5 ──────────────────────────────────────────────────────────────
