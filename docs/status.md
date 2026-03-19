@@ -163,11 +163,11 @@ are present, racing all event sources in a single future.
 - Dispatches complete lines to the shell via `ShellMsg::KeyLine`.
 
 ### virtio-blk Block Device (`devices/src/virtio/`)
-- `virtio-drivers` 0.7 crate provides the virtio protocol; the kernel supplies
+- `virtio-drivers` 0.13 crate provides the virtio protocol; the kernel supplies
   `KernelHal` implementing `Hal` for DMA allocation, MMIO mapping, and
   virtual→physical address translation.
 - QEMU Q35 machine; PCIe ECAM at physical `0xB000_0000` mapped at boot via
-  `MemoryServices::map_mmio_region`.
+  `MemoryServices::map_mmio_region`.  `PciRoot` is generic over `MmioCam<'static>`.
 - `VirtioBlkActor` actor: handles `Read` and `Write` messages using the
   non-blocking virtio-drivers API (`read_blocks_nb` / `complete_read_blocks`)
   with a busy-poll `CompletionFuture` for MVP.
@@ -176,6 +176,23 @@ are present, racing all event sources in a single future.
   addresses for the device.
 - Shell commands: `blk info`, `blk read <sector>`.
 - See [`docs/virtio-blk.md`](virtio-blk.md) for full details.
+
+### VirtIO 9P Host Directory Sharing (`devices/src/virtio/p9*.rs`)
+- VirtIO 9P (9P2000.L) driver for sharing a host directory into the guest,
+  providing a Docker-volume-like workflow: edit files on the host, they appear
+  instantly in the guest.
+- `p9_proto.rs` — minimal 9P2000.L wire protocol: 8 message pairs (version,
+  attach, walk, lopen, read, readdir, getattr, clunk).
+- `p9.rs` — `P9Client` high-level client wrapping `VirtIO9p<KernelHal, PciTransport>`.
+  Synchronous API behind `spin::Mutex`; performs version handshake + attach on
+  construction.  Public methods: `list_dir`, `read_file`, `stat`.
+- QEMU shares `./user` directory via `-fsdev local,...,security_model=none`
+  + `-device virtio-9p-pci,...,mount_tag=hostfs`.
+- Mounted at `/host` (always) and at `/` as fallback when no virtio-blk disk is
+  present, so `/shell` auto-launch works without a disk image.
+- PCI device IDs: `0x1AF4:0x1049` (modern), `0x1AF4:0x1009` (legacy).
+- Read-only for MVP; no write/create/delete support.
+- See [`docs/virtio-9p.md`](virtio-9p.md) for full details.
 
 ### exFAT Filesystem (`devices/src/virtio/exfat.rs`)
 - Read-only exFAT driver with no external dependencies.
@@ -194,6 +211,8 @@ are present, racing all event sources in a single future.
   longest-mountpoint-first; the `Arc` is cloned out before any `.await` so
   the lock is never held across a suspension point.
 - `ExfatVfs` — wraps a `BlkInbox` and delegates to the exFAT driver.
+- `Plan9Vfs` — wraps an `Arc<P9Client>` and delegates to the 9P client.
+  Maps `P9Error` to `VfsError` (ENOENT→NotFound, ENOTDIR→NotADirectory, etc.).
 - `ProcVfs` — synthetic filesystem; no block I/O.  All system info commands
   have been migrated from the shell to `/proc` virtual files:
   - `/proc/tasks` — ready / waiting task counts from the executor.
@@ -210,7 +229,9 @@ are present, racing all event sources in a single future.
   - `/proc/ioapic` — I/O APIC redirection table entries.
 - Shell commands: `ls`, `cat`, `cd` use the VFS API; `mount` manages the
   mount table at runtime (`mount`, `mount proc <mp>`, `mount blk <mp>`).
-- `/proc` is always mounted at boot; exFAT `/` is mounted if virtio-blk is present.
+- `/proc` is always mounted at boot; exFAT `/` is mounted if virtio-blk is
+  present; 9p `/host` is mounted if virtio-9p is present (and 9p falls back
+  to `/` when no disk image exists).
 - See [`docs/vfs.md`](vfs.md) for full design notes.
 
 ### Dummy Driver (`devices/src/dummy.rs`)

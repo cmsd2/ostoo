@@ -4,7 +4,7 @@
 
 The kernel includes a PCI virtio-blk driver that provides read/write access to
 a QEMU virtual disk.  The driver is implemented using the `virtio-drivers` crate
-(v0.7) and integrates with the existing actor/driver framework.
+(v0.13) and integrates with the existing actor/driver framework.
 
 The driver is started automatically at boot if a virtio-blk PCI device is
 found.  It is accessible from the shell via the `blk` commands.
@@ -60,16 +60,20 @@ Physical 0xB000_0000  →  Virtual phys_mem_offset + 0xB000_0000
 The mapping is created once during `libkernel_main` by calling
 `MemoryServices::map_mmio_region`.  The resulting virtual base is stored in the
 `ECAM_VIRT_BASE` atomic and used by `create_pci_root()` which constructs a
-`PciRoot` for the `virtio-drivers` transport layer.
+`PciRoot<MmioCam<'static>>` for the `virtio-drivers` transport layer.
+(In virtio-drivers 0.13, `PciRoot` is generic over a `ConfigurationAccess`
+implementation; `MmioCam` wraps the raw MMIO pointer with a `Cam::Ecam` mode.)
 
-#### `create_blk_transport`
+#### `create_pci_transport` (formerly `create_blk_transport`)
 
 ```rust
-pub fn create_blk_transport(bus: u8, device: u8, function: u8) -> Option<PciTransport>
+pub fn create_pci_transport(bus: u8, device: u8, function: u8) -> Option<PciTransport>
 ```
 
-Wraps `PciTransport::new::<KernelHal>`, isolating `virtio-drivers` from the
+Wraps `PciTransport::new::<KernelHal, _>`, isolating `virtio-drivers` from the
 kernel binary — the kernel crate does not depend on `virtio-drivers` directly.
+Works for any virtio-pci device (blk, 9p, etc.), not just block devices.
+`create_blk_transport` is kept as a legacy alias.
 
 #### `register_blk_irq`
 
@@ -132,7 +136,7 @@ on_read(sector, reply):
 Write is symmetric with `write_blocks_nb` / `complete_write_blocks`.
 
 All of `read_blocks_nb`, `write_blocks_nb`, `complete_read_blocks`, and
-`complete_write_blocks` are `unsafe fn` in `virtio-drivers` 0.7 — the safety
+`complete_write_blocks` are `unsafe fn` in `virtio-drivers` — the safety
 contract is that the buffers remain valid and unpinned for the duration of the
 I/O.  Because `buf`, `req`, and `resp` all live in the `async` state machine
 on the heap, they are not moved or dropped between submit and complete.
@@ -210,9 +214,9 @@ libkernel_main()
   3. devices::pci::init()                   ← scan CF8/CFC config space
   4. find_devices(0x1AF4, 0x1042)           ← probe modern-transitional first
      find_devices(0x1AF4, 0x1001)           ← then legacy
-  5. virtio::create_blk_transport(bus, dev, func)
-       └─ PciRoot::new(ECAM_VIRT_BASE, Cam::Ecam)
-          PciTransport::new::<KernelHal>(&mut root, df)
+  5. virtio::create_pci_transport(bus, dev, func)
+       └─ PciRoot::new(MmioCam::new(ECAM_VIRT_BASE, Cam::Ecam))
+          PciTransport::new::<KernelHal, _>(&mut root, df)
   6. VirtioBlkActor::new(transport)
   7. VirtioBlkActorDriver::new(actor)
   8. driver::register + registry::register("virtio-blk", inbox)
@@ -279,9 +283,11 @@ Both are probed at boot; modern-transitional is tried first.
 
 | File | Role |
 |---|---|
-| `devices/src/virtio/mod.rs` | `KernelHal`, ECAM state, `create_blk_transport`, `register_blk_irq` |
+| `devices/src/virtio/mod.rs` | `KernelHal`, ECAM state, `create_pci_transport`, `register_blk_irq` |
 | `devices/src/virtio/blk.rs` | `VirtioBlkActor`, `VirtioBlkMsg`, `VirtioBlkInfo`, `CompletionFuture` |
-| `kernel/src/main.rs` | ECAM mapping, PCI probe, actor registration |
+| `devices/src/virtio/p9_proto.rs` | 9P2000.L wire protocol encode/decode |
+| `devices/src/virtio/p9.rs` | `P9Client` — high-level 9P client wrapping `VirtIO9p` |
+| `kernel/src/main.rs` | ECAM mapping, PCI probe (blk + 9p), actor registration |
 | `devices/src/virtio/exfat.rs` | exFAT partition detection, filesystem, path walk |
 | `kernel/src/shell.rs` | `blk info`, `blk read`, `blk ls`, `blk cat`, `ls`, `cat`, `cd`, `pwd` |
 | `libkernel/src/memory/mod.rs` | `map_mmio_region`, `alloc_dma_pages`, `translate_virt` |

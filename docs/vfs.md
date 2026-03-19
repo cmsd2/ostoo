@@ -24,6 +24,7 @@ devices/src/
   vfs/
     mod.rs          — public API, mount table, path resolution
     exfat_vfs.rs    — ExfatVfs: wraps virtio-blk + exFAT driver
+    plan9_vfs.rs    — Plan9Vfs: wraps virtio-9p P9Client
     proc_vfs.rs     — ProcVfs: synthetic kernel-info filesystem
 ```
 
@@ -39,7 +40,7 @@ pub enum VfsError {
     IoError, NotFound, NotAFile, NotADirectory, FileTooLarge, NoFilesystem,
 }
 
-pub enum AnyVfs { Exfat(ExfatVfs), Proc(ProcVfs) }
+pub enum AnyVfs { Exfat(ExfatVfs), Plan9(Plan9Vfs), Proc(ProcVfs) }
 
 // Functions
 pub fn  mount(mountpoint: &str, fs: AnyVfs);
@@ -61,6 +62,7 @@ verbose in `no_std`.  Instead, `AnyVfs` is a plain enum:
 ```rust
 pub enum AnyVfs {
     Exfat(ExfatVfs),
+    Plan9(Plan9Vfs),
     Proc(ProcVfs),
 }
 
@@ -68,14 +70,16 @@ impl AnyVfs {
     pub async fn list_dir(&self, path: &str) -> Result<Vec<VfsDirEntry>, VfsError> {
         match self {
             AnyVfs::Exfat(fs) => fs.list_dir(path).await,
+            AnyVfs::Plan9(fs) => fs.list_dir(path).await,
             AnyVfs::Proc(fs)  => fs.list_dir(path).await,
         }
     }
-    // read_file likewise
+    // read_file, fs_type likewise
 }
 ```
 
-Adding a new filesystem = add one variant + two match arms.
+Adding a new filesystem = add one variant + three match arms (`list_dir`,
+`read_file`, `fs_type`).
 
 ---
 
@@ -143,6 +147,36 @@ ExfatVfs::list_dir / read_file
 
 ---
 
+## Plan9Vfs
+
+`Plan9Vfs` wraps an `Arc<P9Client>` and delegates to the 9P2000.L client.
+Unlike `ExfatVfs` (which goes through the actor/mailbox path), the P9 client
+performs synchronous virtio-9p device I/O directly under a `spin::Mutex`.
+
+```
+Plan9Vfs::list_dir / read_file
+    └─ P9Client::list_dir / read_file
+        └─ VirtIO9p::request (virtio-drivers)
+```
+
+`P9Error` → `VfsError` mapping:
+
+| P9Error | VfsError |
+|---|---|
+| ServerError(2) (ENOENT) | NotFound |
+| ServerError(20) (ENOTDIR) | NotADirectory |
+| ServerError(21) (EISDIR) | NotAFile |
+| ServerError(_) / DeviceError | IoError |
+| BufferTooSmall / InvalidResponse / Utf8Error | IoError |
+
+The `list_dir` result sets `is_dir` from the dirent's `dtype` field (4 = DT_DIR)
+or the qid type bit (0x80 = directory).  The `size` field is 0 since `readdir`
+does not report file sizes — a follow-up `stat` per entry could be added later.
+
+See [`docs/virtio-9p.md`](virtio-9p.md) for the full 9P driver documentation.
+
+---
+
 ## ProcVfs
 
 A synthetic filesystem with no block I/O.  All content is computed on demand.
@@ -164,16 +198,35 @@ Data sources:
 ## Kernel initialisation (`kernel/src/main.rs`)
 
 ```rust
+// Probe virtio-9p and create a shared P9Client.
+let p9_client = probe_9p();  // returns Option<Arc<P9Client>>
+
+// If 9p is available, always mount at /host.
+if let Some(ref client) = p9_client {
+    devices::vfs::mount("/host", AnyVfs::Plan9(Plan9Vfs::new(Arc::clone(client))));
+}
+
 // Always mount /proc — available without a block device.
 devices::vfs::mount("/proc", AnyVfs::Proc(ProcVfs));
 
-// Mount exFAT at / only if virtio-blk was probed successfully.
-if let Some(inbox) = registry::get::<VirtioBlkMsg, VirtioBlkInfo>("virtio-blk") {
+// Mount exFAT at / if virtio-blk was probed successfully.
+let have_blk = if let Some(inbox) = registry::get::<..>("virtio-blk") {
     devices::vfs::mount("/", AnyVfs::Exfat(ExfatVfs::new(inbox)));
+    true
+} else { false };
+
+// Fallback: mount 9p at / if no disk image is present.
+if !have_blk {
+    if let Some(client) = p9_client {
+        devices::vfs::mount("/", AnyVfs::Plan9(Plan9Vfs::new(client)));
+    }
 }
 ```
 
-This runs after the virtio-blk probe block and before task spawning.
+This runs after both the virtio-blk and virtio-9p probe blocks and before task
+spawning.  When both are present, exFAT owns `/` and 9p is at `/host`.  When
+only 9p is present, it is mounted at both `/host` and `/` so that `/shell`
+auto-launch works without a disk image.
 
 ---
 
@@ -201,39 +254,30 @@ mount blk  <mountpoint> — attach an ExfatVfs instance (requires virtio-blk)
 ## Example session
 
 ```
-# Boot without a disk image
+# Boot with 9p only (no disk image)
 ostoo:/> mount
-  /proc  proc
-ostoo:/> ls /proc
-  [FILE     0]  tasks
-  [FILE     0]  uptime
-  [FILE     0]  drivers
+  /       9p
+  /host   9p
+  /proc   proc
+ostoo:/> ls /
+         shell
+ostoo:/> ls /host
+         shell
 ostoo:/> cat /proc/uptime
 42s
-ostoo:/> cat /proc/drivers
-virtio-blk  Running
-shell       Running
-keyboard    Running
 
-# Boot with an exFAT disk image
+# Boot with both disk image and 9p
 ostoo:/> mount
   /       exfat
+  /host   9p
   /proc   proc
 ostoo:/> ls /
   [DIR]        subdir
   [FILE    13]  hello.txt
-ostoo:/> cat /hello.txt
-Hello, kernel!
-ostoo:/> cd /proc && ls
-  [FILE     0]  tasks
-  [FILE     0]  uptime
-  [FILE     0]  drivers
-ostoo:/proc> mount proc /proc2
-mounted proc at /proc2
-ostoo:/proc> ls /proc2
-  [FILE     0]  tasks
-  [FILE     0]  uptime
-  [FILE     0]  drivers
+ostoo:/> ls /host
+         shell
+ostoo:/> cat /host/shell | head
+(binary ELF data)
 ```
 
 ---
