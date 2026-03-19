@@ -30,6 +30,7 @@ log                   = { workspace = true }
 pc-keyboard           = { workspace = true }
 pic8259               = { workspace = true }
 raw-cpuid             = { workspace = true }
+snafu                 = { workspace = true }
 spin                  = { workspace = true }
 uart_16550            = { workspace = true }
 volatile              = { workspace = true }

@@ -16,7 +16,7 @@ Always returns 0 (success) without modifying any page table entries. All argumen
 
 This is sufficient for musl's startup, which calls `mprotect` to mark certain regions read-only after initialisation.
 
-**Source:** `libkernel/src/syscall.rs` — inline in `syscall_dispatch`
+**Source:** `osl/src/dispatch.rs` — inline in `syscall_dispatch`
 
 ## Future Work
 

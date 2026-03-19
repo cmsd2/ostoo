@@ -18,7 +18,7 @@ Returns information about a file referred to by the file descriptor `fd`, writin
 
 This is sufficient for musl's stdio initialisation, which calls `fstat` on stdout to determine whether it is a terminal.
 
-**Source:** `libkernel/src/syscall.rs` — `sys_fstat`
+**Source:** `osl/src/dispatch.rs` — `sys_fstat`
 
 ## Future Work
 

@@ -31,6 +31,11 @@ impl BootInfoFrameAllocator {
         self.next
     }
 
+    /// Replace the memory_map reference (e.g. after copying it to the heap).
+    pub fn set_memory_map(&mut self, memory_map: &'static MemoryMap) {
+        self.memory_map = memory_map;
+    }
+
     /// Total number of usable (free-at-boot) frames in the memory map.
     pub fn total_usable_frames(&self) -> usize {
         self.usable_frames().count()

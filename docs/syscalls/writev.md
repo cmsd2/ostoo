@@ -21,17 +21,17 @@ Writes data from multiple buffers (a "scatter/gather" array) to a file descripto
 
 ## Current Implementation
 
-- **fd 1 (stdout) and fd 2 (stderr):** Iterates through `iovcnt` iovec entries (each 16 bytes: `iov_base: u64, iov_len: u64`). For each non-empty buffer:
-  - Attempts UTF-8 decode; if valid, prints via `print!()`.
-  - If not valid UTF-8, falls back to printing only printable ASCII characters (0x20..0x7F), plus `\n`, `\r`, `\t`.
-- **All other fds:** Returns `-EBADF` (-9).
-- Returns the total number of bytes across all iovec entries on success.
+Looks up `fd` in the current process's per-process file descriptor table. Iterates through `iovcnt` iovec entries (each 16 bytes: `iov_base: u64, iov_len: u64`). For each non-empty buffer, calls `FileHandle::write()` on the handle.
 
-**Source:** `libkernel/src/syscall.rs` — `sys_writev`
+- **Console fds (stdout/stderr):** Each buffer is printed via `ConsoleHandle::write()` (UTF-8 with ASCII fallback).
+- **Invalid fds:** Returns `-EBADF` (-9).
+- Returns the total number of bytes written across all iovec entries on success.
+- Short-circuits on error from any individual write.
+
+**Source:** `osl/src/dispatch.rs` — `sys_writev`
 
 ## Future Work
 
 - Validate that `iov` and all `iov_base` pointers are valid user-space addresses.
-- Support writing to VFS-backed file descriptors.
-- Handle partial writes (currently assumes all bytes are always written).
+- Handle partial writes.
 - Cap `iovcnt` at `UIO_MAXIOV` (1024) per Linux convention.

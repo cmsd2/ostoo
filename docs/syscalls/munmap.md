@@ -14,7 +14,7 @@ Removes mappings for the specified address range, causing further references to 
 
 Always returns 0 (success) without actually unmapping anything. Physical frames and page table entries are leaked.
 
-**Source:** `libkernel/src/syscall.rs` — inline in `syscall_dispatch`
+**Source:** `osl/src/dispatch.rs` — inline in `syscall_dispatch`
 
 ## Future Work
 

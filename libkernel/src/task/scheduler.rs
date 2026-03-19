@@ -51,6 +51,7 @@ impl ThreadId {
 enum ThreadState {
     Ready,
     Running,
+    Blocked,
     Dead,
 }
 
@@ -78,6 +79,13 @@ struct Thread {
     /// For user process threads: the top of the process's kernel stack.
     /// Used to update TSS.rsp0 and PER_CPU on context switch.
     kernel_stack_top: u64,
+    /// Saved user RSP from PER_CPU.  The SYSCALL entry stub writes the user
+    /// RSP to a single per-CPU slot; we must save/restore it per-thread so
+    /// that a blocked syscall resumes with the correct user stack.
+    user_rsp: u64,
+    /// Saved FS_BASE (MSR 0xC000_0100).  musl uses FS-relative addressing
+    /// for TLS (errno, etc.), so each user process needs its own FS_BASE.
+    fs_base: u64,
 }
 
 struct Scheduler {
@@ -243,6 +251,8 @@ pub fn init() {
             _stack: None,
             kind: SchedulableKind::Kernel,
             kernel_stack_top: 0,
+            user_rsp: 0,
+            fs_base: 0,
         });
         sched.current_idx = 0;
         sched.initialized = true;
@@ -287,6 +297,8 @@ pub fn spawn_thread(entry: fn() -> !) {
             _stack: Some(stack),
             kind: SchedulableKind::Kernel,
             kernel_stack_top: 0,
+            user_rsp: 0,
+            fs_base: 0,
         });
         sched.ready_queue.push_back(idx);
     });
@@ -338,6 +350,8 @@ pub fn spawn_user_thread(pid: ProcessId, pml4_phys: x86_64::PhysAddr) -> usize {
             _stack: None, // kernel stack owned by Process, not Thread
             kind: SchedulableKind::UserProcess(pid),
             kernel_stack_top: stack_top,
+            user_rsp: 0,
+            fs_base: 0,
         });
         sched.ready_queue.push_back(idx);
         idx
@@ -455,6 +469,51 @@ pub fn kill_current_thread() -> ! {
     }
 }
 
+/// Mark the current thread as blocked and yield.
+///
+/// The timer ISR will see `Blocked` and not re-queue the thread.
+/// When another context calls `unblock(thread_idx)`, the thread will be
+/// placed back on the ready queue and eventually rescheduled.
+///
+/// Returns when the thread is unblocked and rescheduled.
+pub fn block_current_thread() {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        let idx = sched.current_idx;
+        sched.threads[idx].state = ThreadState::Blocked;
+    });
+    // Enable interrupts and spin; the timer will preempt us.
+    // When unblock() is called, our state becomes Ready and we'll be re-queued.
+    // We detect this by checking our state on each wake.
+    loop {
+        x86_64::instructions::interrupts::enable_and_hlt();
+        // Check if we've been unblocked (state changed to Running by the scheduler).
+        let state = x86_64::instructions::interrupts::without_interrupts(|| {
+            let sched = SCHEDULER.lock();
+            let idx = sched.current_idx;
+            sched.threads[idx].state
+        });
+        if state != ThreadState::Blocked {
+            break;
+        }
+    }
+}
+
+/// Unblock a previously blocked thread, placing it back on the ready queue.
+///
+/// Safe to call from any context including ISR.
+pub fn unblock(thread_idx: usize) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        if let Some(t) = sched.threads.get_mut(thread_idx) {
+            if t.state == ThreadState::Blocked {
+                t.state = ThreadState::Ready;
+                sched.ready_queue.push_back(thread_idx);
+            }
+        }
+    });
+}
+
 /// Called by the LAPIC timer assembly stub on every tick.
 ///
 /// Receives the current thread's RSP (pointing to the saved-register area on
@@ -480,8 +539,9 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
     let current_idx = sched.current_idx;
 
     // Decrement the running thread's quantum; keep running if ticks remain
-    // (unless the thread is Dead, in which case we must switch away).
-    if sched.threads[current_idx].state != ThreadState::Dead {
+    // (unless the thread is Dead or Blocked, in which case we must switch away).
+    let cur_state = sched.threads[current_idx].state;
+    if cur_state != ThreadState::Dead && cur_state != ThreadState::Blocked {
         sched.threads[current_idx].ticks_remaining -= 1;
         if sched.threads[current_idx].ticks_remaining > 0 {
             return current_rsp;
@@ -490,9 +550,14 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
 
     // Save context of the current thread.
     sched.threads[current_idx].saved_rsp = current_rsp;
+    sched.threads[current_idx].user_rsp = crate::syscall::get_user_rsp();
+    sched.threads[current_idx].fs_base = unsafe {
+        x86_64::registers::model_specific::Msr::new(0xC000_0100).read()
+    };
 
-    // Only re-queue the thread if it's not Dead.
-    if sched.threads[current_idx].state != ThreadState::Dead {
+    // Only re-queue the thread if it's Ready (not Dead or Blocked).
+    let cur_state = sched.threads[current_idx].state;
+    if cur_state != ThreadState::Dead && cur_state != ThreadState::Blocked {
         sched.threads[current_idx].state = ThreadState::Ready;
         sched.ready_queue.push_back(current_idx);
     }
@@ -508,11 +573,17 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
     sched.threads[next_idx].ticks_remaining = QUANTUM_TICKS;
 
     let next_rsp         = sched.threads[next_idx].saved_rsp;
+    let next_user_rsp    = sched.threads[next_idx].user_rsp;
+    let next_fs_base     = sched.threads[next_idx].fs_base;
     let cur_pml4         = sched.threads[current_idx].pml4_phys;
     let next_pml4        = sched.threads[next_idx].pml4_phys;
     let next_kind        = sched.threads[next_idx].kind;
     let next_kstack_top  = sched.threads[next_idx].kernel_stack_top;
     drop(sched); // release before touching other subsystems
+
+    // Restore the incoming thread's saved user RSP and FS_BASE.
+    crate::syscall::set_user_rsp(next_user_rsp);
+    unsafe { x86_64::registers::model_specific::Msr::new(0xC000_0100).write(next_fs_base); }
 
     // Update TSS.rsp0 and PER_CPU for user process threads; reset PID for kernel threads.
     match next_kind {

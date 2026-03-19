@@ -16,7 +16,7 @@ Always returns `-ENOTTY` (-25), indicating the file descriptor does not refer to
 
 This is sufficient for musl's stdio, which calls `ioctl(fd, TIOCGWINSZ, ...)` to check if stdout is a terminal for line buffering decisions. Receiving `-ENOTTY` causes musl to treat the fd as a non-terminal and use full buffering.
 
-**Source:** `libkernel/src/syscall.rs` — inline in `syscall_dispatch`
+**Source:** `osl/src/dispatch.rs` — inline in `syscall_dispatch`
 
 ## Future Work
 

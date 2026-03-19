@@ -123,6 +123,34 @@ impl KeyboardActor {
     async fn on_key(&self, key: Key) {
         self.keys_processed.fetch_add(1, Ordering::Relaxed);
 
+        // If a userspace process is the foreground, send raw bytes to the
+        // console input buffer instead of the kernel line editor.
+        let fg = libkernel::console::foreground_pid();
+        if fg != libkernel::process::ProcessId::KERNEL {
+            match key {
+                Key::Unicode('\n') | Key::Unicode('\r') => {
+                    libkernel::console::push_input(b'\n');
+                }
+                Key::Unicode('\x08') => {
+                    libkernel::console::push_input(0x7F); // DEL
+                }
+                Key::Unicode('\x03') => {
+                    libkernel::console::push_input(0x03); // Ctrl+C
+                }
+                Key::Unicode('\x04') => {
+                    libkernel::console::push_input(0x04); // Ctrl+D
+                }
+                Key::Unicode('\t') => {
+                    libkernel::console::push_input(0x09); // Tab
+                }
+                Key::Unicode(c) if c.is_ascii() => {
+                    libkernel::console::push_input(c as u8);
+                }
+                _ => {} // ignore non-ASCII for now
+            }
+            return;
+        }
+
         // Read the prompt length before acquiring the line lock so we never
         // hold two locks simultaneously.
         let prompt_col = self.prompt.lock().len();

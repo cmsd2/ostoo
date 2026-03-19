@@ -1,8 +1,12 @@
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::PhysAddr;
+
+use crate::file::{FileHandle, FileError};
 
 // ---------------------------------------------------------------------------
 // ProcessId
@@ -64,6 +68,14 @@ pub struct Process {
     pub mmap_next: u64,
     /// Tracked (vaddr, len) pairs for mmap regions.
     pub mmap_regions: Vec<(u64, u64)>,
+    /// Per-process file descriptor table.
+    pub fd_table: Vec<Option<Arc<dyn FileHandle>>>,
+    /// Current working directory (absolute path).
+    pub cwd: String,
+    /// Parent process ID (KERNEL for top-level processes).
+    pub parent_pid: ProcessId,
+    /// Scheduler thread index to wake when a child exits (for waitpid).
+    pub wait_thread: Option<usize>,
 }
 
 const PROCESS_KERNEL_STACK_SIZE: usize = 64 * 1024;
@@ -92,8 +104,70 @@ impl Process {
             brk_current: brk_base,
             mmap_next: MMAP_BASE,
             mmap_regions: Vec::new(),
+            fd_table: crate::file::default_fd_table(),
+            cwd: String::from("/"),
+            parent_pid: ProcessId::KERNEL,
+            wait_thread: None,
         }
     }
+
+    /// Allocate the lowest available file descriptor for the given handle.
+    pub fn alloc_fd(&mut self, handle: Arc<dyn FileHandle>) -> Result<usize, FileError> {
+        // Search for the first None slot.
+        for (i, slot) in self.fd_table.iter().enumerate() {
+            if slot.is_none() {
+                self.fd_table[i] = Some(handle);
+                return Ok(i);
+            }
+        }
+        // No free slot — extend if under limit.
+        if self.fd_table.len() < crate::file::MAX_FDS {
+            let fd = self.fd_table.len();
+            self.fd_table.push(Some(handle));
+            Ok(fd)
+        } else {
+            Err(FileError::TooManyOpenFiles)
+        }
+    }
+
+    /// Close a file descriptor.
+    pub fn close_fd(&mut self, fd: usize) -> Result<(), FileError> {
+        if fd >= self.fd_table.len() {
+            return Err(FileError::BadFd);
+        }
+        match self.fd_table[fd].take() {
+            Some(handle) => { handle.close(); Ok(()) }
+            None => Err(FileError::BadFd),
+        }
+    }
+
+    /// Get a handle to an open file descriptor.
+    pub fn get_fd(&self, fd: usize) -> Result<Arc<dyn FileHandle>, FileError> {
+        self.fd_table.get(fd)
+            .and_then(|slot| slot.clone())
+            .ok_or(FileError::BadFd)
+    }
+}
+
+/// Find a zombie child of `parent_pid` matching `target_pid` (or any if target == -1).
+/// Returns (child_pid, exit_code) if found.
+pub fn find_zombie_child(parent_pid: ProcessId, target_pid: i64) -> Option<(ProcessId, i32)> {
+    let table = PROCESS_TABLE.lock();
+    for p in table.values() {
+        if p.parent_pid != parent_pid || p.state != ProcessState::Zombie {
+            continue;
+        }
+        if target_pid == -1 || p.pid.as_u64() == target_pid as u64 {
+            return Some((p.pid, p.exit_code.unwrap_or(0)));
+        }
+    }
+    None
+}
+
+/// Check whether `parent_pid` has any children (zombie or not).
+pub fn has_children(parent_pid: ProcessId) -> bool {
+    let table = PROCESS_TABLE.lock();
+    table.values().any(|p| p.parent_pid == parent_pid)
 }
 
 // ---------------------------------------------------------------------------

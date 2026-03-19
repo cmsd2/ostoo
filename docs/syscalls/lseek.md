@@ -16,7 +16,7 @@ according to `whence` (`SEEK_SET`, `SEEK_CUR`, `SEEK_END`).
 Always returns `-ESPIPE` (illegal seek). The only file descriptors currently in use
 are stdin/stdout/stderr, which behave as non-seekable character devices (serial console).
 
-**Source:** `libkernel/src/syscall.rs` — inline in `syscall_dispatch`
+**Source:** `osl/src/dispatch.rs` — inline in `syscall_dispatch`
 
 ## Future Work
 

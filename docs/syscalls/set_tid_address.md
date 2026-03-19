@@ -17,7 +17,7 @@ Sets the `clear_child_tid` pointer for the calling thread. When the thread exits
 
 This is sufficient for musl's early startup, which calls `set_tid_address` to discover its own TID.
 
-**Source:** `libkernel/src/syscall.rs` — `sys_set_tid_address`
+**Source:** `osl/src/dispatch.rs` — `sys_set_tid_address`
 
 ## Future Work
 

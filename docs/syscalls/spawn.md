@@ -1,0 +1,68 @@
+# spawn (nr 500) — custom syscall
+
+## Signature
+
+```c
+long spawn(const char *path, size_t path_len, const char **argv, size_t argc);
+```
+
+**Note:** This is a custom ostoo syscall (number 500), not a standard Linux syscall. It combines the functionality of `fork` + `execve` into a single call, since ostoo does not implement `fork`.
+
+## Description
+
+Spawns a new process from an ELF binary on the VFS. The child process inherits no state from the parent — it gets a fresh address space, file descriptor table, and stack. The child becomes the console foreground process.
+
+## Current Implementation
+
+1. **Read path:** Reads `path_len` bytes from `path` pointer. Validates the buffer is in user space. Resolves relative to the process's `cwd`.
+2. **Read argv:** If `argc > 0`, reads `argc` pointers from `argv` array, then reads each null-terminated string. Each string becomes an element of the child's `argv`.
+3. **Load ELF:** Calls `devices::vfs::read_file()` (through `osl::blocking::blocking()`) to load the ELF binary from the VFS. This blocks the calling thread.
+4. **Spawn process:** Calls `osl::spawn::spawn_process_full(elf_data, argv, parent_pid)` directly:
+   - Parses the ELF binary.
+   - Creates a new user PML4 page table.
+   - Maps PT_LOAD segments into the new address space.
+   - Allocates an 8-page (32 KiB) user stack at `0x0000_7FFF_F000_0000`.
+   - Builds the initial stack with `argc`, `argv` pointers, `envp` (empty), and auxiliary vector (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_ENTRY`, `AT_UID`, `AT_RANDOM`).
+   - Creates a `Process` with `parent_pid` set to the caller.
+   - Spawns a scheduler thread targeting `process_trampoline`.
+5. **Set foreground:** Calls `console::set_foreground(child_pid)` so keyboard input goes to the child.
+6. **Returns** the child's PID on success.
+
+**Source:** `osl/src/dispatch.rs` — `sys_spawn`, `osl/src/spawn.rs` — `spawn_process_full`
+
+## Usage from C (musl)
+
+```c
+#include <sys/syscall.h>
+#include <string.h>
+
+#define SYS_SPAWN 500
+
+/* Spawn /hello with argv */
+const char *path = "/hello";
+const char *argv[] = { "/hello", "arg1", "arg2" };
+long pid = syscall(SYS_SPAWN, path, strlen(path), argv, 3);
+if (pid < 0) {
+    /* error: file not found or invalid ELF */
+}
+
+/* Then wait for the child */
+int status;
+syscall(SYS_wait4, pid, &status, 0, 0);
+```
+
+## Errors
+
+| Errno | Condition |
+|-------|-----------|
+| `-EFAULT` (-14) | Invalid path or argv pointer |
+| `-EINVAL` (-22) | Path is not valid UTF-8 |
+| `-ENOENT` (-2) | File not found on VFS |
+| `-ENOENT` (-2) | ELF load or spawn failed |
+
+## Future Work
+
+- Inherit parent's `cwd` in child process.
+- Inherit or selectively copy file descriptors (e.g. stdin/stdout redirection for pipes).
+- Support environment variables via `envp`.
+- Replace with standard `posix_spawn` or `fork`+`execve` model.

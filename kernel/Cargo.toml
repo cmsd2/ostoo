@@ -41,6 +41,7 @@ ring3_test = []
 apic                  = { workspace = true }
 devices               = { workspace = true }
 libkernel             = { workspace = true }
+osl                   = { workspace = true }
 acpi                  = { workspace = true }
 bootloader            = { workspace = true }
 futures-util          = { workspace = true }

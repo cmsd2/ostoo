@@ -64,15 +64,21 @@ print to the console and exit. The initial user stack is set up with
 | File | Role |
 |------|------|
 | `libkernel/src/gdt.rs` | GDT with kernel + user code/data segments, TSS, `set_kernel_stack` for rsp0 |
-| `libkernel/src/syscall.rs` | SYSCALL MSR init, assembly entry stub, `syscall_dispatch` (14 syscalls), `brk`/`mmap`/`writev`/`fstat`, per-CPU data |
-| `libkernel/src/process.rs` | `Process` struct (with brk/mmap tracking), `ProcessId`, process table, zombie marking/reaping |
+| `libkernel/src/syscall.rs` | SYSCALL MSR init, assembly entry stub, per-CPU data |
+| `osl/src/dispatch.rs` | `syscall_dispatch` (all syscall implementations) |
+| `osl/src/errno.rs` | Linux errno constants, `file_errno()` / `vfs_errno()` converters |
+| `osl/src/file.rs` | `VfsHandle`, `DirHandle` (VFS-backed file handles) |
+| `osl/src/blocking.rs` | Async-to-sync bridge for VFS calls |
+| `osl/src/spawn.rs` | `spawn_process_full` (ELF spawning with argv) |
+| `libkernel/src/file.rs` | `FileHandle` trait, `FileError` enum, `ConsoleHandle` |
+| `libkernel/src/process.rs` | `Process` struct (with brk/mmap/fd tracking), `ProcessId`, process table, zombie marking/reaping |
 | `libkernel/src/elf.rs` | ELF64 parser (static `ET_EXEC`, x86-64) with phdr metadata for auxv |
 | `libkernel/src/memory/mod.rs` | `create_user_page_table`, `map_user_page`, `switch_address_space` |
 | `libkernel/src/task/scheduler.rs` | `spawn_user_thread`, `process_trampoline`, CR3 switching in `preempt_tick` |
 | `libkernel/src/interrupts.rs` | Ring-3-aware page fault handler |
-| `kernel/src/ring3.rs` | `spawn_process` (ELF with auxv stack setup), `build_initial_stack`, `spawn_blob` (raw code), test helpers |
+| `kernel/src/ring3.rs` | Legacy `spawn_process` wrapper, `spawn_blob` (raw code), test helpers |
 | `devices/src/vfs/proc_vfs.rs` | ProcVfs with 12 virtual files |
-| `docs/syscalls/*.md` | Per-syscall documentation (14 files) |
+| `docs/syscalls/*.md` | Per-syscall documentation |
 
 ---
 
@@ -518,10 +524,11 @@ kernel's phys_mem_offset window.  `build_initial_stack()` writes:
 [RSP points here, 16-byte aligned]
 ```
 
-### 4d. Syscall table (`libkernel/src/syscall.rs`)
+### 4d. Syscall table (`osl/src/dispatch.rs`)
 
 All syscalls use Linux x86-64 numbers for musl compatibility.  Unhandled
-numbers log a warning and return `-ENOSYS` (-38).
+numbers log a warning and return `-ENOSYS`.  Errno constants are defined
+in `osl/src/errno.rs`; libkernel uses `FileError` for structured errors.
 
 | Nr | Name | Implementation |
 |----|------|---------------|
@@ -549,8 +556,6 @@ See `docs/syscalls/` for detailed per-syscall documentation.
 
 ### 4e. What's still missing (deferred to later phases)
 
-- **File descriptor table**: No per-process fd table exists.  `write`/`writev`
-  check `fd == 1 || fd == 2` directly; `fstat` accepts any fd.
 - **SMAP enforcement**: User pointers in `writev`, `fstat`, `brk` are accessed
   without `stac`/`clac`.
 - **Page deallocation**: `munmap` and `brk` shrink don't free frames or unmap

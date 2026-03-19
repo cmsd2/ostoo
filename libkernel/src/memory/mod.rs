@@ -11,6 +11,7 @@ use x86_64::structures::paging::{
     PhysFrame,
     Mapper,
     Size4KiB,
+    Size2MiB,
     FrameAllocator,
     RecursivePageTable,
     mapper::MapToError,
@@ -33,6 +34,10 @@ const RECURSIVE_INDEX: u16 = 511;
 /// Virtual address of the PML4 when accessed through the recursive mapping.
 /// With RECURSIVE_INDEX=511: P4=511, P3=511, P2=511, P1=511, offset=0.
 const PML4_RECURSIVE_VIRT: u64 = 0xFFFF_FFFF_FFFF_F000;
+
+/// Base virtual address for the kernel's physical-memory direct map.
+/// PML4 entry 257 → 0xFFFF_8080_0000_0000 (512 GiB window).
+pub const PHYS_MAP_BASE: u64 = 0xFFFF_8080_0000_0000;
 
 /// Base of the high-half MMIO virtual window.
 pub const MMIO_VIRT_BASE: u64 = 0xFFFF_8002_0000_0000;
@@ -265,19 +270,81 @@ static MEMORY: Mutex<Option<MemoryServices>> = Mutex::new(None);
 /// Call exactly once, after the heap is initialised and before any driver
 /// needs to map memory.
 pub fn init_services(
-    mapper: RecursivePageTable<'static>,
-    frame_allocator: BootInfoFrameAllocator,
+    mut mapper: RecursivePageTable<'static>,
+    mut frame_allocator: BootInfoFrameAllocator,
     phys_mem_offset: VirtAddr,
     memory_map: &'static MemoryMap,
 ) {
     PHYS_MEM_OFFSET.store(phys_mem_offset.as_u64(), Ordering::Relaxed);
+
+    // Copy the MemoryMap from its bootloader-provided location (which may be
+    // in the lower-half virtual address space) onto the kernel heap (high-half).
+    // This ensures the frame allocator works from any address space, including
+    // user process page tables that don't map the bootloader's lower half.
+    let heap_map: &'static MemoryMap = unsafe {
+        let layout = core::alloc::Layout::new::<MemoryMap>();
+        let ptr = alloc::alloc::alloc(layout) as *mut MemoryMap;
+        assert!(!ptr.is_null(), "init_services: failed to allocate MemoryMap on heap");
+        core::ptr::copy_nonoverlapping(memory_map as *const MemoryMap, ptr, 1);
+        &*ptr
+    };
+    frame_allocator.set_memory_map(heap_map);
+
+    // -----------------------------------------------------------------------
+    // Remap all physical memory into the high half using 2 MiB huge pages.
+    //
+    // The bootloader placed the physical memory map in the lower half, which
+    // is zeroed in user page tables.  By remapping at PHYS_MAP_BASE (PML4
+    // entry 257) the mapping is automatically inherited by every user address
+    // space via create_user_page_table's entry 256–510 copy.
+    // -----------------------------------------------------------------------
+
+    let max_phys: u64 = heap_map.iter()
+        .map(|r| r.range.end_addr())
+        .max()
+        .unwrap_or(0);
+    let two_mib = 2u64 * 1024 * 1024;
+    let max_phys_aligned = (max_phys + two_mib - 1) & !(two_mib - 1);
+
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    for phys_addr in (0..max_phys_aligned).step_by(two_mib as usize) {
+        let page = Page::<Size2MiB>::containing_address(
+            VirtAddr::new(PHYS_MAP_BASE + phys_addr),
+        );
+        let frame = PhysFrame::<Size2MiB>::containing_address(
+            PhysAddr::new(phys_addr),
+        );
+        unsafe {
+            mapper
+                .map_to(page, frame, flags, &mut frame_allocator)
+                .expect("remap_physical: map_to failed")
+                .ignore(); // flush all at the end
+        }
+    }
+    x86_64::instructions::tlb::flush_all();
+
+    let new_offset = VirtAddr::new(PHYS_MAP_BASE);
+    PHYS_MEM_OFFSET.store(new_offset.as_u64(), Ordering::Relaxed);
+
+    log::info!(
+        "memory::init_services: bootloader phys_mem_offset={:#x} (PML4 idx {}), \
+         remapped to {:#x} (PML4 idx {}), max_phys={:#x} ({} MiB, {} 2MiB pages)",
+        phys_mem_offset.as_u64(),
+        (phys_mem_offset.as_u64() >> 39) & 0x1FF,
+        PHYS_MAP_BASE,
+        (PHYS_MAP_BASE >> 39) & 0x1FF,
+        max_phys_aligned,
+        max_phys_aligned / (1024 * 1024),
+        max_phys_aligned / two_mib,
+    );
+
     let mut m = MEMORY.lock();
     assert!(m.is_none(), "memory::init_services called more than once");
     *m = Some(MemoryServices {
         mapper,
         frame_allocator,
-        phys_mem_offset,
-        memory_map,
+        phys_mem_offset: new_offset,
+        memory_map: heap_map,
         mmio_next:  MMIO_VIRT_BASE,
         mmio_cache: BTreeMap::new(),
     });

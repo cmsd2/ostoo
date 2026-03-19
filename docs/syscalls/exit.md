@@ -18,19 +18,20 @@ Both are handled identically in ostoo since each process currently has exactly o
 
 1. Looks up the current PID.
 2. If it's a user process (not `ProcessId::KERNEL`):
-   - Prints `[kernel] pid N exited with code C`.
+   - Logs `pid N exited with code C` to serial.
+   - Reads the process's `parent_pid` (separate lock acquisition).
    - Marks the process as a zombie via `mark_zombie(pid, code)`.
-   - Does **not** reap the process immediately (still running on its kernel stack).
+   - Checks if the parent process has a `wait_thread` set (meaning it's blocked in `waitpid`). If so, calls `scheduler::unblock()` to wake the parent.
 3. If it's a kernel thread: prints a halt message.
 4. Calls `kill_current_thread()`, which marks the scheduler thread as `Dead` and spins until the timer preempts it. The thread is never re-queued.
 
-Zombie processes are reaped lazily by `reap_zombies()`, which is called at the start of `spawn_blob` and `spawn_process` to free kernel stacks before allocating new ones.
+Zombie processes are reaped by `waitpid` (when a parent collects exit status) or lazily by `reap_zombies()` at the start of `spawn_process`.
 
-**Source:** `libkernel/src/syscall.rs` — `sys_exit`
+**Source:** `osl/src/dispatch.rs` — `sys_exit`
 
 ## Future Work
 
-- Implement `waitpid` so a parent process can collect exit status and trigger reaping.
 - Properly distinguish `exit` (single thread) from `exit_group` (all threads) once multi-threaded processes are supported.
 - Free user-space page tables and physical frames on process exit (currently leaked).
 - Signal handling (SIGCHLD to parent).
+- Close all open file descriptors on exit.

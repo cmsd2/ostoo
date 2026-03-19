@@ -33,6 +33,8 @@ pub mod syscall;
 pub mod process;
 pub mod elf;
 pub mod md5;
+pub mod file;
+pub mod console;
 
 pub fn init() {
     cpuid::init();

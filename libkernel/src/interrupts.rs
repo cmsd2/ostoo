@@ -7,7 +7,7 @@ use x86_64::structures::idt::{
     PageFaultErrorCode,
 };
 use pic8259::ChainedPics;
-use crate::{gdt, println, serial_println, task};
+use crate::{gdt, println, serial_println, task, process};
 
 static LAPIC_EOI_ADDR: AtomicU64 = AtomicU64::new(0);
 
@@ -223,6 +223,22 @@ fn configure_pit_100hz() {
     }
 }
 
+/// Common cleanup for ring-3 process death (page fault, GPF, invalid opcode):
+/// mark zombie and wake parent's wait_thread so `wait4` returns.
+fn kill_user_process(pid: process::ProcessId, exit_code: i32) {
+    if pid == process::ProcessId::KERNEL {
+        return;
+    }
+    let parent_pid = process::with_process_ref(pid, |p| p.parent_pid);
+    process::mark_zombie(pid, exit_code);
+    if let Some(parent_pid) = parent_pid {
+        let wait_thread = process::with_process(parent_pid, |pp| pp.wait_thread.take());
+        if let Some(Some(thread_idx)) = wait_thread {
+            task::scheduler::unblock(thread_idx);
+        }
+    }
+}
+
 extern "x86-interrupt" fn breakpoint_handler(
     stack_frame: InterruptStackFrame)
 {
@@ -233,16 +249,12 @@ extern "x86-interrupt" fn invalid_opcode_handler(
     stack_frame: InterruptStackFrame)
 {
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
-        let pid = crate::process::current_pid();
+        let pid = process::current_pid();
         error!("ring-3 invalid opcode (pid {}) — killing process\n{:#?}",
             pid.as_u64(), stack_frame);
-        if pid != crate::process::ProcessId::KERNEL {
-            crate::process::mark_zombie(pid, -4); // SIGILL
-        }
-        // Restore kernel GS polarity: the CPU entered the fault handler from
-        // ring 3 without swapgs, so GS.BASE is still the user value.
+        kill_user_process(pid, -4); // SIGILL
         unsafe { core::arch::asm!("swapgs", options(nostack, nomem)); }
-        crate::task::scheduler::kill_current_thread();
+        task::scheduler::kill_current_thread();
     }
 
     // Kernel-mode invalid opcode — dump diagnostics before panicking.
@@ -289,17 +301,14 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame, error_code: u64)
 {
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
-        let pid = crate::process::current_pid();
+        let pid = process::current_pid();
         error!(
             "ring-3 GPF (pid {}, error={:#x}) — killing process\n{:#?}",
             pid.as_u64(), error_code, stack_frame
         );
-        if pid != crate::process::ProcessId::KERNEL {
-            crate::process::mark_zombie(pid, -11); // SIGSEGV
-        }
-        // Restore kernel GS polarity (see invalid_opcode_handler comment).
+        kill_user_process(pid, -11); // SIGSEGV
         unsafe { core::arch::asm!("swapgs", options(nostack, nomem)); }
-        crate::task::scheduler::kill_current_thread();
+        task::scheduler::kill_current_thread();
     }
     panic!(
         "EXCEPTION: GENERAL PROTECTION FAULT (error={:#x})\n{:#?}",
@@ -420,7 +429,7 @@ extern "x86-interrupt" fn page_fault_handler(
 
     // Check whether the fault came from ring 3 (RPL field of the saved CS).
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
-        let pid = crate::process::current_pid();
+        let pid = process::current_pid();
         let rip = stack_frame.instruction_pointer.as_u64();
         let rsp = stack_frame.stack_pointer.as_u64();
         let fs_base = unsafe {
@@ -431,16 +440,35 @@ extern "x86-interrupt" fn page_fault_handler(
              RIP={:#x} RSP={:#x} FS_BASE={:#x}",
             faulting_addr, pid.as_u64(), error_code, rip, rsp, fs_base
         );
-        if pid != crate::process::ProcessId::KERNEL {
-            crate::process::mark_zombie(pid, -11); // SIGSEGV
+
+        // Dump instruction bytes at faulting RIP (user-space address, still mapped).
+        if rip < 0x0000_8000_0000_0000 && rip > 0x1000 {
+            let ptr = rip as *const u8;
+            let mut buf = [0u8; 16];
+            for i in 0..16usize {
+                buf[i] = unsafe { core::ptr::read_volatile(ptr.add(i)) };
+            }
+            serial_println!("  Bytes at RIP: {:02x?}", &buf);
         }
+
+        // Dump a few stack entries.
+        if rsp < 0x0000_8000_0000_0000 && rsp > 0x1000 && rsp & 0x7 == 0 {
+            serial_println!("  Stack dump (8 qwords from RSP):");
+            let base = rsp as *const u64;
+            for i in 0..8usize {
+                let val = unsafe { core::ptr::read_volatile(base.add(i)) };
+                serial_println!("    RSP+{:#04x}: {:#018x}", i * 8, val);
+            }
+        }
+
+        kill_user_process(pid, -11); // SIGSEGV
         // Restore kernel GS polarity: the CPU entered the fault handler from
         // ring 3 without swapgs, so GS.BASE is still the user value.  We must
         // swap back to kernel GS before kill_current_thread spins with
         // interrupts enabled, otherwise the next process_trampoline will
         // observe the wrong polarity.
         unsafe { core::arch::asm!("swapgs", options(nostack, nomem)); }
-        crate::task::scheduler::kill_current_thread();
+        task::scheduler::kill_current_thread();
     }
 
     panic!(

@@ -5,6 +5,7 @@
 #![reexport_test_harness_main = "test_main"]
 
 extern crate alloc;
+extern crate osl;
 
 use core::panic::PanicInfo;
 use bootloader::{BootInfo, entry_point};
@@ -213,6 +214,7 @@ fn run_kernel() -> ! {
     executor::spawn(Task::new(example_task()));
     executor::spawn(Task::new(timer_task()));
     executor::spawn(Task::new(status_task()));
+    executor::spawn(Task::new(launch_userspace_shell()));
 
     // Register the current context as thread 0 of the preemptive scheduler.
     scheduler::init();
@@ -253,5 +255,31 @@ async fn status_task() {
             " T{} | ctx:{:6} | rdy:{} wait:{} | up:{:6}s",
             scheduler::current_thread_idx(), ctx, rdy, wait, secs
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-launch userspace shell
+
+async fn launch_userspace_shell() {
+    // Wait a bit for VFS to be ready.
+    Delay::from_millis(100).await;
+
+    match devices::vfs::read_file("/shell").await {
+        Ok(data) => {
+            match ring3::spawn_process(&data) {
+                Ok(pid) => {
+                    info!("[kernel] launched /shell as pid {}", pid.as_u64());
+                    libkernel::console::set_foreground(pid);
+                }
+                Err(e) => {
+                    warn!("[kernel] failed to spawn /shell: {}", e);
+                    info!("[kernel] falling back to kernel shell");
+                }
+            }
+        }
+        Err(e) => {
+            info!("[kernel] /shell not found ({:?}), using kernel shell", e);
+        }
     }
 }
