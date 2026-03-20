@@ -339,9 +339,10 @@ output but functionally harmless.
 3. **IRQ-driven virtio-blk** — wire `IRQ_PENDING` to an `AtomicWaker` so
    `CompletionFuture` parks instead of busy-polling.
 
-4. **`fork` + CoW page faults** — standard POSIX `fork`.  Currently bypassed
-   by the custom `spawn` syscall.  Requires CoW page fault handler and
-   frame reference counting.
+4. **`fork` + CoW page faults** — standard POSIX `fork`.  `clone(CLONE_VM|CLONE_VFORK)`
+   and `execve` are now implemented, enabling unpatched musl `posix_spawn` and
+   Rust `std::process::Command`.  Full `fork` with CoW still requires a page
+   fault handler and frame reference counting.
 
 5. **exFAT write support** — directory entry creation, FAT chain allocation,
    and sector writes to enable `touch`, `mkdir`, `cp`, `rm`.

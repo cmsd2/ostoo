@@ -181,6 +181,16 @@ impl SwitchFrame {
 // ---------------------------------------------------------------------------
 // Assembly context-switch stub
 //
+// The stub conditionally executes `swapgs` on entry and exit so that kernel
+// code always runs with GS.BASE = per-CPU, regardless of whether the timer
+// fired from ring 0 or ring 3.  This mirrors the Linux interrupt entry
+// convention.
+//
+// On entry, the hardware iretq frame is at RSP.  [RSP+8] = CS: if RPL bits
+// (0–1) are non-zero the interrupt came from ring 3 and we need swapgs.
+// On exit, [RSP+8] is the CS of the (possibly different) thread we're
+// returning to — a context switch may have changed the stack.
+//
 // Stack alignment analysis at the point of `call preempt_tick`:
 //   CPU pushes SS/RSP/RFLAGS/CS/RIP  → 5 × 8 = 40 bytes
 //   stub pushes 15 GPRs              → 15 × 8 = 120 bytes
@@ -196,6 +206,11 @@ impl SwitchFrame {
 core::arch::global_asm!(
     ".globl lapic_timer_stub",
     "lapic_timer_stub:",
+    // --- entry swapgs: if interrupted from ring 3, swap to kernel GS ---
+    "test qword ptr [rsp+8], 3",   // check RPL bits of saved CS
+    "jz .Ltimer_from_ring0",
+    "swapgs",
+    ".Ltimer_from_ring0:",
     "push rax", "push rbx", "push rcx", "push rdx",
     "push rsi", "push rdi", "push rbp",
     "push r8",  "push r9",  "push r10", "push r11",
@@ -211,6 +226,11 @@ core::arch::global_asm!(
     "pop r11", "pop r10", "pop r9",  "pop r8",
     "pop rbp", "pop rdi", "pop rsi",
     "pop rdx", "pop rcx", "pop rbx", "pop rax",
+    // --- exit swapgs: if returning to ring 3, swap back to user GS ---
+    "test qword ptr [rsp+8], 3",   // check RPL bits of target CS
+    "jz .Ltimer_to_ring0",
+    "swapgs",
+    ".Ltimer_to_ring0:",
     "iretq",
 );
 
@@ -365,6 +385,97 @@ pub fn spawn_user_thread(pid: ProcessId, pml4_phys: x86_64::PhysAddr) -> usize {
     })
 }
 
+/// Spawn a scheduler thread for a clone(CLONE_VM|CLONE_VFORK) child.
+///
+/// The child "returns from syscall" at `user_rip` with RAX=0, on `child_stack`.
+/// Returns the thread index.
+pub fn spawn_clone_thread(
+    pid: ProcessId,
+    pml4_phys: x86_64::PhysAddr,
+    user_rip: u64,
+    child_stack: u64,
+    user_rflags: u64,
+    user_r9: u64,
+) -> usize {
+    let kernel_stack_top = crate::process::with_process_ref(pid, |p| {
+        p.kernel_stack_top
+    }).expect("spawn_clone_thread: process not found");
+
+    // Build a SwitchFrame that enters `clone_trampoline` in kernel mode.
+    // Pass the PID via RDI (first SysV64 argument).
+    let stack_top = kernel_stack_top;
+    let frame = SwitchFrame {
+        r15: 0, r14: 0, r13: 0, r12: 0,
+        r11: user_rflags, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: pid.as_u64(), rsi: user_rip,
+        rdx: child_stack, rcx: user_r9, rbx: 0, rax: 0,
+        rip: clone_trampoline as *const () as usize as u64,
+        cs: KERNEL_CS,
+        rflags: RFLAGS_IF,
+        rsp: stack_top - 8,
+        ss: KERNEL_SS,
+    };
+    let saved_rsp = stack_top - core::mem::size_of::<SwitchFrame>() as u64 - FXSAVE_SIZE as u64;
+    unsafe {
+        let frame_ptr = (saved_rsp + FXSAVE_SIZE as u64) as *mut SwitchFrame;
+        core::ptr::write(frame_ptr, frame);
+        core::ptr::write((saved_rsp + 24) as *mut u32, 0x1F80);
+    }
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        let id = ThreadId::new();
+        let idx = sched.threads.len();
+        sched.threads.push(Thread {
+            id,
+            state: ThreadState::Ready,
+            saved_rsp,
+            pml4_phys: pml4_phys.as_u64(),
+            ticks_remaining: QUANTUM_TICKS,
+            _stack: None,
+            kind: SchedulableKind::UserProcess(pid),
+            kernel_stack_top: stack_top,
+            user_rsp: child_stack,
+            fs_base: 0,
+        });
+        sched.ready_queue.push_back(idx);
+        idx
+    })
+}
+
+/// Trampoline for clone() child threads.
+///
+/// Receives PID in RDI, user_rip in RSI, child_stack in RDX, user_r9 in RCX.
+/// Drops to ring 3 at user_rip with RAX=0, R9=user_r9, RSP=child_stack.
+extern "C" fn clone_trampoline(pid_raw: u64, user_rip: u64, child_stack: u64, user_r9: u64) -> ! {
+    let pid = ProcessId::from_raw(pid_raw);
+
+    let (pml4_phys, kernel_stack_top) =
+        crate::process::with_process_ref(pid, |p| {
+            (p.pml4_phys.as_u64(), p.kernel_stack_top)
+        }).expect("clone_trampoline: process not found");
+
+    serial_println!("[clone_trampoline] pid={} rip={:#x} stack={:#x} pml4={:#x} r9={:#x}",
+        pid.as_u64(), user_rip, child_stack, pml4_phys, user_r9);
+
+    x86_64::instructions::interrupts::disable();
+
+    crate::gdt::set_kernel_stack(x86_64::VirtAddr::new(kernel_stack_top));
+    crate::syscall::set_kernel_rsp(kernel_stack_top);
+    crate::process::set_current_pid(pid);
+    set_current_cr3(pml4_phys);
+
+    let user_cs = crate::gdt::user_code_selector().0 as u64;
+    let user_ss = crate::gdt::user_data_selector().0 as u64;
+    let per_cpu = crate::syscall::per_cpu_addr();
+
+    // RAX=0 tells musl's __clone that this is the child.
+    // R9=user_r9 restores the child function pointer that musl stored in R9.
+    unsafe {
+        jump_to_userspace(user_rip, child_stack, pml4_phys, user_cs, user_ss, per_cpu, 0, user_r9);
+    }
+}
+
 /// Trampoline for newly-spawned user process threads.
 ///
 /// The scheduler's iretq lands here in kernel mode with the PID passed in RDI
@@ -407,11 +518,15 @@ extern "C" fn process_trampoline(pid_raw: u64) -> ! {
     // Safety: interrupts are disabled, we have set up TSS/PER_CPU/CR3,
     // and the entry/stack/selector values come from a validated Process.
     unsafe {
-        drop_to_ring3(entry_point, user_stack_top, pml4_phys, user_cs, user_ss, per_cpu);
+        jump_to_userspace(entry_point, user_stack_top, pml4_phys, user_cs, user_ss, per_cpu, 0, 0);
     }
 }
 
-/// Switch to ring 3: set GS MSRs, load CR3, and execute iretq.
+/// Switch to ring 3: set GS MSRs, load CR3, restore GPRs, and execute iretq.
+///
+/// `user_rax` and `user_r9` are loaded into RAX/R9 before the iretq.
+/// For a fresh exec, pass 0 for both.  For a clone child, pass RAX=0
+/// and R9 = the saved user R9 (musl's `__clone` needs R9 = fn pointer).
 ///
 /// # Safety
 /// - Interrupts must be disabled.
@@ -419,9 +534,10 @@ extern "C" fn process_trampoline(pid_raw: u64) -> ! {
 /// - `entry` and `user_rsp` must be valid user-space addresses.
 /// - `user_cs` and `user_ss` must be valid ring-3 segment selectors.
 /// - `per_cpu` must point to the kernel's `PerCpuData` block.
-unsafe fn drop_to_ring3(
+pub unsafe fn jump_to_userspace(
     entry: u64, user_rsp: u64, pml4_phys: u64,
     user_cs: u64, user_ss: u64, per_cpu: u64,
+    user_rax: u64, user_r9: u64,
 ) -> ! {
     // Explicitly set GS MSRs instead of using `swapgs`, because the GS
     // polarity is unpredictable: a timer preemption of a previous user process
@@ -440,13 +556,17 @@ unsafe fn drop_to_ring3(
         "push {rf}",
         "push {cs}",
         "push {ip}",
+        "mov rax, {rax_val}",
+        "mov r9,  {r9_val}",
         "iretq",
-        pml4  = in(reg) pml4_phys,
-        ss    = in(reg) user_ss,
-        usp   = in(reg) user_rsp,
-        rf    = in(reg) RFLAGS_IF,
-        cs    = in(reg) user_cs,
-        ip    = in(reg) entry,
+        pml4    = in(reg) pml4_phys,
+        ss      = in(reg) user_ss,
+        usp     = in(reg) user_rsp,
+        rf      = in(reg) RFLAGS_IF,
+        cs      = in(reg) user_cs,
+        ip      = in(reg) entry,
+        rax_val = in(reg) user_rax,
+        r9_val  = in(reg) user_r9,
         options(noreturn),
     );
 }

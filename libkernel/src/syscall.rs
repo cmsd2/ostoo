@@ -14,6 +14,13 @@ pub struct PerCpuData {
     pub kernel_rsp: u64,
     /// User RSP saved by the entry stub. Offset 8.
     pub user_rsp: u64,
+    /// User RIP (RCX on SYSCALL entry) saved by the entry stub. Offset 16.
+    pub user_rip: u64,
+    /// User RFLAGS (R11 on SYSCALL entry) saved by the entry stub. Offset 24.
+    pub user_rflags: u64,
+    /// User R9 saved by the entry stub before the arg shuffle. Offset 32.
+    /// Needed by clone: musl's __clone stores the child fn pointer in R9.
+    pub user_r9: u64,
 }
 
 /// Wrapper for the per-CPU data block, replacing `static mut`.
@@ -27,7 +34,9 @@ unsafe impl Sync for PerCpuCell {}
 
 impl PerCpuCell {
     const fn new() -> Self {
-        PerCpuCell(UnsafeCell::new(PerCpuData { kernel_rsp: 0, user_rsp: 0 }))
+        PerCpuCell(UnsafeCell::new(PerCpuData {
+            kernel_rsp: 0, user_rsp: 0, user_rip: 0, user_rflags: 0, user_r9: 0,
+        }))
     }
     fn get(&self) -> *mut PerCpuData {
         self.0.get()
@@ -106,6 +115,9 @@ syscall_entry:
 
     swapgs                      /* GS.BASE <-> KERNEL_GS_BASE; now GS = per-CPU */
     mov  gs:8, rsp              /* save user RSP to per_cpu.user_rsp  (offset 8) */
+    mov  gs:16, rcx             /* save user RIP to per_cpu.user_rip  (offset 16) */
+    mov  gs:24, r11             /* save user RFLAGS to per_cpu.user_rflags (offset 24) */
+    mov  gs:32, r9              /* save user R9 to per_cpu.user_r9 (offset 32) — needed by clone */
     mov  rsp, gs:0              /* load kernel RSP from per_cpu.kernel_rsp (offset 0) */
 
     /* Save all user registers that we clobber during the argument shuffle.
@@ -198,6 +210,32 @@ pub fn prepare_swapgs() {
     //   GS.BASE          = 0    (user GS, initially nothing)
     //   KERNEL_GS_BASE   = &PER_CPU  (kernel per-CPU, restored by entry swapgs)
     unsafe { core::arch::asm!("swapgs", options(nostack, nomem)); }
+}
+
+/// Read the saved user RIP from the per-CPU data block.
+///
+/// During a SYSCALL, RCX holds the return address (user RIP).
+/// The entry stub saves it to gs:16. Used by `sys_clone` to create a child
+/// that "returns from syscall" at the same instruction.
+pub fn get_user_rip() -> u64 {
+    unsafe { (*PER_CPU.get()).user_rip }
+}
+
+/// Read the saved user RFLAGS from the per-CPU data block.
+///
+/// During a SYSCALL, R11 holds the user RFLAGS.
+/// The entry stub saves it to gs:24. Used by `sys_clone`.
+pub fn get_user_rflags() -> u64 {
+    unsafe { (*PER_CPU.get()).user_rflags }
+}
+
+/// Read the saved user R9 from the per-CPU data block.
+///
+/// musl's `__clone` stores the child function pointer in R9 before the
+/// SYSCALL.  After the clone child "returns from syscall", it does
+/// `call *%r9`.  Used by `sys_clone` to capture R9 for the child thread.
+pub fn get_user_r9() -> u64 {
+    unsafe { (*PER_CPU.get()).user_r9 }
 }
 
 /// Returns the top of the dedicated kernel syscall stack, suitable for

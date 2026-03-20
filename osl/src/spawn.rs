@@ -131,6 +131,7 @@ pub fn spawn_process_full(
         ELF_STACK_SIZE,
         &info,
         argv,
+        &[], // no environment variables
     );
 
     // Create the process and insert it into the process table.
@@ -158,9 +159,10 @@ pub fn spawn_process_full(
 ///
 /// ```text
 /// [stack_top]
-///   argv string data (null-terminated strings)
+///   argv/envp string data (null-terminated strings)
 ///   16 bytes of zeros (AT_RANDOM target)
 ///   auxv pairs (AT_NULL terminator)
+///   envp[n-1] ptr ... envp[0] ptr
 ///   NULL                    <- envp terminator
 ///   argv[argc-1] ptr
 ///   ...
@@ -169,12 +171,13 @@ pub fn spawn_process_full(
 ///   argc
 /// [RSP points here, 16-byte aligned]
 /// ```
-fn build_initial_stack(
+pub fn build_initial_stack(
     kernel_base: VirtAddr,
     user_virt_base: u64,
     stack_size: u64,
     info: &libkernel::elf::ElfInfo,
     argv: &[&[u8]],
+    envp: &[&[u8]],
 ) -> u64 {
     let kernel_top = kernel_base.as_u64() + stack_size;
     let user_top = user_virt_base + stack_size;
@@ -202,6 +205,20 @@ fn build_initial_stack(
             *p.add(arg.len()) = 0; // null-terminate
         }
         argv_user_addrs.push(str_user_addr);
+    }
+
+    // 1b. Write envp string data.
+    let mut envp_user_addrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    for env in envp {
+        let len = env.len() + 1;
+        cursor -= len as u64;
+        let str_user_addr = k2u(cursor);
+        unsafe {
+            let p = cursor as *mut u8;
+            core::ptr::copy_nonoverlapping(env.as_ptr(), p, env.len());
+            *p.add(env.len()) = 0;
+        }
+        envp_user_addrs.push(str_user_addr);
     }
 
     // 2. AT_RANDOM data: 16 bytes of "random" data.
@@ -236,8 +253,11 @@ fn build_initial_stack(
     push(&mut cursor, PAGE_SIZE); push(&mut cursor, AT_PAGESZ);
     push(&mut cursor, 0); push(&mut cursor, AT_UID);
 
-    // 4. envp: NULL terminator (no environment variables).
-    push(&mut cursor, 0);
+    // 4. envp pointers: NULL terminator, then pointers in reverse order.
+    push(&mut cursor, 0); // envp NULL terminator
+    for addr in envp_user_addrs.iter().rev() {
+        push(&mut cursor, *addr);
+    }
 
     // 5. argv pointers: NULL terminator, then pointers in reverse order.
     push(&mut cursor, 0); // argv NULL terminator

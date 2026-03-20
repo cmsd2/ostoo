@@ -9,7 +9,7 @@ use x86_64::structures::paging::PageTableFlags;
 use crate::errno;
 use crate::syscall_nr::*;
 use libkernel::consts::{PAGE_SIZE, PAGE_MASK};
-use libkernel::file::FileHandle;
+use libkernel::file::{FileHandle, FdEntry, FD_CLOEXEC};
 
 pub(crate) const USER_DATA_FLAGS: PageTableFlags = PageTableFlags::PRESENT
     .union(PageTableFlags::WRITABLE)
@@ -51,18 +51,31 @@ fn syscall_inner(
         SYS_MPROTECT       => 0, // no-op
         SYS_MUNMAP         => 0, // stub (leak frames)
         SYS_BRK            => sys_brk(a1),
+        SYS_RT_SIGACTION   => 0, // stub (no signal support)
+        SYS_RT_SIGPROCMASK => 0, // stub (no signal support)
         SYS_IOCTL          => -errno::ENOTTY,
         SYS_WRITEV         => sys_writev(a1, a2, a3),
+        SYS_MADVISE        => 0, // no-op
+        SYS_DUP2           => sys_dup2(a1, a2),
+        SYS_GETPID         => sys_getpid(),
+        SYS_CLONE          => crate::clone::sys_clone(a1, a2, a3, a4, a5),
+        SYS_EXECVE         => crate::exec::sys_execve(a1, a2, a3),
         SYS_EXIT
         | SYS_EXIT_GROUP   => sys_exit(a1 as i32),
         SYS_WAIT4          => sys_wait4(a1, a2, a3),
+        SYS_FCNTL          => sys_fcntl(a1, a2, a3),
         SYS_GETCWD         => sys_getcwd(a1, a2),
         SYS_CHDIR          => sys_chdir(a1),
+        SYS_SIGALTSTACK    => 0, // stub (no signal support)
         SYS_ARCH_PRCTL     => sys_arch_prctl(a1, a2),
         SYS_FUTEX          => 0, // stub (single-threaded, lock never contended)
+        SYS_SCHED_GETAFFINITY => sys_sched_getaffinity(a1, a2, a3),
         SYS_GETDENTS64     => sys_getdents64(a1, a2, a3),
         SYS_SET_TID_ADDRESS => sys_set_tid_address(),
+        SYS_CLOCK_GETTIME  => sys_clock_gettime(a1, a2),
         SYS_SET_ROBUST_LIST => 0, // no-op
+        SYS_PIPE2          => sys_pipe2(a1, a2),
+        SYS_GETRANDOM      => sys_getrandom(a1, a2, a3),
         SYS_SPAWN          => sys_spawn(a1, a2, a3, a4),
         other              => {
             log::warn!("unhandled syscall nr={} a1={:#x} a2={:#x} a3={:#x}",
@@ -76,13 +89,13 @@ fn syscall_inner(
 // Helpers
 
 /// Validate that a user buffer [ptr..ptr+len) is within user address space.
-fn validate_user_buf(ptr: u64, len: u64) -> bool {
+pub(crate) fn validate_user_buf(ptr: u64, len: u64) -> bool {
     const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
     ptr != 0 && len <= USER_LIMIT && ptr.checked_add(len).map_or(false, |end| end <= USER_LIMIT)
 }
 
 /// Read a null-terminated string from user space. Returns None on bad pointer.
-fn read_user_string(ptr: u64, max_len: usize) -> Option<alloc::string::String> {
+pub(crate) fn read_user_string(ptr: u64, max_len: usize) -> Option<alloc::string::String> {
     const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
     if ptr == 0 || ptr >= USER_LIMIT { return None; }
     let mut len = 0usize;
@@ -108,7 +121,7 @@ fn get_fd_handle(fd: u64) -> Result<Arc<dyn FileHandle>, i64> {
 }
 
 /// Resolve a path relative to the current process's CWD.
-fn resolve_user_path(path: &str) -> alloc::string::String {
+pub(crate) fn resolve_user_path(path: &str) -> alloc::string::String {
     let pid = libkernel::process::current_pid();
     let cwd = libkernel::process::with_process_ref(pid, |p| p.cwd.clone())
         .unwrap_or_else(|| alloc::string::String::from("/"));
@@ -118,7 +131,7 @@ fn resolve_user_path(path: &str) -> alloc::string::String {
 // ---------------------------------------------------------------------------
 // VFS helpers (direct calls into devices::vfs, no callback trampolines)
 
-fn vfs_read_file(path: &str) -> Result<alloc::vec::Vec<u8>, devices::vfs::VfsError> {
+pub(crate) fn vfs_read_file(path: &str) -> Result<alloc::vec::Vec<u8>, devices::vfs::VfsError> {
     let path = alloc::string::String::from(path);
     crate::blocking::blocking(async move {
         devices::vfs::read_file(&path).await
@@ -154,6 +167,14 @@ fn sys_exit(code: i32) -> i64 {
     let pid = libkernel::process::current_pid();
     if pid != libkernel::process::ProcessId::KERNEL {
         libkernel::serial_println!("[kernel] pid {} exited with code {}", pid.as_u64(), code);
+
+        // If this is a vfork child, unblock the parent before marking zombie.
+        let vfork_parent_thread = libkernel::process::with_process(pid, |p| {
+            p.vfork_parent_thread.take()
+        });
+        if let Some(Some(thread_idx)) = vfork_parent_thread {
+            libkernel::task::scheduler::unblock(thread_idx);
+        }
 
         let parent_pid = libkernel::process::with_process_ref(pid, |p| p.parent_pid);
         libkernel::process::mark_zombie(pid, code);
@@ -512,4 +533,154 @@ fn sys_spawn(path_ptr: u64, path_len: u64, argv_ptr: u64, argv_count: u64) -> i6
         }
         Err(_) => -errno::ENOENT,
     }
+}
+
+// ---------------------------------------------------------------------------
+// getpid
+
+fn sys_getpid() -> i64 {
+    libkernel::process::current_pid().as_u64() as i64
+}
+
+// ---------------------------------------------------------------------------
+// fcntl
+
+fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
+    const F_GETFD: u64 = 1;
+    const F_SETFD: u64 = 2;
+    const F_GETFL: u64 = 3;
+
+    let pid = libkernel::process::current_pid();
+    match cmd {
+        F_GETFD => {
+            match libkernel::process::with_process_ref(pid, |p| p.get_fd_flags(fd as usize)) {
+                Some(Ok(flags)) => flags as i64,
+                _ => -errno::EBADF,
+            }
+        }
+        F_SETFD => {
+            match libkernel::process::with_process(pid, |p| p.set_fd_flags(fd as usize, arg as u32)) {
+                Some(Ok(())) => 0,
+                _ => -errno::EBADF,
+            }
+        }
+        F_GETFL => 0, // no file status flags tracked
+        _ => -errno::EINVAL,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dup2
+
+fn sys_dup2(oldfd: u64, newfd: u64) -> i64 {
+    let oldfd = oldfd as usize;
+    let newfd = newfd as usize;
+    if oldfd == newfd {
+        // Verify oldfd is valid, then return it.
+        let pid = libkernel::process::current_pid();
+        return match libkernel::process::with_process_ref(pid, |p| p.get_fd(oldfd)) {
+            Some(Ok(_)) => newfd as i64,
+            _ => -errno::EBADF,
+        };
+    }
+    let pid = libkernel::process::current_pid();
+    match libkernel::process::with_process(pid, |p| {
+        let entry = p.get_fd_entry(oldfd)?;
+        // New entry inherits the handle but NOT the CLOEXEC flag (POSIX).
+        p.set_fd(newfd, FdEntry::new(entry.handle));
+        Ok(newfd)
+    }) {
+        Some(Ok(fd)) => fd as i64,
+        Some(Err(e)) => errno::file_errno(e),
+        None => -errno::EBADF,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pipe2
+
+fn sys_pipe2(fds_ptr: u64, flags: u64) -> i64 {
+    const O_CLOEXEC: u64 = 0o2000000;
+
+    if !validate_user_buf(fds_ptr, 8) {
+        return -errno::EFAULT;
+    }
+
+    let (reader, writer) = libkernel::file::make_pipe();
+    let fd_flags = if flags & O_CLOEXEC != 0 { FD_CLOEXEC } else { 0 };
+
+    let pid = libkernel::process::current_pid();
+    match libkernel::process::with_process(pid, |p| {
+        let rfd = p.alloc_fd_with_flags(Arc::new(reader), fd_flags)?;
+        let wfd = match p.alloc_fd_with_flags(Arc::new(writer), fd_flags) {
+            Ok(fd) => fd,
+            Err(e) => {
+                p.close_fd(rfd).ok();
+                return Err(e);
+            }
+        };
+        Ok((rfd, wfd))
+    }) {
+        Some(Ok((rfd, wfd))) => {
+            let fds = unsafe { core::slice::from_raw_parts_mut(fds_ptr as *mut i32, 2) };
+            fds[0] = rfd as i32;
+            fds[1] = wfd as i32;
+            0
+        }
+        Some(Err(e)) => errno::file_errno(e),
+        None => -errno::EBADF,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// getrandom
+
+fn sys_getrandom(buf: u64, count: u64, _flags: u64) -> i64 {
+    if !validate_user_buf(buf, count) {
+        return -errno::EFAULT;
+    }
+    // Simple xorshift64* PRNG seeded from TSC.
+    let mut state: u64 = unsafe { core::arch::x86_64::_rdtsc() };
+    if state == 0 { state = 0xDEAD_BEEF_CAFE_BABE; }
+    let user_buf = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count as usize) };
+    for byte in user_buf.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = state as u8;
+    }
+    count as i64
+}
+
+// ---------------------------------------------------------------------------
+// sched_getaffinity — single-CPU mask
+
+fn sys_sched_getaffinity(_pid: u64, cpusetsize: u64, mask_ptr: u64) -> i64 {
+    if cpusetsize == 0 {
+        return -errno::EINVAL;
+    }
+    if !validate_user_buf(mask_ptr, cpusetsize) {
+        return -errno::EFAULT;
+    }
+    let user_buf = unsafe { core::slice::from_raw_parts_mut(mask_ptr as *mut u8, cpusetsize as usize) };
+    // Zero the entire mask, then set bit 0 (CPU 0).
+    for b in user_buf.iter_mut() { *b = 0; }
+    user_buf[0] = 1;
+    // Return the number of bytes written (kernel convention).
+    cpusetsize as i64
+}
+
+// ---------------------------------------------------------------------------
+// clock_gettime — stub returning zero
+
+fn sys_clock_gettime(_clk_id: u64, tp: u64) -> i64 {
+    if !validate_user_buf(tp, 16) {
+        return -errno::EFAULT;
+    }
+    // Write zero seconds and nanoseconds.
+    unsafe {
+        *(tp as *mut u64) = 0;         // tv_sec
+        *((tp + 8) as *mut u64) = 0;   // tv_nsec
+    }
+    0
 }

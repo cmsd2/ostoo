@@ -2,8 +2,10 @@
 extern crate alloc;
 
 pub mod blocking;
+pub mod clone;
 pub mod dispatch;
 pub mod errno;
+pub mod exec;
 pub mod file;
 pub mod spawn;
 pub mod syscall_nr;

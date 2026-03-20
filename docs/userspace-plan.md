@@ -12,12 +12,14 @@ through system calls, and eventually linked against a ported musl libc.
 
 ## Progress Summary
 
-Phases 0–6 are **complete** (Phase 6 without `fork`).  The kernel runs a
-musl-linked C shell (`user/shell.c`) as its primary user interface.  The
-shell auto-launches on boot, supports line editing, built-in commands
-(`echo`, `pwd`, `cd`, `ls`, `cat`, `exit`, `help`), and spawning external
-programs via a custom `spawn` syscall + `waitpid`.  21 syscalls are
-implemented.
+Phases 0–6 are **complete**.  The kernel runs a musl-linked C shell
+(`user/shell.c`) as its primary user interface.  The shell auto-launches on
+boot, supports line editing, built-in commands (`echo`, `pwd`, `cd`, `ls`,
+`cat`, `exit`, `help`), and spawning external programs.  Process creation
+supports both the custom `spawn` syscall (nr 500) and standard Linux
+`clone(CLONE_VM|CLONE_VFORK)` + `execve`, enabling unpatched musl
+`posix_spawn` and Rust `std::process::Command`.  30+ syscalls are implemented
+including `pipe2`, `dup2`, `fcntl`, `getpid`, `getrandom`, and `clone`/`execve`.
 
 | Phase | Status | Milestone |
 |-------|--------|-----------|
@@ -27,7 +29,7 @@ implemented.
 | 3 — Process abstraction | **Done** | `Process` struct, process table, ELF loader, `exec` shell command, zombie reaping |
 | 4 — System call layer | **Done** | 14 syscalls implemented; initial stack with auxv; `brk`/`mmap` for heap; `writev` for musl printf |
 | 5 — Cross-compiler + musl | **Done** | Docker-based musl cross-compiler (`scripts/user-build.sh`); static musl binaries run on ostoo |
-| 6 — Spawn / wait / user shell | **Done** | Custom `spawn` syscall (nr 500) + `wait4`; userspace C shell with line editing, auto-launched on boot; `fork` deferred |
+| 6 — Spawn / wait / user shell | **Done** | Custom `spawn` syscall (nr 500) + `wait4`; `clone(CLONE_VM\|CLONE_VFORK)` + `execve` for standard process creation; `pipe2`, `dup2`, `fcntl`, `getpid`, `getrandom`; userspace C shell with line editing, auto-launched on boot |
 | 7 — Signals | **Not started** | Requires signal frame push/pop, `rt_sigaction`, `rt_sigreturn` |
 
 ### What works today

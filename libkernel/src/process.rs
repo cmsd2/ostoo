@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::PhysAddr;
 
-use crate::file::{FileHandle, FileError};
+use crate::file::{FileHandle, FileError, FdEntry, FD_CLOEXEC};
 
 // ---------------------------------------------------------------------------
 // ProcessId
@@ -63,13 +63,15 @@ pub struct Process {
     /// Tracked (vaddr, len) pairs for mmap regions.
     pub mmap_regions: Vec<(u64, u64)>,
     /// Per-process file descriptor table.
-    pub fd_table: Vec<Option<Arc<dyn FileHandle>>>,
+    pub fd_table: Vec<Option<FdEntry>>,
     /// Current working directory (absolute path).
     pub cwd: String,
     /// Parent process ID (KERNEL for top-level processes).
     pub parent_pid: ProcessId,
     /// Scheduler thread index to wake when a child exits (for waitpid).
     pub wait_thread: Option<usize>,
+    /// For vfork children: parent's thread index to unblock on execve/_exit.
+    pub vfork_parent_thread: Option<usize>,
 }
 
 const PROCESS_KERNEL_STACK_SIZE: usize = crate::consts::KERNEL_STACK_SIZE;
@@ -102,22 +104,28 @@ impl Process {
             cwd: String::from("/"),
             parent_pid: ProcessId::KERNEL,
             wait_thread: None,
+            vfork_parent_thread: None,
         }
     }
 
     /// Allocate the lowest available file descriptor for the given handle.
     pub fn alloc_fd(&mut self, handle: Arc<dyn FileHandle>) -> Result<usize, FileError> {
+        self.alloc_fd_with_flags(handle, 0)
+    }
+
+    /// Allocate the lowest available file descriptor with the given flags.
+    pub fn alloc_fd_with_flags(&mut self, handle: Arc<dyn FileHandle>, flags: u32) -> Result<usize, FileError> {
         // Search for the first None slot.
         for (i, slot) in self.fd_table.iter().enumerate() {
             if slot.is_none() {
-                self.fd_table[i] = Some(handle);
+                self.fd_table[i] = Some(FdEntry::with_flags(handle, flags));
                 return Ok(i);
             }
         }
         // No free slot — extend if under limit.
         if self.fd_table.len() < crate::file::MAX_FDS {
             let fd = self.fd_table.len();
-            self.fd_table.push(Some(handle));
+            self.fd_table.push(Some(FdEntry::with_flags(handle, flags)));
             Ok(fd)
         } else {
             Err(FileError::TooManyOpenFiles)
@@ -130,7 +138,7 @@ impl Process {
             return Err(FileError::BadFd);
         }
         match self.fd_table[fd].take() {
-            Some(handle) => { handle.close(); Ok(()) }
+            Some(entry) => { entry.handle.close(); Ok(()) }
             None => Err(FileError::BadFd),
         }
     }
@@ -138,8 +146,56 @@ impl Process {
     /// Get a handle to an open file descriptor.
     pub fn get_fd(&self, fd: usize) -> Result<Arc<dyn FileHandle>, FileError> {
         self.fd_table.get(fd)
+            .and_then(|slot| slot.as_ref().map(|e| e.handle.clone()))
+            .ok_or(FileError::BadFd)
+    }
+
+    /// Get FD flags (e.g. FD_CLOEXEC).
+    pub fn get_fd_flags(&self, fd: usize) -> Result<u32, FileError> {
+        self.fd_table.get(fd)
+            .and_then(|slot| slot.as_ref().map(|e| e.flags))
+            .ok_or(FileError::BadFd)
+    }
+
+    /// Set FD flags (e.g. FD_CLOEXEC).
+    pub fn set_fd_flags(&mut self, fd: usize, flags: u32) -> Result<(), FileError> {
+        match self.fd_table.get_mut(fd) {
+            Some(Some(entry)) => { entry.flags = flags; Ok(()) }
+            _ => Err(FileError::BadFd),
+        }
+    }
+
+    /// Insert an FdEntry at a specific fd slot, closing any existing fd there.
+    /// Extends the table if needed.
+    pub fn set_fd(&mut self, fd: usize, entry: FdEntry) {
+        // Extend table if necessary.
+        while self.fd_table.len() <= fd {
+            self.fd_table.push(None);
+        }
+        // Close existing fd silently.
+        if let Some(old) = self.fd_table[fd].take() {
+            old.handle.close();
+        }
+        self.fd_table[fd] = Some(entry);
+    }
+
+    /// Get a clone of the FdEntry at `fd`.
+    pub fn get_fd_entry(&self, fd: usize) -> Result<FdEntry, FileError> {
+        self.fd_table.get(fd)
             .and_then(|slot| slot.clone())
             .ok_or(FileError::BadFd)
+    }
+
+    /// Close all file descriptors that have FD_CLOEXEC set.
+    pub fn close_cloexec_fds(&mut self) {
+        for slot in self.fd_table.iter_mut() {
+            if let Some(entry) = slot {
+                if entry.flags & FD_CLOEXEC != 0 {
+                    entry.handle.close();
+                    *slot = None;
+                }
+            }
+        }
     }
 }
 

@@ -2,19 +2,18 @@
  * Minimal userspace shell for ostoo.
  *
  * Reads raw keypresses from stdin (fd 0), performs its own line editing,
- * and dispatches built-in commands or spawns programs via a custom syscall.
+ * and dispatches built-in commands or spawns programs via posix_spawn.
  *
- * Built-in commands: echo, pwd, cd, ls, cat, exit
+ * Built-in commands: echo, pwd, cd, ls, cat, exit, pid
  * External programs: spawn by path (e.g. /hello)
  */
 
 #include <unistd.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
+#include <spawn.h>
 #include <fcntl.h>
-
-/* ── custom syscall numbers ─────────────────────────────────────────── */
-#define SYS_SPAWN 500
 
 /* ── small helpers (no libc printf to avoid buffering issues) ───────── */
 
@@ -236,10 +235,6 @@ static void cmd_cat(char *path) {
     close(fd);
 }
 
-static long do_spawn(const char *path, const char **argv, int argc) {
-    return syscall(SYS_SPAWN, path, strlen(path), argv, argc);
-}
-
 static void cmd_run(char *cmdline) {
     /* First word is the program path. */
     char *path = cmdline;
@@ -250,8 +245,8 @@ static void cmd_run(char *cmdline) {
     int has_args = (*end != '\0');
     if (has_args) *end = '\0';
 
-    /* Build argv: argv[0] = path, then remaining words. */
-    const char *argv[16];
+    /* Build argv: argv[0] = path, then remaining words, NULL-terminated. */
+    char *argv[16];
     int argc = 0;
     argv[argc++] = path;
 
@@ -265,9 +260,12 @@ static void cmd_run(char *cmdline) {
             else break;
         }
     }
+    argv[argc] = (char *)0;
 
-    long pid = do_spawn(path, argv, argc);
-    if (pid < 0) {
+    /* Use posix_spawn (musl uses clone(CLONE_VM|CLONE_VFORK) + execve). */
+    pid_t child_pid;
+    int err = posix_spawn(&child_pid, path, 0, 0, argv, (char **)0);
+    if (err != 0) {
         puts_stdout(path);
         puts_stdout(": not found\n");
         return;
@@ -275,7 +273,7 @@ static void cmd_run(char *cmdline) {
 
     /* Wait for child to finish. */
     int status = 0;
-    syscall(SYS_wait4, pid, &status, 0, 0);
+    waitpid(child_pid, &status, 0);
 }
 
 /* ── main loop ──────────────────────────────────────────────────────── */
@@ -311,10 +309,13 @@ int main(void) {
             cmd_ls(args);
         } else if (strcmp(cmd, "cat") == 0) {
             cmd_cat(args);
+        } else if (strcmp(cmd, "pid") == 0) {
+            put_num(getpid());
+            put_char('\n');
         } else if (strcmp(cmd, "exit") == 0) {
             break;
         } else if (strcmp(cmd, "help") == 0) {
-            puts_stdout("Commands: echo, pwd, cd, ls, cat, exit, help\n");
+            puts_stdout("Commands: echo, pwd, cd, ls, cat, pid, exit, help\n");
             puts_stdout("Or run a program by path (e.g. /hello)\n");
         } else {
             /* Reconstruct full cmdline for spawning (cmd was null-terminated). */
