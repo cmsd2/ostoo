@@ -1,4 +1,5 @@
 /target
+/user-rs/target
 **/*.rs.bk
 disk.img
 .config.old

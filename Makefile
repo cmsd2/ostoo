@@ -1,13 +1,17 @@
 
-.PHONY: build user run run-disk test clean
+.PHONY: build user user-rs run run-disk test clean
 
 # Build userspace programs first, then the kernel bootimage.
-build: user
+build: user user-rs
 	cargo bootimage --manifest-path kernel/Cargo.toml
 
-# Build userspace programs via the Docker cross-compiler.
+# Build C userspace programs via the Docker cross-compiler.
 user:
 	scripts/user-build.sh
+
+# Build Rust userspace programs natively.
+user-rs:
+	scripts/user-rs-build.sh
 
 # Run with virtio-9p host sharing (default, no disk image needed).
 run: build
