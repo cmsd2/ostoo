@@ -19,6 +19,7 @@ Both are handled identically in ostoo since each process currently has exactly o
 1. Looks up the current PID.
 2. If it's a user process (not `ProcessId::KERNEL`):
    - Logs `pid N exited with code C` to serial.
+   - **Unblocks vfork parent:** If this process was created by `clone(CLONE_VFORK)` and has not yet called `execve`, unblocks the parent thread so it can resume. Clears `vfork_parent_thread`.
    - Reads the process's `parent_pid` (separate lock acquisition).
    - Marks the process as a zombie via `mark_zombie(pid, code)`.
    - Checks if the parent process has a `wait_thread` set (meaning it's blocked in `waitpid`). If so, calls `scheduler::unblock()` to wake the parent.

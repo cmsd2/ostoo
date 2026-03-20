@@ -60,9 +60,12 @@ syscall(SYS_wait4, pid, &status, 0, 0);
 | `-ENOENT` (-2) | File not found on VFS |
 | `-ENOENT` (-2) | ELF load or spawn failed |
 
+## Alternatives
+
+Standard Linux process creation is now available via `clone(CLONE_VM|CLONE_VFORK)` + `execve` (see [clone.md](clone.md) and [execve.md](execve.md)). musl's `posix_spawn` and Rust's `std::process::Command` use these standard syscalls and do not require this custom syscall. The userspace shell has been updated to use `posix_spawn` instead of `SYS_SPAWN`.
+
 ## Future Work
 
-- Inherit parent's `cwd` in child process.
 - Inherit or selectively copy file descriptors (e.g. stdin/stdout redirection for pipes).
 - Support environment variables via `envp`.
-- Replace with standard `posix_spawn` or `fork`+`execve` model.
+- May be deprecated in favour of the standard `clone` + `execve` path.
