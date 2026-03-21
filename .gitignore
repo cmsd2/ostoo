@@ -3,3 +3,4 @@
 **/*.rs.bk
 disk.img
 .config.old
+/sysroot

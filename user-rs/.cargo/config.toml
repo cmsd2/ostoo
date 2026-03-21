@@ -2,5 +2,10 @@
 target = "x86_64-ostoo-user.json"
 
 [unstable]
-build-std = ["core", "compiler_builtins", "alloc"]
+build-std = ["std", "panic_abort"]
 build-std-features = ["compiler-builtins-mem"]
+
+[target.x86_64-ostoo-user]
+rustflags = [
+    "-Lnative=../sysroot/x86_64-ostoo-user/lib",
+]

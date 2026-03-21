@@ -10,5 +10,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hello-std"
+version = "0.1.0"
+dependencies = [
+ "ostoo-rt",
+]
+
+[[package]]
 name = "ostoo-rt"
 version = "0.1.0"
