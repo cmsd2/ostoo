@@ -601,7 +601,7 @@ model.
 | Item | Detail |
 |---|---|
 | **Files** | `libkernel/src/irq_handle.rs` (IrqInner, IRQ slot table, ISR dispatch), `libkernel/src/file.rs` (FdObject::Irq variant), `libkernel/src/completion_port.rs` (OP_IRQ_WAIT constant), `osl/src/irq.rs` (sys_irq_create), `osl/src/io_port.rs` (OP_IRQ_WAIT handler in io_submit) |
-| **Dependencies** | Phase 1; IO APIC route/mask/unmask (apic crate) |
+| **Dependencies** | Phase 1; IO APIC route/mask/unmask (libkernel::apic) |
 | **Delivers** | `irq_create(gsi)` syscall (504), submit OP_IRQ_WAIT on an IRQ fd, ISR masks line and posts completion to port, rearm via another OP_IRQ_WAIT unmasks |
 | **Test** | `user/irq_demo.c`: create IRQ fd for keyboard GSI 1, submit OP_IRQ_WAIT, press key, verify completion with scancode in result. |
 

@@ -73,7 +73,7 @@ redirection entry.
 
 ## Initialization Sequence
 
-### 1. Map Local APIC (`apic::init_local`)
+### 1. Map Local APIC (`libkernel::apic::init_local`)
 
 The LAPIC physical address is read from the `IA32_APIC_BASE` MSR. A virtual
 page at `APIC_BASE` is mapped to this physical frame (with `NO_CACHE` flag, as
@@ -88,9 +88,9 @@ After mapping:
 - `enable()` writes the SIVR: `APIC_ENABLE | 0xFF` (enable + spurious vector).
 - The EOI virtual address (`APIC_BASE + 0xB0`) is stored in
   `libkernel::interrupts::LAPIC_EOI_ADDR` so interrupt handlers can issue EOI
-  without needing a reference to the `apic` crate.
+  without needing a reference to the `apic` module.
 
-### 2. Map IO APIC(s) (`apic::init_io`)
+### 2. Map IO APIC(s) (`libkernel::apic::init_io`)
 
 Each IO APIC listed in the ACPI MADT is mapped to consecutive virtual pages
 starting at `APIC_BASE + 4KiB`. The `global_system_interrupt_base` field records
@@ -137,13 +137,16 @@ vectors or cause double-delivery with the IO APIC.
 | `TIMER_VECTOR`      | `0x20`     | IDT vector for timer (ISA IRQ 0)      |
 | `KEYBOARD_VECTOR`   | `0x21`     | IDT vector for keyboard (ISA IRQ 1)   |
 
-## Circular Dependency Constraint
+## Crate Location
 
-`libkernel` is a dependency of `apic`, so `libkernel` cannot import `apic`. The
-LAPIC EOI address is therefore communicated via a single `AtomicU64` in
-`libkernel::interrupts`: the `apic` crate writes the address after mapping the
-LAPIC, and `libkernel`'s interrupt handlers read it to perform EOI without any
-direct knowledge of the APIC mapping.
+The APIC code lives in `libkernel::apic` (module `libkernel/src/apic/`). It was
+originally a separate `apic` crate but was merged into `libkernel` so that
+`libkernel::irq_handle` can call IO APIC mask/unmask/write functions directly
+without duplicating raw MMIO code.
+
+The LAPIC EOI address is communicated via a single `AtomicU64` in
+`libkernel::interrupts`: the `apic` module writes the address after mapping the
+LAPIC, and interrupt handlers read it to perform EOI.
 
 ## References
 

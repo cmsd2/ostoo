@@ -38,7 +38,6 @@ default = []
 ring3_test = []
 
 [dependencies]
-apic                  = { workspace = true }
 devices               = { workspace = true }
 libkernel             = { workspace = true }
 osl                   = { workspace = true }

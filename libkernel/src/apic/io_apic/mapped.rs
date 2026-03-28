@@ -42,22 +42,22 @@ impl MappedIoApic {
             }
         }
     }
-    
+
     pub fn max_redirect_entries(&self) -> u32 {
         unsafe { VersionRegister.read(self) }.max_redirect_entry()
     }
 
-    /// Raw IO APIC Version register (bits 0–7 = version, 16–23 = max redir entry).
+    /// Raw IO APIC Version register (bits 0-7 = version, 16-23 = max redir entry).
     pub fn read_version_raw(&self) -> u32 {
         unsafe { self.read_reg_32(IoApic32BitRegisterIndex::Version) }
     }
 
-    /// Read a single 64-bit redirection entry. `gsi_offset` = gsi − `self.interrupt_base`.
+    /// Read a single 64-bit redirection entry. `gsi_offset` = gsi - `self.interrupt_base`.
     pub fn read_redirect_entry(&self, gsi_offset: u32) -> u64 {
         unsafe { self.read_reg_64(IoApic64BitRegisterIndex::RedirectionEntry(gsi_offset)) }
     }
 
-    /// Write a single 64-bit redirection entry. `gsi_offset` = gsi − `self.interrupt_base`.
+    /// Write a single 64-bit redirection entry. `gsi_offset` = gsi - `self.interrupt_base`.
     pub fn write_redirect_entry(&self, gsi_offset: u32, entry: u64) {
         unsafe { self.write_reg_64(IoApic64BitRegisterIndex::RedirectionEntry(gsi_offset), entry); }
     }
@@ -88,7 +88,7 @@ impl MappedIoApic {
         if active_low      { entry |= 1 << 13; }   // bit 13: pin polarity (1=active low)
         if level_triggered { entry |= 1 << 15; }   // bit 15: trigger mode (1=level)
         entry |= (lapic_id as u64) << 56;          // bits 56-63: destination LAPIC ID (physical)
-        // bit 16 (mask) = 0 → unmasked
+        // bit 16 (mask) = 0 -> unmasked
         unsafe { self.write_reg_64(IoApic64BitRegisterIndex::RedirectionEntry(gsi_offset), entry); }
     }
 

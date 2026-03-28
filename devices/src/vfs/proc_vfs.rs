@@ -466,13 +466,13 @@ fn gen_pci() -> String {
 
 fn gen_lapic() -> String {
     let mut s = String::new();
-    let guard = apic::LOCAL_APIC.lock();
+    let guard = libkernel::apic::LOCAL_APIC.lock();
     let Some(lapic) = guard.as_ref() else {
         let _ = writeln!(s, "Local APIC not initialised");
         return s;
     };
     let id       = lapic.id();
-    let phys     = unsafe { apic::local_apic::MappedLocalApic::get_base_phys_addr() };
+    let phys     = unsafe { libkernel::apic::local_apic::MappedLocalApic::get_base_phys_addr() };
     let enabled  = lapic.is_global_enabled();
     let ver_raw  = lapic.read_version_raw();
     let ver_byte = ver_raw as u8;
@@ -505,7 +505,7 @@ fn gen_lapic() -> String {
 
 fn gen_ioapic() -> String {
     let mut s = String::new();
-    let io_apics = apic::IO_APICS.lock();
+    let io_apics = libkernel::apic::IO_APICS.lock();
     if io_apics.is_empty() {
         let _ = writeln!(s, "No IO APICs found");
         return s;

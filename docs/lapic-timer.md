@@ -34,9 +34,9 @@ The LAPIC timer counts down from a programmed initial value at a rate derived fr
 
 ### Implementation
 
-`apic::calibrate_and_start_lapic_timer()` in `apic/src/lib.rs`:
+`libkernel::apic::calibrate_and_start_lapic_timer()` in `libkernel/src/apic/mod.rs`:
 
-- Called from `kernel/src/main.rs` after `apic::init()` and `disable_pic()`.
+- Called from `kernel/src/main.rs` after `libkernel::apic::init()` and `disable_pic()`.
 - Releases the `LOCAL_APIC` lock before entering the HLT loop (phase 2) so the PIT ISR can proceed without deadlock.
 - The LAPIC EOI address is already registered in `libkernel::LAPIC_EOI_ADDR` by `init_local()`.
 

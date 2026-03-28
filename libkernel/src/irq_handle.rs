@@ -1,9 +1,5 @@
 //! IRQ fd infrastructure — allows userspace to receive hardware interrupts
 //! through file descriptors and completion ports.
-//!
-//! The ISR handler and arm/close operations live here (in libkernel) using
-//! raw IO APIC MMIO writes to avoid depending on the `apic` crate.
-//! The `create_irq` function lives in `osl` which has the `apic` dependency.
 
 use alloc::sync::Arc;
 
@@ -19,10 +15,6 @@ pub struct IrqInner {
     pub gsi: u32,
     pub vector: u8,
     pub slot: usize,
-    /// IO APIC MMIO virtual base address (for raw mask/unmask).
-    pub io_apic_base: u64,
-    /// Offset within the IO APIC (gsi - interrupt_base).
-    pub gsi_offset: u32,
     /// When OP_IRQ_WAIT is active: (port, user_data) to post on interrupt.
     pub pending: Option<(Arc<IrqMutex<CompletionPort>>, u64)>,
     /// Original IO APIC redirection entry, saved before route_gsi reprograms it.
@@ -36,9 +28,9 @@ pub struct IrqInner {
 }
 
 impl IrqInner {
-    pub fn new(gsi: u32, vector: u8, slot: usize, io_apic_base: u64, gsi_offset: u32, saved_entry: u64) -> Self {
+    pub fn new(gsi: u32, vector: u8, slot: usize, saved_entry: u64) -> Self {
         Self {
-            gsi, vector, slot, io_apic_base, gsi_offset,
+            gsi, vector, slot,
             pending: None,
             saved_entry,
             scancode_buf: [0; SCANCODE_BUF_SIZE],
@@ -89,52 +81,6 @@ pub fn take_slot(slot: usize) -> Option<Arc<IrqMutex<IrqInner>>> {
 }
 
 // ---------------------------------------------------------------------------
-// Raw IO APIC mask/unmask (no lock needed, ISR-safe)
-
-/// Mask an IO APIC redirection entry via raw MMIO writes.
-///
-/// # Safety
-/// `io_apic_base` must be a valid mapped IO APIC MMIO address.
-unsafe fn raw_mask_entry(io_apic_base: u64, gsi_offset: u32) {
-    let sel = io_apic_base as *mut u32;
-    let win = (io_apic_base + 0x10) as *mut u32;
-    let reg_idx = 0x10 + gsi_offset * 2;
-    core::ptr::write_volatile(sel, reg_idx);
-    let low = core::ptr::read_volatile(win as *const u32);
-    core::ptr::write_volatile(sel, reg_idx);
-    core::ptr::write_volatile(win, low | (1 << 16));
-}
-
-/// Unmask an IO APIC redirection entry via raw MMIO writes.
-///
-/// # Safety
-/// `io_apic_base` must be a valid mapped IO APIC MMIO address.
-unsafe fn raw_unmask_entry(io_apic_base: u64, gsi_offset: u32) {
-    let sel = io_apic_base as *mut u32;
-    let win = (io_apic_base + 0x10) as *mut u32;
-    let reg_idx = 0x10 + gsi_offset * 2;
-    core::ptr::write_volatile(sel, reg_idx);
-    let low = core::ptr::read_volatile(win as *const u32);
-    core::ptr::write_volatile(sel, reg_idx);
-    core::ptr::write_volatile(win, low & !(1 << 16));
-}
-
-/// Write a full 64-bit IO APIC redirection entry via raw MMIO writes.
-///
-/// # Safety
-/// `io_apic_base` must be a valid mapped IO APIC MMIO address.
-unsafe fn raw_write_entry(io_apic_base: u64, gsi_offset: u32, entry: u64) {
-    let sel = io_apic_base as *mut u32;
-    let win = (io_apic_base + 0x10) as *mut u32;
-    let low_reg = 0x10 + gsi_offset * 2;
-    let high_reg = low_reg + 1;
-    core::ptr::write_volatile(sel, low_reg);
-    core::ptr::write_volatile(win, entry as u32);
-    core::ptr::write_volatile(sel, high_reg);
-    core::ptr::write_volatile(win, (entry >> 32) as u32);
-}
-
-// ---------------------------------------------------------------------------
 // ISR handler — registered with register_handler() as fn(usize)
 
 /// Dynamic interrupt handler for all IRQ fd slots.
@@ -150,7 +96,7 @@ pub fn irq_fd_dispatch(slot: usize) {
     let mut inner = inner_arc.lock();
 
     // Mask the GSI immediately to prevent interrupt storms.
-    unsafe { raw_mask_entry(inner.io_apic_base, inner.gsi_offset); }
+    crate::apic::mask_gsi(inner.gsi);
 
     // For keyboard (GSI 1): read the scancode to deassert the IRQ.
     let scancode = if inner.gsi == 1 {
@@ -203,13 +149,13 @@ pub fn arm_irq(inner: &Arc<IrqMutex<IrqInner>>, port: Arc<IrqMutex<CompletionPor
     }
 
     guard.pending = Some((port, user_data));
-    unsafe { raw_unmask_entry(guard.io_apic_base, guard.gsi_offset); }
+    crate::apic::unmask_gsi(guard.gsi);
 }
 
 /// Close an IRQ fd: restore the original IO APIC redirection entry, free the
 /// dynamic vector, and remove from the slot table.
 pub fn close_irq(inner: &IrqInner) {
-    unsafe { raw_write_entry(inner.io_apic_base, inner.gsi_offset, inner.saved_entry); }
+    crate::apic::write_gsi_entry(inner.gsi, inner.saved_entry);
     crate::interrupts::free_vector(inner.vector);
     take_slot(inner.slot);
 }

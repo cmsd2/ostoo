@@ -2,7 +2,6 @@
 members = [
     "kernel",
     "libkernel",
-    "apic",
     "devices",
     "devices-macros",
     "osl",
@@ -10,7 +9,6 @@ members = [
 
 [workspace.dependencies]
 # workspace-local crates
-apic      = { path = "apic" }
 devices   = { path = "devices" }
 libkernel = { path = "libkernel" }
 osl       = { path = "osl" }

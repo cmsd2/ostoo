@@ -295,14 +295,14 @@ are present, racing all event sources in a single future.
 - Calls `acpi::search_for_rsdp_bios` to locate and parse ACPI tables.
 - On boot the interrupt model is printed; APIC vs legacy PIC is detected.
 
-### APIC Crate (`apic/`)
-- A separate crate for APIC initialisation, mapped at `0xFFFF_8001_0000_0000`.
-- `apic/src/local_apic/` — Local APIC register access via MMIO and MSR.
-- `apic/src/io_apic/` — I/O APIC register access via MMIO.
-- `apic::init()` maps the Local APIC and all I/O APICs from the ACPI table,
+### APIC Module (`libkernel/src/apic/`)
+- APIC code lives in `libkernel::apic`, mapped at `0xFFFF_8001_0000_0000`.
+- `libkernel/src/apic/local_apic/` — Local APIC register access via MMIO and MSR.
+- `libkernel/src/apic/io_apic/` — I/O APIC register access via MMIO.
+- `libkernel::apic::init()` maps the Local APIC and all I/O APICs from the ACPI table,
   routes ISA IRQs 0 (timer) and 1 (keyboard) through the I/O APIC to IDT
   vectors 0x20 and 0x21, then disables the 8259 PIC.
-- `apic::calibrate_and_start_lapic_timer()` uses the PIT as a reference to
+- `libkernel::apic::calibrate_and_start_lapic_timer()` uses the PIT as a reference to
   measure the LAPIC bus frequency, starts the LAPIC timer in periodic mode
   at 1000 Hz, then masks the PIT's I/O APIC entry so it no longer fires.
 

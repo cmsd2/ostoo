@@ -2,7 +2,7 @@ use x86_64::{PhysAddr, VirtAddr};
 use x86_64::registers::model_specific::Msr;
 use apic_types::local::*;
 use super::msr::ApicBaseMsrFlags;
-use libkernel::cpuid;
+use crate::cpuid;
 
 const IA32_APIC_BASE_MSR: u32 = 0x1b;
 
@@ -117,7 +117,7 @@ impl MappedLocalApic {
         unsafe { self.read_reg_32(LocalApicRegisterIndex::TimerCurrentCount) }
     }
 
-    /// Raw LVT Timer register (bits 0–7 = vector, 16 = mask, 17–18 = mode).
+    /// Raw LVT Timer register (bits 0-7 = vector, 16 = mask, 17-18 = mode).
     pub fn read_lvt_timer(&self) -> u32 {
         unsafe { self.read_reg_32(LocalApicRegisterIndex::LvtTimer) }
     }
@@ -127,7 +127,7 @@ impl MappedLocalApic {
         unsafe { self.read_reg_32(LocalApicRegisterIndex::TimerInitialCount) }
     }
 
-    /// Raw LAPIC Version register (bits 0–7 = version, 16–23 = max LVT entry).
+    /// Raw LAPIC Version register (bits 0-7 = version, 16-23 = max LVT entry).
     pub fn read_version_raw(&self) -> u32 {
         unsafe { self.read_reg_32(LocalApicRegisterIndex::Version) }
     }

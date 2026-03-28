@@ -17,22 +17,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "apic"
-version = "0.1.0"
-dependencies = [
- "acpi",
- "apic_types",
- "bitflags 1.2.1",
- "bootloader",
- "lazy_static",
- "libkernel",
- "log",
- "raw-cpuid 7.0.3",
- "spin 0.9.8",
- "x86_64 0.15.4",
-]
-
-[[package]]
 name = "apic_types"
 version = "0.1.0"
 source = "git+https://github.com/cmsd2/apic_types.git#e5cc9d7ea72371c6da5b5edb2ca0e7026c630375"
@@ -116,7 +100,6 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 name = "devices"
 version = "0.1.0"
 dependencies = [
- "apic",
  "bootloader",
  "devices-macros",
  "lazy_static",
@@ -181,7 +164,6 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "acpi",
- "apic",
  "bootloader",
  "devices",
  "futures-util",
@@ -210,6 +192,9 @@ dependencies = [
 name = "libkernel"
 version = "0.1.0"
 dependencies = [
+ "acpi",
+ "apic_types",
+ "bitflags 1.2.1",
  "bootloader",
  "conquer-once",
  "crossbeam-queue",
@@ -255,7 +240,6 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 name = "osl"
 version = "0.1.0"
 dependencies = [
- "apic",
  "devices",
  "libkernel",
  "log",

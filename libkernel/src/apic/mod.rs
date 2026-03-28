@@ -1,22 +1,3 @@
-#![no_std]
-#![cfg_attr(test, no_main)]
-#![feature(custom_test_frameworks)]
-#![test_runner(libkernel::test_runner)]
-#![reexport_test_harness_main = "test_main"]
-
-#[macro_use]
-extern crate bitflags;
-
-extern crate alloc;
-
-#[cfg(test)]
-use libkernel::{hlt_loop, test_panic_handler};
-#[cfg(test)]
-use bootloader::{entry_point, BootInfo};
-#[cfg(test)]
-use core::panic::PanicInfo;
-
-pub mod ioapic;
 pub mod local_apic;
 pub mod io_apic;
 
@@ -25,8 +6,7 @@ use acpi::platform::interrupt::{InterruptModel, IoApic as AcpiIoApic, InterruptS
 use core::sync::atomic::{AtomicU32, Ordering};
 use spin::Mutex;
 use lazy_static::lazy_static;
-use libkernel;
-use libkernel::memory::MemoryServices;
+use crate::memory::MemoryServices;
 use x86_64::{PhysAddr, VirtAddr};
 use x86_64::structures::paging::{
     PageSize,
@@ -34,8 +14,6 @@ use x86_64::structures::paging::{
 };
 use local_apic::MappedLocalApic;
 use io_apic::MappedIoApic;
-#[macro_use]
-extern crate log;
 
 lazy_static! {
     pub static ref LOCAL_APIC: Mutex<Option<MappedLocalApic>> = Mutex::new(None);
@@ -67,7 +45,7 @@ pub fn init_io(io_apics: &[AcpiIoApic], overrides: &[InterruptSourceOverride], m
         apic.mask_all();
     }
 
-    // Route ISA IRQ 0 (timer) → vector 0x20, IRQ 1 (keyboard) → vector 0x21
+    // Route ISA IRQ 0 (timer) -> vector 0x20, IRQ 1 (keyboard) -> vector 0x21
     let lapic_id = {
         LOCAL_APIC.lock().as_ref().map(|a| a.id()).unwrap_or(0)
     };
@@ -103,7 +81,7 @@ fn route_isa_irq(io_apics: &[MappedIoApic], isa_irq: u8, vector: u8, lapic_id: u
 // ---------------------------------------------------------------------------
 // Public GSI management (for IRQ fd infrastructure)
 
-/// Program an IO APIC redirection entry for `gsi` → `vector`, targeting LAPIC 0
+/// Program an IO APIC redirection entry for `gsi` -> `vector`, targeting LAPIC 0
 /// (BSP), edge-triggered, active-high. The entry is initially **masked**.
 /// Returns `true` if the GSI was found in an IO APIC.
 pub fn route_gsi(gsi: u32, vector: u8) -> bool {
@@ -213,13 +191,13 @@ pub fn init_local(remap_addr: VirtAddr, mem: &mut MemoryServices) {
     mapped_apic.enable();
 
     // Register LAPIC EOI virtual address with libkernel (offset 0xB0 = EndOfInterrupt)
-    libkernel::interrupts::set_local_apic_eoi_addr((remap_addr + 0xB0u64).as_u64());
+    crate::interrupts::set_local_apic_eoi_addr((remap_addr + 0xB0u64).as_u64());
 
     let mut local_apic = LOCAL_APIC.lock();
     *local_apic = Some(mapped_apic);
 }
 
-const CALIBRATION_PIT_TICKS: u64 = 50;  // 50 × 10ms = 500ms window
+const CALIBRATION_PIT_TICKS: u64 = 50;  // 50 x 10ms = 500ms window
 const CALIBRATION_PIT_HZ:    u64 = 100;
 const LAPIC_TARGET_HZ:       u64 = 1000;
 const LAPIC_DIVIDE_BY_16:    u8  = 0x3;
@@ -227,7 +205,7 @@ const LAPIC_DIVIDE_BY_16:    u8  = 0x3;
 /// Calibrate the LAPIC timer against the PIT and start it in periodic mode at 1000 Hz.
 /// Must be called after `init()` and with interrupts enabled (PIT drives TICK_COUNT during calibration).
 pub fn calibrate_and_start_lapic_timer() {
-    use libkernel::{interrupts::LAPIC_TIMER_VECTOR, task::timer};
+    use crate::{interrupts::LAPIC_TIMER_VECTOR, task::timer};
 
     info!("[apic] calibrating LAPIC timer against PIT ({}ms window)...",
         CALIBRATION_PIT_TICKS * 1000 / CALIBRATION_PIT_HZ);
@@ -281,20 +259,4 @@ fn map(remap_addr: VirtAddr, phys_addr: PhysAddr, mem: &mut MemoryServices) {
     let page = Page::from_start_address(remap_addr).expect("remap apic page");
     let flags = Flags::PRESENT | Flags::WRITABLE | Flags::NO_CACHE;
     mem.map_page(page, phys_addr, flags);
-}
-
-#[cfg(test)]
-entry_point!(test_apic_main);
-
-#[cfg(test)]
-pub fn test_apic_main(_boot_info: &'static BootInfo) -> ! {
-    //init();
-    test_main();
-    hlt_loop();
-}
-
-#[cfg(test)]
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    test_panic_handler(info)
 }
