@@ -146,7 +146,7 @@ are present, racing all event sources in a single future.
 ### User Space and Process Isolation
 - Full ring-3 process support with per-process page tables, SYSCALL/SYSRET,
   and preemptive scheduling.
-- 21 Linux-compatible syscalls in `osl/src/dispatch.rs`.
+- 30+ Linux-compatible syscalls in `osl/src/dispatch.rs`.
 - Per-process FD table, CWD tracking, parent/child relationships, zombie
   lifecycle with `wait4`/`reap`.
 - ELF loader for static x86-64 binaries; initial stack with `argc/argv/auxv`.
@@ -259,6 +259,29 @@ are present, racing all event sources in a single future.
   to `/` when no disk image exists).
 - See [`docs/vfs.md`](vfs.md) for full design notes.
 
+### Completion Port Async I/O (`osl/src/io_port.rs`)
+- io_uring-style completion-based async I/O subsystem.
+- Kernel object: `CompletionPort` (`libkernel/src/completion_port.rs`) — bounded
+  queue of completions with single-waiter blocking semantics.
+- `FdObject` enum in `libkernel/src/file.rs` provides type-safe polymorphism
+  for the fd table (`File` | `Port`), replacing the previous trait-object
+  downcast approach.
+- `IrqMutex` protects the `CompletionPort` for ISR-safe `post()` from
+  interrupt context.
+- Syscalls: `io_create` (501), `io_submit` (502), `io_wait` (503).
+- Supported operations: `OP_NOP` (immediate), `OP_TIMEOUT` (async timer via
+  executor), `OP_READ` / `OP_WRITE` (async — user buffers are copied to/from
+  kernel memory during `io_submit`/`io_wait`; the actual I/O runs on executor
+  tasks so `io_submit` returns immediately).
+- `FileHandle` trait has `poll_read` / `poll_write` methods (default impls
+  delegate to sync `read`/`write`).  `PipeReader` and `ConsoleHandle`
+  override `poll_read` with waker-based async semantics so completion port
+  reads never block executor threads.
+- Userspace demo programs: `io_demo.c` (smoke test), `io_pingpong.c` /
+  `io_pong.c` (parent-child IPC via completion port).
+- See [`docs/completion-port-design.md`](completion-port-design.md) for the
+  full phased roadmap (Phases 1–2 complete; Phases 3–5 pending prerequisites).
+
 ### Dummy Driver (`devices/src/dummy.rs`)
 - Example actor with `#[on_tick]` heartbeat, `#[on_message(SetInterval)]`,
   and `#[on_info]`.
@@ -328,30 +351,60 @@ output but functionally harmless.
 
 ## Possible Next Steps
 
-1. **Signals** — `rt_sigaction`, `rt_sigreturn`, signal frame push/pop.
+### Completion Port Phases 3–5 (blocked on prerequisites)
+
+- **Phase 3: OP_IRQ_WAIT** — deliver hardware interrupts through completion
+  ports.  Blocked on microkernel Phase B (IRQ fd infrastructure).
+- **Phase 4: OP_RING_WAIT** — shared-memory ring buffer wakeup notifications.
+  Blocked on mmap Phase 5 (`MAP_SHARED`).
+- **Phase 5: Shared-memory SQ/CQ rings** — zero-syscall submission/completion
+  via userspace-mapped ring buffers.  Blocked on `MAP_SHARED`.
+
+### Memory Management
+
+1. **Page deallocation on process exit** — physical frames from `brk`,
+   `mmap`, and ELF segment loading are never freed.  `munmap` is a no-op
+   stub.  Must be addressed before running multiple long-lived processes.
+   See [`docs/mmap-design.md`](mmap-design.md) Phases 2–3.
+
+2. **Larger / growable heap** — demand-paged heap that grows on fault, or a
+   larger static allocation.  1 MiB is tight with concurrent processes.
+
+3. **Reclaiming virtual address space** — replace `DumbVmemAllocator` with a
+   proper free-list allocator so MMIO mappings can be released.
+
+4. **`MAP_SHARED`** — prerequisite for completion port Phases 4–5 and
+   microkernel Phase B.  See [`docs/mmap-design.md`](mmap-design.md) Phase 5.
+
+### Process Model
+
+5. **Signals** — `rt_sigaction`, `rt_sigreturn`, signal frame push/pop.
    Ctrl+C (`SIGINT`) should terminate the foreground process.  See
    [`docs/userspace-plan.md`](userspace-plan.md) Phase 7.
 
-2. **Page deallocation on process exit** — physical frames from `brk`,
-   `mmap`, and ELF segment loading are never freed.  `munmap` is a no-op
-   stub.  Must be addressed before running multiple long-lived processes.
-
-3. **IRQ-driven virtio-blk** — wire `IRQ_PENDING` to an `AtomicWaker` so
-   `CompletionFuture` parks instead of busy-polling.
-
-4. **`fork` + CoW page faults** — standard POSIX `fork`.  `clone(CLONE_VM|CLONE_VFORK)`
+6. **`fork` + CoW page faults** — standard POSIX `fork`.  `clone(CLONE_VM|CLONE_VFORK)`
    and `execve` are now implemented, enabling unpatched musl `posix_spawn` and
    Rust `std::process::Command`.  Full `fork` with CoW still requires a page
    fault handler and frame reference counting.
 
-5. **exFAT write support** — directory entry creation, FAT chain allocation,
-   and sector writes to enable `touch`, `mkdir`, `cp`, `rm`.
+### Drivers & I/O
 
-6. **Larger / growable heap** — demand-paged heap that grows on fault, or a
-   larger static allocation.  1 MiB is tight with concurrent processes.
+7. **IRQ-driven virtio-blk** — wire `IRQ_PENDING` to an `AtomicWaker` so
+   `CompletionFuture` parks instead of busy-polling.
 
-7. **Multi-sector DMA** — batch multiple sectors per virtio request to reduce
+8. **Multi-sector DMA** — batch multiple sectors per virtio request to reduce
    queue round-trips for directory scans and file reads.
 
-8. **Reclaiming virtual address space** — replace `DumbVmemAllocator` with a
-   proper free-list allocator so MMIO mappings can be released.
+9. **exFAT write support** — directory entry creation, FAT chain allocation,
+   and sector writes to enable `touch`, `mkdir`, `cp`, `rm`.
+
+### Microkernel Path
+
+10. **Microkernel Phase B** — kernel primitives for userspace drivers:
+    `MAP_SHARED`, IRQ fd, device MMIO mapping, DMA syscalls.  Unblocks
+    completion port Phase 3 and userspace NIC driver.
+    See [`docs/microkernel-design.md`](microkernel-design.md).
+
+11. **Networking** — virtio-net driver + smoltcp TCP/IP stack.  The
+    completion port is ready to back it once the NIC driver lands.
+    See [`docs/networking-design.md`](networking-design.md).

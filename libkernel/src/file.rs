@@ -128,6 +128,22 @@ pub trait FileHandle: Send + Sync {
     fn getdents64(&self, _buf: &mut [u8]) -> Result<usize, FileError> {
         Err(FileError::NotATty)
     }
+
+    /// Async-capable read. Default delegates to sync `read()`.
+    /// Handles that may block (pipe, console) should override to register
+    /// the waker and return `Pending` instead of blocking a thread.
+    fn poll_read(&self, _cx: &mut core::task::Context<'_>, buf: &mut [u8])
+        -> core::task::Poll<Result<usize, FileError>>
+    {
+        core::task::Poll::Ready(self.read(buf))
+    }
+
+    /// Async-capable write. Default delegates to sync `write()`.
+    fn poll_write(&self, _cx: &mut core::task::Context<'_>, buf: &[u8])
+        -> core::task::Poll<Result<usize, FileError>>
+    {
+        core::task::Poll::Ready(self.write(buf))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -142,8 +158,19 @@ impl FileHandle for ConsoleHandle {
         if !self.readable {
             return Err(FileError::BadFd);
         }
-        // Delegate to the console input buffer (Phase 3).
         Ok(crate::console::read_input(buf))
+    }
+
+    fn poll_read(&self, cx: &mut core::task::Context<'_>, buf: &mut [u8])
+        -> core::task::Poll<Result<usize, FileError>>
+    {
+        if !self.readable {
+            return core::task::Poll::Ready(Err(FileError::BadFd));
+        }
+        match crate::console::poll_read_input(cx, buf) {
+            core::task::Poll::Ready(n) => core::task::Poll::Ready(Ok(n)),
+            core::task::Poll::Pending => core::task::Poll::Pending,
+        }
     }
 
     fn write(&self, buf: &[u8]) -> Result<usize, FileError> {
@@ -171,6 +198,8 @@ struct PipeInner {
     buffer: VecDeque<u8>,
     write_closed: bool,
     reader_thread: Option<usize>,
+    /// Waker for async readers (completion port OP_READ).
+    reader_waker: Option<core::task::Waker>,
 }
 
 /// Read end of a pipe.
@@ -185,6 +214,7 @@ pub fn make_pipe() -> (PipeReader, PipeWriter) {
         buffer: VecDeque::new(),
         write_closed: false,
         reader_thread: None,
+        reader_waker: None,
     }));
     (PipeReader(inner.clone()), PipeWriter(inner))
 }
@@ -211,11 +241,39 @@ impl FileHandle for PipeReader {
         }
     }
 
+    fn poll_read(&self, cx: &mut core::task::Context<'_>, buf: &mut [u8])
+        -> core::task::Poll<Result<usize, FileError>>
+    {
+        let mut inner = self.0.lock();
+        if !inner.buffer.is_empty() {
+            let count = buf.len().min(inner.buffer.len());
+            for i in 0..count {
+                buf[i] = inner.buffer.pop_front().unwrap();
+            }
+            return core::task::Poll::Ready(Ok(count));
+        }
+        if inner.write_closed {
+            return core::task::Poll::Ready(Ok(0));
+        }
+        inner.reader_waker = Some(cx.waker().clone());
+        core::task::Poll::Pending
+    }
+
     fn write(&self, _buf: &[u8]) -> Result<usize, FileError> {
         Err(FileError::BadFd)
     }
 
     fn kind(&self) -> &'static str { "pipe_r" }
+}
+
+/// Helper: wake both the scheduler thread and the async waker on a pipe.
+fn pipe_wake_reader(inner: &mut PipeInner) {
+    if let Some(thread_idx) = inner.reader_thread.take() {
+        crate::task::scheduler::unblock(thread_idx);
+    }
+    if let Some(waker) = inner.reader_waker.take() {
+        waker.wake();
+    }
 }
 
 impl FileHandle for PipeWriter {
@@ -226,18 +284,14 @@ impl FileHandle for PipeWriter {
     fn write(&self, buf: &[u8]) -> Result<usize, FileError> {
         let mut inner = self.0.lock();
         inner.buffer.extend(buf.iter());
-        if let Some(thread_idx) = inner.reader_thread.take() {
-            crate::task::scheduler::unblock(thread_idx);
-        }
+        pipe_wake_reader(&mut inner);
         Ok(buf.len())
     }
 
     fn close(&self) {
         let mut inner = self.0.lock();
         inner.write_closed = true;
-        if let Some(thread_idx) = inner.reader_thread.take() {
-            crate::task::scheduler::unblock(thread_idx);
-        }
+        pipe_wake_reader(&mut inner);
     }
 
     fn kind(&self) -> &'static str { "pipe_w" }

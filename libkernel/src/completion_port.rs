@@ -1,6 +1,7 @@
 //! Kernel completion port object for async I/O notification.
 
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use crate::task::scheduler;
 
 // ---------------------------------------------------------------------------
@@ -20,6 +21,11 @@ pub struct Completion {
     pub result: i64,
     pub flags: u32,
     pub opcode: u32,
+    /// For async OP_READ: kernel buffer containing read data, copied to user
+    /// space by io_wait (which runs in the process's syscall context).
+    pub read_buf: Option<Vec<u8>>,
+    /// For async OP_READ: user-space destination address for read_buf data.
+    pub read_dest: u64,
 }
 
 // ---------------------------------------------------------------------------
