@@ -10,8 +10,8 @@ significantly beyond the tutorial.
 | Crate | Purpose |
 |---|---|
 | `kernel/` | Top-level kernel binary — entry point, ties everything together |
-| `libkernel/` | Core kernel library — all subsystems live here |
-| `apic/` | Local APIC and I/O APIC initialisation and LAPIC timer |
+| `libkernel/` | Core kernel library — all subsystems including APIC live here |
+| `osl/` | "OS Subsystem for Linux" — syscall dispatch + VFS bridge |
 | `devices/` | Driver framework — `DriverTask` trait, actor macro, built-in drivers, VFS |
 | `devices-macros/` | Proc-macro crate: `#[actor]`, `#[on_message]`, `#[on_info]`, `#[on_tick]`, `#[on_stream]`, `#[on_start]` |
 
@@ -272,7 +272,8 @@ are present, racing all event sources in a single future.
 - Supported operations: `OP_NOP` (immediate), `OP_TIMEOUT` (async timer via
   executor), `OP_READ` / `OP_WRITE` (async — user buffers are copied to/from
   kernel memory during `io_submit`/`io_wait`; the actual I/O runs on executor
-  tasks so `io_submit` returns immediately).
+  tasks so `io_submit` returns immediately), `OP_IRQ_WAIT` (hardware interrupt
+  delivery — ISR masks GSI and posts completion; rearm via another submit unmasks).
 - `FileHandle` trait has `poll_read` / `poll_write` methods (default impls
   delegate to sync `read`/`write`).  `PipeReader` and `ConsoleHandle`
   override `poll_read` with waker-based async semantics so completion port
@@ -280,7 +281,16 @@ are present, racing all event sources in a single future.
 - Userspace demo programs: `io_demo.c` (smoke test), `io_pingpong.c` /
   `io_pong.c` (parent-child IPC via completion port).
 - See [`docs/completion-port-design.md`](completion-port-design.md) for the
-  full phased roadmap (Phases 1–2 complete; Phases 3–5 pending prerequisites).
+  full phased roadmap (Phases 1–3 complete; Phases 4–5 pending prerequisites).
+
+### IRQ File Descriptors (`libkernel/src/irq_handle.rs`, `osl/src/irq.rs`)
+- Userspace interrupt delivery via `irq_create(gsi)` syscall (504).
+- `IrqInner` tracks GSI, vector, slot, and saved IO APIC redirection entry.
+- ISR handler (`irq_fd_dispatch`) masks the GSI via `libkernel::apic::mask_gsi`
+  and posts a completion to the associated `CompletionPort`.
+- Keyboard (GSI 1) scancode ring buffer prevents lost scancodes between rearms.
+- On close, the original IO APIC entry is restored.
+- Demo: `user/irq_demo.c` — keyboard scancode display via OP_IRQ_WAIT.
 
 ### Dummy Driver (`devices/src/dummy.rs`)
 - Example actor with `#[on_tick]` heartbeat, `#[on_message(SetInterval)]`,
@@ -351,10 +361,9 @@ output but functionally harmless.
 
 ## Possible Next Steps
 
-### Completion Port Phases 3–5 (blocked on prerequisites)
+### Completion Port Phases 4–5 (blocked on prerequisites)
 
-- **Phase 3: OP_IRQ_WAIT** — deliver hardware interrupts through completion
-  ports.  Blocked on microkernel Phase B (IRQ fd infrastructure).
+- Phase 3 (OP_IRQ_WAIT) is complete — see IRQ fd section above.
 - **Phase 4: OP_RING_WAIT** — shared-memory ring buffer wakeup notifications.
   Blocked on mmap Phase 5 (`MAP_SHARED`).
 - **Phase 5: Shared-memory SQ/CQ rings** — zero-syscall submission/completion
@@ -401,8 +410,8 @@ output but functionally harmless.
 ### Microkernel Path
 
 10. **Microkernel Phase B** — kernel primitives for userspace drivers:
-    `MAP_SHARED`, IRQ fd, device MMIO mapping, DMA syscalls.  Unblocks
-    completion port Phase 3 and userspace NIC driver.
+    `MAP_SHARED`, device MMIO mapping, DMA syscalls.  IRQ fd is complete
+    (syscall 504 + OP_IRQ_WAIT).  Remaining items unblock userspace NIC driver.
     See [`docs/microkernel-design.md`](microkernel-design.md).
 
 11. **Networking** — virtio-net driver + smoltcp TCP/IP stack.  The
