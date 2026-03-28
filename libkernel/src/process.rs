@@ -4,8 +4,52 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::PhysAddr;
+use x86_64::structures::paging::PageTableFlags;
 
 use crate::file::{FileError, FdEntry, FdObject, FD_CLOEXEC};
+
+// ---------------------------------------------------------------------------
+// VMA (Virtual Memory Area)
+
+/// Linux mmap protection flags.
+pub const PROT_NONE:  u32 = 0x0;
+pub const PROT_READ:  u32 = 0x1;
+pub const PROT_WRITE: u32 = 0x2;
+pub const PROT_EXEC:  u32 = 0x4;
+
+/// Linux mmap flags.
+pub const MAP_PRIVATE:   u32 = 0x02;
+pub const MAP_FIXED:     u32 = 0x10;
+pub const MAP_ANONYMOUS: u32 = 0x20;
+
+/// A virtual memory area tracked per-process.
+#[derive(Debug, Clone)]
+pub struct Vma {
+    pub start: u64,        // page-aligned start address
+    pub len: u64,          // page-aligned length
+    pub prot: u32,         // PROT_READ | PROT_WRITE | PROT_EXEC
+    pub flags: u32,        // MAP_PRIVATE | MAP_ANONYMOUS etc.
+    pub fd: Option<usize>, // file descriptor (Phase 5)
+    pub offset: u64,       // file offset (Phase 5)
+}
+
+impl Vma {
+    /// Translate VMA protection flags to x86-64 page table flags.
+    pub fn page_table_flags(&self) -> PageTableFlags {
+        if self.prot == PROT_NONE {
+            // No PRESENT bit — any access will fault.
+            return PageTableFlags::USER_ACCESSIBLE;
+        }
+        let mut f = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        if self.prot & PROT_WRITE != 0 {
+            f |= PageTableFlags::WRITABLE;
+        }
+        if self.prot & PROT_EXEC == 0 {
+            f |= PageTableFlags::NO_EXECUTE;
+        }
+        f
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ProcessId
@@ -59,8 +103,8 @@ pub struct Process {
     pub brk_current: u64,
     /// Bump-down pointer for anonymous mmap allocations.
     pub mmap_next: u64,
-    /// Tracked (vaddr, len) pairs for mmap regions.
-    pub mmap_regions: Vec<(u64, u64)>,
+    /// VMA map: base address → VMA descriptor.
+    pub vma_map: BTreeMap<u64, Vma>,
     /// Per-process file descriptor table.
     pub fd_table: Vec<Option<FdEntry>>,
     /// Current working directory (absolute path).
@@ -98,7 +142,7 @@ impl Process {
             brk_base,
             brk_current: brk_base,
             mmap_next: MMAP_BASE,
-            mmap_regions: Vec::new(),
+            vma_map: BTreeMap::new(),
             fd_table: crate::file::default_fd_table(),
             cwd: String::from("/"),
             parent_pid: ProcessId::KERNEL,

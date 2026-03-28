@@ -17,10 +17,11 @@ Each phase is self-contained and independently testable.
 - Anonymous-only (`MAP_ANONYMOUS`).  Returns `-ENOSYS` for file-backed.
 - `MAP_FIXED` is rejected (`-ENOSYS`).
 - Allocations bump down from `0x0000_4000_0000_0000` (`MMAP_BASE`).
-- Pages are eagerly allocated, zeroed, and mapped with
-  `USER_DATA_FLAGS` (present | writable | user | no-execute).
-- `prot` argument is ignored — all pages get RW.
-- Regions are tracked as `Vec<(u64, u64)>` (`mmap_regions` in `Process`).
+- Pages are eagerly allocated, zeroed, and mapped.
+- `prot` argument is honoured — page table flags are derived from
+  `PROT_READ`, `PROT_WRITE`, `PROT_EXEC` via `Vma::page_table_flags()`.
+- Regions are tracked as `BTreeMap<u64, Vma>` (`vma_map` in `Process`).
+- `/proc/maps` displays actual `rwxp` flags from VMA metadata.
 
 ### munmap (syscall 11)
 
@@ -37,7 +38,7 @@ tables, frames, or VMA metadata are freed.
 
 ---
 
-## Phase 1: VMA Tracking + PROT Flags
+## Phase 1: VMA Tracking + PROT Flags ✓ (implemented)
 
 **Goal:** Replace the bare `Vec<(u64, u64)>` region list with a proper VMA
 (Virtual Memory Area) structure, and honour the `prot` argument in `mmap`.

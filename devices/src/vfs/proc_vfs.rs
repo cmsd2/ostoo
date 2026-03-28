@@ -368,11 +368,11 @@ fn gen_maps(pid: libkernel::process::ProcessId) -> String {
             p.brk_base,
             p.brk_current,
             p.user_stack_top,
-            p.mmap_regions.clone(),
+            p.vma_map.clone(),
         )
     });
 
-    let Some((brk_base, brk_current, user_stack_top, mmap_regions)) = info else {
+    let Some((brk_base, brk_current, user_stack_top, vma_map)) = info else {
         let _ = writeln!(s, "(process not found)");
         return s;
     };
@@ -383,12 +383,14 @@ fn gen_maps(pid: libkernel::process::ProcessId) -> String {
             brk_base, brk_current);
     }
 
-    // mmap regions (anonymous, all currently rw-p)
-    let mut regions = mmap_regions;
-    regions.sort_by_key(|&(start, _)| start);
-    for (start, len) in &regions {
-        let _ = writeln!(s, "{:012x}-{:012x} rw-p 00000000 00:00 0",
-            start, start + len);
+    // mmap regions — BTreeMap is already sorted by start address
+    for vma in vma_map.values() {
+        let r = if vma.prot & process::PROT_READ  != 0 { 'r' } else { '-' };
+        let w = if vma.prot & process::PROT_WRITE != 0 { 'w' } else { '-' };
+        let x = if vma.prot & process::PROT_EXEC  != 0 { 'x' } else { '-' };
+        let p = if vma.flags & process::MAP_PRIVATE != 0 { 'p' } else { 's' };
+        let _ = writeln!(s, "{:012x}-{:012x} {}{}{}{} 00000000 00:00 0",
+            vma.start, vma.start + vma.len, r, w, x, p);
     }
 
     // User stack — grows down, so the mapped region ends at user_stack_top.

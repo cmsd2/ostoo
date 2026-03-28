@@ -172,7 +172,7 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
         p.brk_base = brk_base;
         p.brk_current = brk_base;
         p.mmap_next = MMAP_BASE;
-        p.mmap_regions.clear();
+        p.vma_map.clear();
         p.close_cloexec_fds();
         p.vfork_parent_thread.take()
     });

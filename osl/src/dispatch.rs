@@ -314,21 +314,16 @@ fn sys_close(fd: u64) -> i64 {
     }
 }
 
-fn sys_mmap(addr: u64, length: u64, _prot: u64, flags: u64, _a5: u64) -> i64 {
-    use libkernel::process;
+fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, _a5: u64) -> i64 {
+    use libkernel::process::{self, Vma, MAP_ANONYMOUS, MAP_FIXED};
     use libkernel::memory::with_memory;
 
-    const MAP_ANONYMOUS: u64 = 0x20;
-    const MAP_PRIVATE: u64 = 0x02;
-    const MAP_FIXED: u64 = 0x10;
-
-    if flags & MAP_ANONYMOUS == 0 {
+    if flags & MAP_ANONYMOUS as u64 == 0 {
         return -errno::ENOSYS;
     }
-    if flags & MAP_FIXED != 0 && addr != 0 {
+    if flags & MAP_FIXED as u64 != 0 && addr != 0 {
         return -errno::ENOSYS;
     }
-    let _ = MAP_PRIVATE;
 
     let pid = process::current_pid();
     if pid == process::ProcessId::KERNEL {
@@ -347,15 +342,25 @@ fn sys_mmap(addr: u64, length: u64, _prot: u64, flags: u64, _a5: u64) -> i64 {
 
     let region_base = mmap_next - aligned_len;
 
+    let vma = Vma {
+        start: region_base,
+        len: aligned_len,
+        prot: prot as u32,
+        flags: flags as u32,
+        fd: None,
+        offset: 0,
+    };
+    let pt_flags = vma.page_table_flags();
+
     let ok = with_memory(|mem| {
-        mem.alloc_and_map_user_pages(num_pages, region_base, pml4_phys, USER_DATA_FLAGS)
+        mem.alloc_and_map_user_pages(num_pages, region_base, pml4_phys, pt_flags)
             .is_ok()
     });
 
     if ok {
         process::with_process(pid, |p| {
             p.mmap_next = region_base;
-            p.mmap_regions.push((region_base, aligned_len));
+            p.vma_map.insert(region_base, vma);
         });
         region_base as i64
     } else {
