@@ -396,6 +396,7 @@ pub fn spawn_clone_thread(
     child_stack: u64,
     user_rflags: u64,
     user_r9: u64,
+    fs_base: u64,
 ) -> usize {
     let kernel_stack_top = crate::process::with_process_ref(pid, |p| {
         p.kernel_stack_top
@@ -436,7 +437,7 @@ pub fn spawn_clone_thread(
             kind: SchedulableKind::UserProcess(pid),
             kernel_stack_top: stack_top,
             user_rsp: child_stack,
-            fs_base: 0,
+            fs_base,
         });
         sched.ready_queue.push_back(idx);
         idx

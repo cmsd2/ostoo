@@ -34,10 +34,11 @@ pub fn sys_clone(flags: u64, child_stack: u64, _ptid: u64, _ctid: u64, _tls: u64
     };
     let (pml4_phys, cwd, fd_table, brk_base, brk_current, vma_map) = parent_info;
 
-    // Read user RIP, RFLAGS, and R9 saved by the SYSCALL entry stub.
+    // Read user RIP, RFLAGS, R9 and FS_BASE saved by the SYSCALL entry stub.
     let user_rip = libkernel::syscall::get_user_rip();
     let user_rflags = libkernel::syscall::get_user_rflags();
     let user_r9 = libkernel::syscall::get_user_r9();
+    let fs_base = libkernel::msr::read_fs_base();
 
     // Create child process sharing the parent's address space (CLONE_VM).
     let mut child = Process::new(pml4_phys, user_rip, child_stack, brk_base);
@@ -54,7 +55,7 @@ pub fn sys_clone(flags: u64, child_stack: u64, _ptid: u64, _ctid: u64, _tls: u64
 
     // Spawn a scheduler thread for the child that "returns from syscall" with RAX=0.
     let thread_idx = scheduler::spawn_clone_thread(
-        child_pid, pml4_phys, user_rip, child_stack, user_rflags, user_r9,
+        child_pid, pml4_phys, user_rip, child_stack, user_rflags, user_r9, fs_base,
     );
     process::with_process(child_pid, |p| {
         p.thread_idx = Some(thread_idx);
