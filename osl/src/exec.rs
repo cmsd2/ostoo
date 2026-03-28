@@ -18,9 +18,6 @@ const ELF_STACK_PAGES: usize = 8;
 const ELF_STACK_SIZE: u64 = (ELF_STACK_PAGES as u64) * PAGE_SIZE;
 const ELF_STACK_VIRT: u64 = 0x0000_7FFF_F000_0000;
 
-/// Default mmap region start (bump-down from here).
-const MMAP_BASE: u64 = 0x0000_4000_0000_0000;
-
 pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
     // 1. Copy all arguments from userspace before we destroy the address space.
     let path = match read_user_string(path_ptr, 4096) {
@@ -176,7 +173,6 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
         p.user_stack_top = user_rsp;
         p.brk_base = brk_base;
         p.brk_current = brk_base;
-        p.mmap_next = MMAP_BASE;
         p.vma_map.clear();
         p.pml4_shared = false;
         p.close_cloexec_fds();

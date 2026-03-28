@@ -27,12 +27,12 @@ pub fn sys_clone(flags: u64, child_stack: u64, _ptid: u64, _ctid: u64, _tls: u64
     // Read parent process info needed for the child.
     let parent_info = match process::with_process_ref(parent_pid, |p| {
         (p.pml4_phys, p.cwd.clone(), p.fd_table.clone(),
-         p.brk_base, p.brk_current, p.mmap_next, p.vma_map.clone())
+         p.brk_base, p.brk_current, p.vma_map.clone())
     }) {
         Some(info) => info,
         None => return -errno::ENOSYS,
     };
-    let (pml4_phys, cwd, fd_table, brk_base, brk_current, mmap_next, vma_map) = parent_info;
+    let (pml4_phys, cwd, fd_table, brk_base, brk_current, vma_map) = parent_info;
 
     // Read user RIP, RFLAGS, and R9 saved by the SYSCALL entry stub.
     let user_rip = libkernel::syscall::get_user_rip();
@@ -45,7 +45,6 @@ pub fn sys_clone(flags: u64, child_stack: u64, _ptid: u64, _ctid: u64, _tls: u64
     child.cwd = cwd;
     child.fd_table = fd_table;
     child.brk_current = brk_current;
-    child.mmap_next = mmap_next;
     child.vma_map = vma_map;
     child.vfork_parent_thread = Some(parent_thread_idx);
     child.pml4_shared = true;

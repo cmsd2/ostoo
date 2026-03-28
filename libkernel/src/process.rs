@@ -101,8 +101,6 @@ pub struct Process {
     pub brk_base: u64,
     /// Current program break (starts == brk_base).
     pub brk_current: u64,
-    /// Bump-down pointer for anonymous mmap allocations.
-    pub mmap_next: u64,
     /// VMA map: base address → VMA descriptor.
     pub vma_map: BTreeMap<u64, Vma>,
     /// Per-process file descriptor table.
@@ -122,8 +120,10 @@ pub struct Process {
 
 const PROCESS_KERNEL_STACK_SIZE: usize = crate::consts::KERNEL_STACK_SIZE;
 
-/// Default mmap region start (bump-down from here).
-const MMAP_BASE: u64 = 0x0000_4000_0000_0000;
+/// Top of the mmap search range (exclusive). Allocations are placed below this.
+pub const MMAP_CEILING: u64 = 0x0000_4000_0000_0000;
+/// Bottom of the mmap search range (inclusive). Above any brk region.
+pub const MMAP_FLOOR: u64 = 0x0000_0010_0000_0000;
 
 impl Process {
     pub fn new(pml4_phys: PhysAddr, entry_point: u64, user_stack_top: u64, brk_base: u64) -> Self {
@@ -144,7 +144,6 @@ impl Process {
             exit_code: None,
             brk_base,
             brk_current: brk_base,
-            mmap_next: MMAP_BASE,
             vma_map: BTreeMap::new(),
             fd_table: crate::file::default_fd_table(),
             cwd: String::from("/"),
@@ -421,6 +420,11 @@ impl Process {
         }
 
         pages_to_update
+    }
+
+    /// Find the highest gap of at least `len` bytes in the mmap region.
+    pub fn find_mmap_gap(&self, len: u64) -> Option<u64> {
+        crate::gap::find_gap_topdown(&self.vma_map, MMAP_FLOOR, MMAP_CEILING, len)
     }
 
     /// Close all file descriptors that have FD_CLOEXEC set.

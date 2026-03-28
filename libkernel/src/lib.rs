@@ -41,6 +41,7 @@ pub mod apic;
 pub mod irq_handle;
 pub mod msr;
 pub mod path;
+pub mod gap;
 
 pub fn init() {
     cpuid::init();

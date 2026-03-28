@@ -15,8 +15,10 @@ Each phase is self-contained and independently testable.
 ### mmap (syscall 9)
 
 - Anonymous-only (`MAP_ANONYMOUS`).  Returns `-ENOSYS` for file-backed.
-- `MAP_FIXED` is rejected (`-ENOSYS`).
-- Allocations bump down from `0x0000_4000_0000_0000` (`MMAP_BASE`).
+- `MAP_FIXED` supported — implicit munmap of overlapping VMAs (Linux semantics).
+- Non-fixed allocations use a top-down gap finder over the VMA tree
+  (`[MMAP_FLOOR, MMAP_CEILING)` = `[0x10_0000_0000, 0x4000_0000_0000)`).
+  Freed regions are automatically reused.
 - Pages are eagerly allocated, zeroed, and mapped.
 - `prot` argument is honoured — page table flags are derived from
   `PROT_READ`, `PROT_WRITE`, `PROT_EXEC` via `Vma::page_table_flags()`.
@@ -223,45 +225,36 @@ usage should stay bounded.
 
 ---
 
-## Phase 4: MAP_FIXED + Gap Finding
+## Phase 4: MAP_FIXED + Gap Finding ✓ (implemented)
 
 **Goal:** Support `MAP_FIXED` placement and smarter allocation that avoids
 fragmenting the address space.
 
 ### MAP_FIXED
 
-Currently rejected with `-ENOSYS`.  Implementation:
-
-1. If `MAP_FIXED` is set and addr != 0: unmap any existing pages in
-   `[addr, addr+length)` (implicit munmap, same as Linux).
-2. Map new pages at the requested address.
-3. Insert/replace VMAs.
+`MAP_FIXED` performs implicit munmap of overlapping VMAs before mapping at
+the requested address (Linux semantics).  Addr must be page-aligned and
+non-zero.
 
 ### Gap-finding allocator
 
-Replace the simple bump-down pointer (`mmap_next`) with a gap search over
-the VMA tree:
+Replaced the bump-down pointer (`mmap_next`) with a generic top-down gap
+finder (`libkernel/src/gap.rs`).  The `OccupiedRanges` trait abstracts
+iteration over occupied intervals so the algorithm can be reused.
 
-1. Walk the VMA `BTreeMap` to find the highest gap that fits the requested
-   size (top-down, matching Linux's default).
-2. Fall back to searching lower if the top is full.
-3. Remove `mmap_next` from `Process` — the VMA map is the source of truth.
-
-This avoids the current problem where `munmap` frees space but `mmap_next`
-never reclaims it.
+Search range: `[MMAP_FLOOR, MMAP_CEILING)` = `[0x10_0000_0000, 0x4000_0000_0000)`.
+The VMA `BTreeMap` is the sole source of truth — no bump pointer.
 
 ### Changes
 
 | File | Change |
 |---|---|
-| `osl/src/dispatch.rs` (`sys_mmap`) | MAP_FIXED support, gap-finding allocation |
-| `libkernel/src/process.rs` | Remove `mmap_next`, add gap-search helper on VMA map |
-
-### Test
-
-`mmap` three regions, `munmap` the middle one, `mmap` with a size that fits
-the gap — should reuse the freed space.  `MAP_FIXED` at a specific address
-overlapping an existing mapping — old mapping should be silently replaced.
+| `libkernel/src/gap.rs` | **New** — `OccupiedRanges` trait, `find_gap_topdown` |
+| `libkernel/src/lib.rs` | Add `pub mod gap` |
+| `libkernel/src/process.rs` | Remove `mmap_next`, add `MMAP_FLOOR`/`MMAP_CEILING`, `find_mmap_gap` |
+| `osl/src/dispatch.rs` | Rewrite `sys_mmap` with gap finder + MAP_FIXED |
+| `osl/src/clone.rs` | Remove `mmap_next` from clone state |
+| `osl/src/exec.rs` | Remove `mmap_next` reset and local `MMAP_BASE` constant |
 
 ---
 

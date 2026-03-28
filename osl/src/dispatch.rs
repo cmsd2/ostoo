@@ -342,9 +342,6 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, _a5: u64) -> i64 {
     if flags & MAP_ANONYMOUS as u64 == 0 {
         return -errno::ENOSYS;
     }
-    if flags & MAP_FIXED as u64 != 0 && addr != 0 {
-        return -errno::ENOSYS;
-    }
 
     let pid = process::current_pid();
     if pid == process::ProcessId::KERNEL {
@@ -352,40 +349,96 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, _a5: u64) -> i64 {
     }
 
     let aligned_len = (length + PAGE_MASK) & !PAGE_MASK;
+    if aligned_len == 0 {
+        return -errno::EINVAL;
+    }
     let num_pages = (aligned_len / PAGE_SIZE) as usize;
 
-    let (mmap_next, pml4_phys) = match process::with_process_ref(pid, |p| {
-        (p.mmap_next, p.pml4_phys)
-    }) {
-        Some(v) => v,
-        None => return -errno::ENOMEM,
-    };
+    let fixed = flags & MAP_FIXED as u64 != 0;
 
-    let region_base = mmap_next - aligned_len;
+    if fixed {
+        // MAP_FIXED: addr must be page-aligned and non-zero.
+        if addr == 0 || addr & PAGE_MASK != 0 {
+            return -errno::EINVAL;
+        }
 
-    let vma = Vma {
-        start: region_base,
-        len: aligned_len,
-        prot: prot as u32,
-        flags: flags as u32,
-        fd: None,
-        offset: 0,
-    };
-    let pt_flags = vma.page_table_flags();
+        let pml4_phys = match process::with_process_ref(pid, |p| p.pml4_phys) {
+            Some(v) => v,
+            None => return -errno::ENOMEM,
+        };
 
-    let ok = with_memory(|mem| {
-        mem.alloc_and_map_user_pages(num_pages, region_base, pml4_phys, pt_flags)
-            .is_ok()
-    });
+        // Implicit munmap: remove any overlapping VMAs and free their pages.
+        let pages_to_free = process::with_process(pid, |p| {
+            p.munmap_vmas(addr, aligned_len)
+        }).unwrap_or_default();
 
-    if ok {
-        process::with_process(pid, |p| {
-            p.mmap_next = region_base;
-            p.vma_map.insert(region_base, vma);
+        if !pages_to_free.is_empty() {
+            with_memory(|mem| {
+                for (base, count) in &pages_to_free {
+                    for i in 0..*count {
+                        let vaddr = x86_64::VirtAddr::new(base + (i as u64) * PAGE_SIZE);
+                        mem.unmap_and_free_user_page(pml4_phys, vaddr, true);
+                    }
+                }
+            });
+        }
+
+        // Allocate and map new pages at the fixed address.
+        let vma = Vma {
+            start: addr,
+            len: aligned_len,
+            prot: prot as u32,
+            flags: flags as u32,
+            fd: None,
+            offset: 0,
+        };
+        let pt_flags = vma.page_table_flags();
+
+        let ok = with_memory(|mem| {
+            mem.alloc_and_map_user_pages(num_pages, addr, pml4_phys, pt_flags)
+                .is_ok()
         });
-        region_base as i64
+
+        if ok {
+            process::with_process(pid, |p| {
+                p.vma_map.insert(addr, vma);
+            });
+            addr as i64
+        } else {
+            -errno::ENOMEM
+        }
     } else {
-        -errno::ENOMEM
+        // Non-fixed: find a gap using the top-down gap finder.
+        let (region_base, pml4_phys) = match process::with_process(pid, |p| {
+            p.find_mmap_gap(aligned_len).map(|base| (base, p.pml4_phys))
+        }) {
+            Some(Some(v)) => v,
+            _ => return -errno::ENOMEM,
+        };
+
+        let vma = Vma {
+            start: region_base,
+            len: aligned_len,
+            prot: prot as u32,
+            flags: flags as u32,
+            fd: None,
+            offset: 0,
+        };
+        let pt_flags = vma.page_table_flags();
+
+        let ok = with_memory(|mem| {
+            mem.alloc_and_map_user_pages(num_pages, region_base, pml4_phys, pt_flags)
+                .is_ok()
+        });
+
+        if ok {
+            process::with_process(pid, |p| {
+                p.vma_map.insert(region_base, vma);
+            });
+            region_base as i64
+        } else {
+            -errno::ENOMEM
+        }
     }
 }
 
