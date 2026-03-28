@@ -37,6 +37,10 @@ impl FileHandle for VfsHandle {
     }
 
     fn kind(&self) -> &'static str { "vfs_file" }
+
+    fn content_bytes(&self) -> Option<&[u8]> {
+        Some(&self.content)
+    }
 }
 
 // ---------------------------------------------------------------------------

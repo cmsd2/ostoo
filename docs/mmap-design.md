@@ -14,7 +14,7 @@ Each phase is self-contained and independently testable.
 
 ### mmap (syscall 9)
 
-- Anonymous-only (`MAP_ANONYMOUS`).  Returns `-ENOSYS` for file-backed.
+- Anonymous (`MAP_ANONYMOUS`) and file-backed `MAP_PRIVATE` (eager copy).
 - `MAP_FIXED` supported — implicit munmap of overlapping VMAs (Linux semantics).
 - Non-fixed allocations use a top-down gap finder over the VMA tree
   (`[MMAP_FLOOR, MMAP_CEILING)` = `[0x10_0000_0000, 0x4000_0000_0000)`).
@@ -258,10 +258,10 @@ The VMA `BTreeMap` is the sole source of truth — no bump pointer.
 
 ---
 
-## Phase 5: File-Backed mmap + MAP_SHARED
+## Phase 5a: File-Backed MAP_PRIVATE (eager copy) ✓ (implemented)
 
-**Goal:** Map files into the address space and support shared mappings with
-reference-counted frames.
+**Goal:** Support `mmap(fd, offset, ...)` for `MAP_PRIVATE` file-backed
+mappings with eager data copy.  No sharing, no refcounting, no writeback.
 
 ### 6th syscall argument
 
@@ -271,30 +271,55 @@ The Linux `mmap` signature is:
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
 ```
 
-`fd` and `offset` are the 5th and 6th arguments.  The current assembly stub
-saves all 6 user args (r9 is saved to `per_cpu.user_r9` at offset 32) but
-only passes 5 to `syscall_dispatch` via the SysV64 calling convention (which
-has exactly 6 register args, one consumed by `nr`).
+`fd` and `offset` are the 5th and 6th arguments.  The assembly stub saves
+user R9 to `per_cpu.user_r9` (offset 32).  `sys_mmap` reads the offset via
+`libkernel::syscall::get_user_r9()` — no ABI change needed.
 
-Two options to deliver the 6th user arg:
+### Design: read from the fd's buffer
 
-1. **Read from PerCpuData** — `sys_mmap` reads `per_cpu.user_r9` directly
-   via inline assembly or a helper.  No ABI change needed.
-2. **Stack arg** — push the 6th arg onto the stack before `call
-   syscall_dispatch`.  Requires changing both the assembly stub and the
-   dispatch signature.
+Two approaches were considered:
 
-**Decision:** read from PerCpuData.  It's already saved there for clone, and
-only mmap needs it.  Avoids touching the hot-path assembly for all syscalls.
+1. **Read from VFS by path** — incorrect because a file's path can change
+   after open (rename, unlink).  An open fd refers to an inode, not a path.
+2. **Read from the fd's existing in-memory buffer** — `VfsHandle` holds the
+   full file content in a `Vec<u8>`.  Exposed via `FileHandle::content_bytes()`.
+   Semantically correct: the fd holds a reference to the file content.
 
-### File-backed MAP_PRIVATE
+**Decision:** option 2.  When lazy/partial `sys_open` or inode-based VFS
+arrives later, `content_bytes()` can trigger a full load or we switch to an
+inode-keyed page cache.  The mmap code doesn't need to change.
 
-1. `sys_mmap` validates `fd` refers to a regular file (via the fd table).
-2. Read `length` bytes from the file at `offset` into freshly mapped pages.
-3. Pages are CoW-private: the process owns them and modifications are not
-   written back.  (True CoW with page-fault handling is deferred — initially
-   just copy the data eagerly.)
-4. Store `fd` and `offset` in the VMA for bookkeeping.
+### Implementation
+
+- `FileHandle::content_bytes()` — default returns `None`.
+- `VfsHandle::content_bytes()` — returns `Some(&self.content)`.
+- `sys_mmap` file-backed path: extracts fd/offset, calls `content_bytes()`,
+  allocates per-page (clear + copy file data, clamped to file length —
+  bytes past EOF stay zero, matching Linux), maps with prot flags.
+- Both MAP_FIXED and non-fixed variants work for file-backed — the address
+  selection logic from Phase 4 is reused.
+
+### Changes
+
+| File | Change |
+|---|---|
+| `libkernel/src/file.rs` | Added `content_bytes()` default method to `FileHandle` |
+| `osl/src/file.rs` | Implemented `content_bytes()` on `VfsHandle` |
+| `osl/src/errno.rs` | Added `ENODEV` for non-mmap-able handles |
+| `osl/src/dispatch.rs` | Extended `sys_mmap` with file-backed MAP_PRIVATE, added `mmap_alloc_pages` helper |
+| `user/mmap_file.c` | New demo: open file, mmap, compare with read(), munmap |
+
+### Test
+
+`mmap_file`: opens `/shell`, reads first 64 bytes via read(), mmaps same
+file with MAP_PRIVATE/PROT_READ, compares mapped bytes with read() output,
+munmaps, exits cleanly.
+
+---
+
+## Phase 5b: MAP_SHARED + Refcounted Frames (future)
+
+**Goal:** Support shared mappings with reference-counted frames.
 
 ### MAP_SHARED + refcounted frames
 
@@ -312,27 +337,30 @@ This needs:
    back to the file.  Deferred initially — start with read-only shared
    mappings.
 
-### Eager vs demand paging
+### Future: inode-based VFS
 
-**Decision:** eager paging for all phases.  Demand paging (mapping pages
-as not-present and faulting them in) requires a page-fault handler that can
-resolve VMA lookups and perform I/O — significant complexity.  Eager paging
-is correct, simpler, and adequate for the current workload.  Demand paging
-can be added later as an optimisation without changing the VMA/syscall API.
+The current `content_bytes()` approach reads from the fd's in-memory buffer.
+This is correct for MAP_PRIVATE (snapshot semantics) but MAP_SHARED requires
+an inode-keyed page cache so multiple processes can share the same physical
+pages.  This requires:
 
-### Changes
+- VFS inode identifiers (unique per file across mounts)
+- An inode-keyed page cache: `BTreeMap<(InodeId, page_offset) → PhysAddr>`
+- Refcounted frames with dirty tracking for writeback
+
+Path-based re-reading is incorrect because files can be renamed/unlinked
+after open.  The fd (inode reference) is the correct identity.
+
+### Changes (planned)
 
 | File | Change |
 |---|---|
-| `libkernel/src/syscall.rs` | Helper to read `per_cpu.user_r9` |
-| `osl/src/dispatch.rs` | Pass fd/offset to `sys_mmap`, file read path |
 | `libkernel/src/memory/` | Frame refcount table |
-| `libkernel/src/process.rs` | VMA `fd` / `offset` fields (already in Phase 1 struct) |
-| VFS layer | Inode identifiers for shared page cache (if MAP_SHARED for files) |
+| VFS layer | Inode identifiers for shared page cache |
+| `osl/src/dispatch.rs` | MAP_SHARED path in `sys_mmap` |
 
 ### Test
 
-Map a file, read its contents from the mapped region — should match.
 Two processes `MAP_SHARED` the same file, one writes — the other should see
 the change (once writable shared mappings are supported).
 
@@ -348,11 +376,14 @@ Phase 1 ─── VMA tracking + PROT flags
    │       └──▶ Phase 3 ─── mprotect + process cleanup
    │               │
    │               └──▶ Phase 4 ─── MAP_FIXED + gap finding
+   │                       │
+   │                       └──▶ Phase 5a ─── File-backed MAP_PRIVATE (eager copy)
    │
-   └──────────────▶ Phase 5 ─── File-backed mmap + MAP_SHARED
-                        │
-                   (requires Phase 2 for munmap/refcount free,
-                    Phase 3 for cleanup on exit)
+   └──────────────────────────▶ Phase 5b ─── MAP_SHARED + refcounted frames
+                                     │
+                                (requires Phase 2 for refcount free,
+                                 Phase 3 for cleanup on exit,
+                                 inode-based VFS for shared page cache)
 ```
 
 Phase 1 is a prerequisite for everything — VMAs are the foundation.
@@ -363,9 +394,11 @@ because cleanup reuses the unmap/free primitives from Phase 2.
 Phase 4 (MAP_FIXED + gap finding) requires munmap (Phase 2) for the implicit
 unmap-on-overlap behaviour.
 
-Phase 5 (file-backed) requires Phase 1 (VMA with fd/offset), Phase 2 (frame
-freeing for refcount release), and Phase 3 (cleanup on exit to decrement
-refcounts).
+Phase 5a (file-backed MAP_PRIVATE) builds on Phase 4 and uses the fd's
+in-memory buffer via `content_bytes()`.
+
+Phase 5b (MAP_SHARED) requires inode-based VFS, frame refcounting, and
+all earlier phases.
 
 ---
 

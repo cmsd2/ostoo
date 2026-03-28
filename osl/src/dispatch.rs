@@ -335,13 +335,9 @@ fn sys_close(fd: u64) -> i64 {
     }
 }
 
-fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, _a5: u64) -> i64 {
+fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, a5: u64) -> i64 {
     use libkernel::process::{self, Vma, MAP_ANONYMOUS, MAP_FIXED};
     use libkernel::memory::with_memory;
-
-    if flags & MAP_ANONYMOUS as u64 == 0 {
-        return -errno::ENOSYS;
-    }
 
     let pid = process::current_pid();
     if pid == process::ProcessId::KERNEL {
@@ -354,7 +350,41 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, _a5: u64) -> i64 {
     }
     let num_pages = (aligned_len / PAGE_SIZE) as usize;
 
+    let anonymous = flags & MAP_ANONYMOUS as u64 != 0;
     let fixed = flags & MAP_FIXED as u64 != 0;
+
+    // For file-backed mappings: extract fd, offset, and grab file content.
+    let file_info: Option<(i32, u64, alloc::vec::Vec<u8>)> = if !anonymous {
+        let fd = a5 as i32;
+        let offset = libkernel::syscall::get_user_r9();
+        if offset & PAGE_MASK != 0 {
+            return -errno::EINVAL;
+        }
+
+        // Get the file content from the fd's buffer.
+        let content = match process::with_process_ref(pid, |p| {
+            let obj = p.get_fd(fd as usize).ok()?;
+            let handle = obj.as_file()?.clone();
+            Some(handle)
+        }) {
+            Some(Some(handle)) => {
+                match handle.content_bytes() {
+                    Some(bytes) => alloc::vec::Vec::from(bytes),
+                    None => return -errno::ENODEV,
+                }
+            }
+            _ => return -errno::EBADF,
+        };
+
+        Some((fd, offset, content))
+    } else {
+        None
+    };
+
+    let (vma_fd, vma_offset) = match &file_info {
+        Some((fd, offset, _)) => (Some(*fd as usize), *offset),
+        None => (None, 0),
+    };
 
     if fixed {
         // MAP_FIXED: addr must be page-aligned and non-zero.
@@ -383,22 +413,17 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, _a5: u64) -> i64 {
             });
         }
 
-        // Allocate and map new pages at the fixed address.
         let vma = Vma {
             start: addr,
             len: aligned_len,
             prot: prot as u32,
             flags: flags as u32,
-            fd: None,
-            offset: 0,
+            fd: vma_fd,
+            offset: vma_offset,
         };
         let pt_flags = vma.page_table_flags();
 
-        let ok = with_memory(|mem| {
-            mem.alloc_and_map_user_pages(num_pages, addr, pml4_phys, pt_flags)
-                .is_ok()
-        });
-
+        let ok = mmap_alloc_pages(num_pages, addr, pml4_phys, pt_flags, &file_info);
         if ok {
             process::with_process(pid, |p| {
                 p.vma_map.insert(addr, vma);
@@ -421,16 +446,12 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, _a5: u64) -> i64 {
             len: aligned_len,
             prot: prot as u32,
             flags: flags as u32,
-            fd: None,
-            offset: 0,
+            fd: vma_fd,
+            offset: vma_offset,
         };
         let pt_flags = vma.page_table_flags();
 
-        let ok = with_memory(|mem| {
-            mem.alloc_and_map_user_pages(num_pages, region_base, pml4_phys, pt_flags)
-                .is_ok()
-        });
-
+        let ok = mmap_alloc_pages(num_pages, region_base, pml4_phys, pt_flags, &file_info);
         if ok {
             process::with_process(pid, |p| {
                 p.vma_map.insert(region_base, vma);
@@ -438,6 +459,74 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, _a5: u64) -> i64 {
             region_base as i64
         } else {
             -errno::ENOMEM
+        }
+    }
+}
+
+/// Allocate, zero (and optionally fill with file data), and map pages for mmap.
+///
+/// For anonymous mappings (`file_info` is None), pages are zeroed.
+/// For file-backed mappings, file data is copied into each page (bytes past EOF stay zero).
+fn mmap_alloc_pages(
+    num_pages: usize,
+    vaddr_base: u64,
+    pml4_phys: x86_64::PhysAddr,
+    flags: PageTableFlags,
+    file_info: &Option<(i32, u64, alloc::vec::Vec<u8>)>,
+) -> bool {
+    use libkernel::memory::with_memory;
+
+    match file_info {
+        None => {
+            // Anonymous: allocate, zero, and map in one call.
+            with_memory(|mem| {
+                mem.alloc_and_map_user_pages(num_pages, vaddr_base, pml4_phys, flags)
+                    .is_ok()
+            })
+        }
+        Some((_fd, offset, content)) => {
+            // File-backed: per-page allocate, clear, copy file data, then map.
+            with_memory(|mem| {
+                let phys_off = mem.phys_mem_offset();
+                for i in 0..num_pages {
+                    let page_vaddr = vaddr_base + (i as u64) * PAGE_SIZE;
+                    let frame_phys = match mem.alloc_dma_pages(1) {
+                        Some(f) => f,
+                        None => return false,
+                    };
+
+                    let dst_base = phys_off + frame_phys.as_u64();
+                    unsafe {
+                        libkernel::consts::clear_page(dst_base.as_mut_ptr::<u8>());
+                    }
+
+                    // Copy file data into the page. Bytes past EOF stay zero.
+                    let file_offset = *offset + (i as u64) * PAGE_SIZE;
+                    if (file_offset as usize) < content.len() {
+                        let src_start = file_offset as usize;
+                        let src_end = content.len().min(src_start + PAGE_SIZE as usize);
+                        let count = src_end - src_start;
+                        unsafe {
+                            let dst = dst_base.as_mut_ptr::<u8>();
+                            core::ptr::copy_nonoverlapping(
+                                content[src_start..src_end].as_ptr(),
+                                dst,
+                                count,
+                            );
+                        }
+                    }
+
+                    if mem.map_user_page(
+                        pml4_phys,
+                        x86_64::VirtAddr::new(page_vaddr),
+                        frame_phys,
+                        flags,
+                    ).is_err() {
+                        return false;
+                    }
+                }
+                true
+            })
         }
     }
 }

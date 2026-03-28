@@ -145,6 +145,10 @@ pub trait FileHandle: Send + Sync {
         Err(FileError::NotATty)
     }
 
+    /// Return the full file content as a byte slice, if available.
+    /// Used by mmap to copy file data into mapped pages.
+    fn content_bytes(&self) -> Option<&[u8]> { None }
+
     /// Async-capable read. Default delegates to sync `read()`.
     /// Handles that may block (pipe, console) should override to register
     /// the waker and return `Pending` instead of blocking a thread.
