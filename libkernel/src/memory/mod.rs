@@ -14,7 +14,7 @@ use x86_64::structures::paging::{
     Size2MiB,
     FrameAllocator,
     RecursivePageTable,
-    mapper::MapToError,
+    mapper::{MapToError, FlagUpdateError},
 };
 use bootloader::bootinfo::{MemoryMap, MemoryRegion};
 
@@ -330,6 +330,109 @@ impl MemoryServices {
             true
         } else {
             false
+        }
+    }
+
+    /// Update the page table flags for a single 4 KiB page in a page table
+    /// rooted at `pml4_phys`.
+    ///
+    /// Returns `true` on success, `false` if the page is not mapped.
+    pub fn update_user_page_flags(
+        &mut self,
+        pml4_phys: PhysAddr,
+        vaddr: VirtAddr,
+        flags: PageTableFlags,
+        flush_tlb: bool,
+    ) -> bool {
+        let pml4_virt = self.phys_mem_offset + pml4_phys.as_u64();
+        let pml4: &mut PageTable = unsafe { &mut *pml4_virt.as_mut_ptr() };
+        let mut table = unsafe { OffsetPageTable::new(pml4, self.phys_mem_offset) };
+        let page = Page::<Size4KiB>::containing_address(vaddr);
+        match unsafe { table.update_flags(page, flags) } {
+            Ok(flush_token) => {
+                if flush_tlb {
+                    flush_token.flush();
+                } else {
+                    flush_token.ignore();
+                }
+                true
+            }
+            Err(FlagUpdateError::PageNotMapped) => false,
+            Err(_) => false,
+        }
+    }
+
+    /// Free all user-space pages and intermediate page table frames for a
+    /// process address space.
+    ///
+    /// Walks PML4 entries 0–255 (user half only), unmaps every leaf 4 KiB
+    /// page, frees its data frame, then frees the intermediate PT/PD/PDPT
+    /// frames bottom-up. Finally frees the PML4 frame itself.
+    ///
+    /// `flush_tlb`: true when the PML4 is still the active address space
+    /// (exit), false when CR3 has already been switched (execve).
+    pub fn cleanup_user_address_space(
+        &mut self,
+        pml4_phys: PhysAddr,
+        flush_tlb: bool,
+    ) {
+        let phys_off = self.phys_mem_offset;
+        let pml4_virt = phys_off + pml4_phys.as_u64();
+        let pml4: &PageTable = unsafe { &*pml4_virt.as_ptr() };
+
+        // Walk PML4 entries 0–255 (user half only).
+        for p4_idx in 0..256u16 {
+            let p4e = &pml4[PageTableIndex::new(p4_idx)];
+            if p4e.is_unused() { continue; }
+            let pdpt_phys = p4e.addr();
+            let pdpt: &PageTable = unsafe { &*(phys_off + pdpt_phys.as_u64()).as_ptr() };
+
+            for p3_idx in 0..512u16 {
+                let p3e = &pdpt[PageTableIndex::new(p3_idx)];
+                if p3e.is_unused() { continue; }
+                // Skip huge pages (1 GiB) — we don't create them for user space.
+                if p3e.flags().contains(PageTableFlags::HUGE_PAGE) { continue; }
+                let pd_phys = p3e.addr();
+                let pd: &PageTable = unsafe { &*(phys_off + pd_phys.as_u64()).as_ptr() };
+
+                for p2_idx in 0..512u16 {
+                    let p2e = &pd[PageTableIndex::new(p2_idx)];
+                    if p2e.is_unused() { continue; }
+                    // Skip huge pages (2 MiB).
+                    if p2e.flags().contains(PageTableFlags::HUGE_PAGE) { continue; }
+                    let pt_phys = p2e.addr();
+                    let pt: &PageTable = unsafe { &*(phys_off + pt_phys.as_u64()).as_ptr() };
+
+                    // Free all leaf data frames.
+                    for p1_idx in 0..512u16 {
+                        let p1e = &pt[PageTableIndex::new(p1_idx)];
+                        if p1e.is_unused() { continue; }
+                        let frame = PhysFrame::<Size4KiB>::containing_address(p1e.addr());
+                        self.frame_allocator.deallocate_frame(frame);
+                    }
+                    // Free the PT frame.
+                    self.frame_allocator.deallocate_frame(
+                        PhysFrame::containing_address(pt_phys),
+                    );
+                }
+                // Free the PD frame.
+                self.frame_allocator.deallocate_frame(
+                    PhysFrame::containing_address(pd_phys),
+                );
+            }
+            // Free the PDPT frame.
+            self.frame_allocator.deallocate_frame(
+                PhysFrame::containing_address(pdpt_phys),
+            );
+        }
+
+        // Free the PML4 frame itself.
+        self.frame_allocator.deallocate_frame(
+            PhysFrame::containing_address(pml4_phys),
+        );
+
+        if flush_tlb {
+            x86_64::instructions::tlb::flush_all();
         }
     }
 }

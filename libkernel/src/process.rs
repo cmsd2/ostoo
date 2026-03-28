@@ -115,6 +115,9 @@ pub struct Process {
     pub wait_thread: Option<usize>,
     /// For vfork children: parent's thread index to unblock on execve/_exit.
     pub vfork_parent_thread: Option<usize>,
+    /// True when this process shares its PML4 with the parent (CLONE_VM).
+    /// Cleanup must not free the PML4 or its pages in this case.
+    pub pml4_shared: bool,
 }
 
 const PROCESS_KERNEL_STACK_SIZE: usize = crate::consts::KERNEL_STACK_SIZE;
@@ -148,6 +151,7 @@ impl Process {
             parent_pid: ProcessId::KERNEL,
             wait_thread: None,
             vfork_parent_thread: None,
+            pml4_shared: false,
         }
     }
 
@@ -316,6 +320,107 @@ impl Process {
         }
 
         pages_to_free
+    }
+
+    /// Update VMA prot flags in `[start .. start+len)`, splitting VMAs as needed.
+    ///
+    /// Returns a list of `(page_base, page_count)` ranges whose page table flags
+    /// need to be updated by the caller (with MEMORY lock held separately).
+    pub fn mprotect_vmas(&mut self, start: u64, len: u64, new_prot: u32) -> Vec<(u64, usize)> {
+        let end = start + len;
+        let page_size = crate::consts::PAGE_SIZE;
+
+        // Collect keys of VMAs that overlap [start, end).
+        let overlapping: Vec<u64> = self.vma_map.range(..end)
+            .filter(|(_, vma)| vma.start + vma.len > start)
+            .map(|(&k, _)| k)
+            .collect();
+
+        let mut pages_to_update: Vec<(u64, usize)> = Vec::new();
+        let mut to_remove: Vec<u64> = Vec::new();
+        let mut to_insert: Vec<(u64, Vma)> = Vec::new();
+
+        for key in &overlapping {
+            let vma = &self.vma_map[key];
+            let vma_start = vma.start;
+            let vma_end = vma.start + vma.len;
+
+            if start <= vma_start && end >= vma_end {
+                // Case 1: entire VMA — update prot in place
+                let count = (vma.len / page_size) as usize;
+                pages_to_update.push((vma_start, count));
+                let mut updated = vma.clone();
+                updated.prot = new_prot;
+                to_remove.push(*key);
+                to_insert.push((vma_start, updated));
+            } else if start <= vma_start && end < vma_end {
+                // Case 2: front overlap — split front with new_prot, remainder keeps old
+                let front_len = end - vma_start;
+                let count = (front_len / page_size) as usize;
+                pages_to_update.push((vma_start, count));
+
+                let mut front = vma.clone();
+                front.len = front_len;
+                front.prot = new_prot;
+
+                let mut tail = vma.clone();
+                tail.start = end;
+                tail.len = vma_end - end;
+
+                to_remove.push(*key);
+                to_insert.push((vma_start, front));
+                to_insert.push((end, tail));
+            } else if start > vma_start && end >= vma_end {
+                // Case 3: tail overlap — original shrinks, tail gets new_prot
+                let tail_len = vma_end - start;
+                let count = (tail_len / page_size) as usize;
+                pages_to_update.push((start, count));
+
+                let mut head = vma.clone();
+                head.len = start - vma_start;
+
+                let mut tail = vma.clone();
+                tail.start = start;
+                tail.len = tail_len;
+                tail.prot = new_prot;
+
+                to_remove.push(*key);
+                to_insert.push((vma_start, head));
+                to_insert.push((start, tail));
+            } else {
+                // Case 4: middle overlap — split into three
+                let mid_len = end - start;
+                let count = (mid_len / page_size) as usize;
+                pages_to_update.push((start, count));
+
+                let mut left = vma.clone();
+                left.len = start - vma_start;
+
+                let mut mid = vma.clone();
+                mid.start = start;
+                mid.len = mid_len;
+                mid.prot = new_prot;
+
+                let mut right = vma.clone();
+                right.start = end;
+                right.len = vma_end - end;
+
+                to_remove.push(*key);
+                to_insert.push((vma_start, left));
+                to_insert.push((start, mid));
+                to_insert.push((end, right));
+            }
+        }
+
+        // Apply mutations
+        for key in to_remove {
+            self.vma_map.remove(&key);
+        }
+        for (key, vma) in to_insert {
+            self.vma_map.insert(key, vma);
+        }
+
+        pages_to_update
     }
 
     /// Close all file descriptors that have FD_CLOEXEC set.

@@ -48,6 +48,7 @@ pub fn sys_clone(flags: u64, child_stack: u64, _ptid: u64, _ctid: u64, _tls: u64
     child.mmap_next = mmap_next;
     child.vma_map = vma_map;
     child.vfork_parent_thread = Some(parent_thread_idx);
+    child.pml4_shared = true;
 
     let child_pid = child.pid;
     process::insert(child);

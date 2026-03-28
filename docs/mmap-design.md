@@ -30,12 +30,18 @@ VMAs.  Supports partial unmaps (front, tail, middle split).
 
 ### mprotect (syscall 10)
 
-Stub — returns 0 but does not change page permissions.
+Implemented — updates page table flags and splits/updates VMAs.  Supports
+partial mprotect across VMA boundaries (front, tail, middle split).
 
 ### Process cleanup on exit
 
-`sys_exit` marks the process as a zombie and kills the thread.  No page
-tables, frames, or VMA metadata are freed.
+`sys_exit` frees all user-space frames (ELF segments, brk heap, user stack,
+mmap regions) and intermediate page table frames before marking zombie.
+
+### Process cleanup on execve
+
+`sys_execve` creates a fresh PML4, switches CR3, then frees the old address
+space (all user pages and page tables).
 
 ---
 
@@ -165,7 +171,7 @@ get the same (or nearby) frames back, zero-filled.
 
 ---
 
-## Phase 3: mprotect + Process Cleanup
+## Phase 3: mprotect + Process Cleanup ✓ (implemented)
 
 **Goal:** Change page permissions on existing mappings, and free all process
 memory on exit/execve.

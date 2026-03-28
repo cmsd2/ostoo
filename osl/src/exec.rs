@@ -57,6 +57,11 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
         return -errno::ENOEXEC;
     }
 
+    // 4a. Save old address space info before creating new one.
+    let (old_pml4_phys, old_pml4_shared) = process::with_process_ref(pid, |p| {
+        (p.pml4_phys, p.pml4_shared)
+    }).unwrap_or((x86_64::PhysAddr::new(0), false));
+
     // 4. Create fresh PML4 and map segments + stack.
     let (new_pml4_phys, stack_kernel_base) = with_memory(|mem| {
         let pml4_phys = mem.create_user_page_table();
@@ -173,12 +178,22 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
         p.brk_current = brk_base;
         p.mmap_next = MMAP_BASE;
         p.vma_map.clear();
+        p.pml4_shared = false;
         p.close_cloexec_fds();
         p.vfork_parent_thread.take()
     });
 
-    // 8. Update scheduler thread's PML4.
+    // 8. Switch to new address space and free old one.
     scheduler::set_current_cr3(new_pml4_phys.as_u64());
+    unsafe { libkernel::memory::switch_address_space(new_pml4_phys); }
+
+    // Free old address space (CR3 already points to new PML4, so flush_tlb=false).
+    // Skip if the old PML4 was shared with the parent (CLONE_VM/vfork).
+    if !old_pml4_shared && old_pml4_phys.as_u64() != 0 {
+        with_memory(|mem| {
+            mem.cleanup_user_address_space(old_pml4_phys, false);
+        });
+    }
 
     // 9. If vfork child, unblock parent.
     if let Some(Some(thread_idx)) = vfork_parent_thread {

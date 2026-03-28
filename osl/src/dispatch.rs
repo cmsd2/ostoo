@@ -48,7 +48,7 @@ fn syscall_inner(
         SYS_FSTAT          => sys_fstat(a1, a2),
         SYS_LSEEK          => -errno::ESPIPE, // stdout is not seekable
         SYS_MMAP           => sys_mmap(a1, a2, a3, a4, a5),
-        SYS_MPROTECT       => 0, // no-op
+        SYS_MPROTECT       => sys_mprotect(a1, a2, a3),
         SYS_MUNMAP         => sys_munmap(a1, a2),
         SYS_BRK            => sys_brk(a1),
         SYS_RT_SIGACTION   => 0, // stub (no signal support)
@@ -187,6 +187,22 @@ fn sys_exit(code: i32) -> i64 {
         // Close all fds before marking zombie so resources (IRQ handles,
         // completion ports, pipes) are released while page tables are active.
         libkernel::process::with_process(pid, |p| p.close_all_fds());
+
+        // Free all user-space pages and page tables.
+        // Skip if the PML4 is shared with the parent (CLONE_VM/vfork child
+        // that called _exit without execve).
+        let cleanup_info = libkernel::process::with_process(pid, |p| {
+            let info = (p.pml4_phys, p.pml4_shared);
+            p.vma_map.clear();
+            info
+        });
+        if let Some((pml4_phys, shared)) = cleanup_info {
+            if !shared && pml4_phys.as_u64() != 0 {
+                libkernel::memory::with_memory(|mem| {
+                    mem.cleanup_user_address_space(pml4_phys, true);
+                });
+            }
+        }
 
         let parent_pid = libkernel::process::with_process_ref(pid, |p| p.parent_pid);
         libkernel::process::mark_zombie(pid, code);
@@ -412,6 +428,68 @@ fn sys_munmap(addr: u64, length: u64) -> i64 {
     });
 
     0
+}
+
+fn sys_mprotect(addr: u64, length: u64, prot: u64) -> i64 {
+    use libkernel::process;
+    use libkernel::memory::with_memory;
+
+    if addr & PAGE_MASK != 0 || length == 0 {
+        return -errno::EINVAL;
+    }
+
+    let pid = process::current_pid();
+    if pid == process::ProcessId::KERNEL {
+        return -errno::EINVAL;
+    }
+
+    let aligned_len = (length + PAGE_MASK) & !PAGE_MASK;
+    let prot32 = prot as u32;
+
+    // Step 1: split/update VMAs (PROCESS_TABLE lock).
+    let result = process::with_process(pid, |p| {
+        (p.pml4_phys, p.mprotect_vmas(addr, aligned_len, prot32))
+    });
+    let (pml4_phys, pages_to_update) = match result {
+        Some(v) => v,
+        None => return -errno::EINVAL,
+    };
+
+    if pages_to_update.is_empty() {
+        return 0;
+    }
+
+    // Compute page table flags from prot.
+    let flags = prot_to_page_flags(prot32);
+
+    // Step 2: update page table flags (MEMORY lock, separate from PROCESS_TABLE).
+    with_memory(|mem| {
+        for (base, count) in &pages_to_update {
+            for i in 0..*count {
+                let vaddr = x86_64::VirtAddr::new(base + (i as u64) * PAGE_SIZE);
+                mem.update_user_page_flags(pml4_phys, vaddr, flags, true);
+            }
+        }
+    });
+
+    0
+}
+
+/// Convert Linux PROT_* flags to x86-64 page table flags.
+fn prot_to_page_flags(prot: u32) -> PageTableFlags {
+    use libkernel::process::{PROT_NONE, PROT_WRITE, PROT_EXEC};
+
+    if prot == PROT_NONE {
+        return PageTableFlags::USER_ACCESSIBLE;
+    }
+    let mut f = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if prot & PROT_WRITE != 0 {
+        f |= PageTableFlags::WRITABLE;
+    }
+    if prot & PROT_EXEC == 0 {
+        f |= PageTableFlags::NO_EXECUTE;
+    }
+    f
 }
 
 // ---------------------------------------------------------------------------
