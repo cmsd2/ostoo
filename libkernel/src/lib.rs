@@ -42,6 +42,7 @@ pub mod irq_handle;
 pub mod msr;
 pub mod path;
 pub mod gap;
+pub mod signal;
 
 pub fn init() {
     cpuid::init();

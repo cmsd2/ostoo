@@ -21,6 +21,24 @@ pub struct PerCpuData {
     /// User R9 saved by the entry stub before the arg shuffle. Offset 32.
     /// Needed by clone: musl's __clone stores the child fn pointer in R9.
     pub user_r9: u64,
+    /// Pointer to the SyscallSavedFrame on the kernel stack. Offset 40.
+    /// Set by the entry stub after pushing all registers; used by signal delivery.
+    pub saved_frame_ptr: u64,
+}
+
+/// Layout of the 8 registers pushed on the kernel stack by the SYSCALL entry stub.
+/// Matches the push order: rcx, r11, rdi, rsi, rdx, r10, r8, r9.
+/// RSP points to the r9 slot (lowest address) after all pushes.
+#[repr(C)]
+pub struct SyscallSavedFrame {
+    pub r9: u64,      // offset 0  (top of stack after pushes)
+    pub r8: u64,      // offset 8
+    pub r10: u64,     // offset 16
+    pub rdx: u64,     // offset 24
+    pub rsi: u64,     // offset 32
+    pub rdi: u64,     // offset 40
+    pub r11: u64,     // offset 48 (user RFLAGS)
+    pub rcx: u64,     // offset 56 (user RIP)
 }
 
 /// Wrapper for the per-CPU data block, replacing `static mut`.
@@ -35,7 +53,8 @@ unsafe impl Sync for PerCpuCell {}
 impl PerCpuCell {
     const fn new() -> Self {
         PerCpuCell(UnsafeCell::new(PerCpuData {
-            kernel_rsp: 0, user_rsp: 0, user_rip: 0, user_rflags: 0, user_r9: 0,
+            kernel_rsp: 0, user_rsp: 0, user_rip: 0, user_rflags: 0,
+            user_r9: 0, saved_frame_ptr: 0,
         }))
     }
     fn get(&self) -> *mut PerCpuData {
@@ -133,6 +152,8 @@ syscall_entry:
     push r8                     /* save user r8  (a5) */
     push r9                     /* save user r9  (a6) */
 
+    mov  gs:40, rsp              /* save frame ptr for signal delivery */
+
     /* Translate syscall ABI -> SysV64 for syscall_dispatch:
        syscall: nr=rax, a1=rdi, a2=rsi, a3=rdx, a4=r10, a5=r8
        SysV64:  rdi,    rsi,    rdx,    rcx,    r8,     r9
@@ -145,6 +166,9 @@ syscall_entry:
     mov  rdi, rax               /* nr -> 1st SysV arg (rdi) */
 
     call syscall_dispatch        /* returns i64 in rax */
+
+    mov  rdi, rax               /* pass syscall return value as arg */
+    call check_pending_signals  /* returns (possibly modified) rax */
 
     /* Restore user registers (rax has the return value from dispatch). */
     pop  r9
@@ -238,8 +262,199 @@ pub fn get_user_r9() -> u64 {
     unsafe { (*PER_CPU.get()).user_r9 }
 }
 
+/// Read the saved frame pointer from the per-CPU data block.
+///
+/// Points to the `SyscallSavedFrame` on the kernel stack, written by the
+/// SYSCALL entry stub. Used by signal delivery to rewrite the return context.
+pub fn get_saved_frame_ptr() -> *mut SyscallSavedFrame {
+    unsafe { (*PER_CPU.get()).saved_frame_ptr as *mut SyscallSavedFrame }
+}
+
+/// Read the user RSP that was saved by the SYSCALL entry stub into per-CPU.
+///
+/// This is the user-space RSP at the point of the SYSCALL instruction,
+/// needed by signal delivery to construct the signal frame below it.
+pub fn get_saved_user_rsp() -> u64 {
+    unsafe { (*PER_CPU.get()).user_rsp }
+}
+
+/// Set the user RSP in the per-CPU data block (used by rt_sigreturn
+/// to restore original user RSP after signal handling).
+pub fn set_saved_user_rsp(rsp: u64) {
+    unsafe { (*PER_CPU.get()).user_rsp = rsp; }
+}
+
 /// Returns the top of the dedicated kernel syscall stack, suitable for
 /// storing in TSS.rsp0 so hardware interrupts from ring 3 land on it.
 pub fn kernel_stack_top() -> VirtAddr {
     VirtAddr::new(SYSCALL_STACK.0.as_ptr_range().end as u64)
+}
+
+// ---------------------------------------------------------------------------
+// Signal delivery on SYSCALL return path
+
+/// Called from the assembly stub after `syscall_dispatch` returns.
+///
+/// Takes the syscall return value (passed in rdi) and returns it in rax.
+/// If a signal is pending, delivers it by rewriting the saved frame so
+/// that `sysretq` "returns" to the handler instead.
+#[no_mangle]
+extern "C" fn check_pending_signals(syscall_ret: i64) -> i64 {
+    let pid = crate::process::current_pid();
+    if pid == crate::process::ProcessId::KERNEL {
+        return syscall_ret;
+    }
+
+    // Peek at pending & !blocked — avoid locking if nothing to do.
+    let deliverable = match crate::process::with_process_ref(pid, |p| {
+        p.signal.pending & !p.signal.blocked
+    }) {
+        Some(d) if d != 0 => d,
+        _ => return syscall_ret,
+    };
+
+    // Dequeue the lowest signal and get its action.
+    let (signum, action) = match crate::process::with_process(pid, |p| {
+        if let Some(sig) = p.signal.dequeue() {
+            let idx = (sig - 1) as usize;
+            Some((sig, p.signal.actions[idx]))
+        } else {
+            None
+        }
+    }) {
+        Some(Some(v)) => v,
+        _ => return syscall_ret,
+    };
+
+    let _ = deliverable; // used only for early-exit check above
+
+    use crate::signal::*;
+
+    if action.handler == SIG_IGN {
+        return syscall_ret;
+    }
+
+    if action.handler == SIG_DFL {
+        if SignalState::is_default_ignore(signum) {
+            return syscall_ret;
+        }
+        if SignalState::is_default_terminate(signum) {
+            crate::serial_println!("[signal] pid={} killed by signal {}", pid.as_u64(), signum);
+            crate::process::terminate_process(pid, 128 + signum as i32);
+        }
+        return syscall_ret;
+    }
+
+    // Deliver signal: construct rt_sigframe on user stack, rewrite saved frame.
+    deliver_signal(pid, signum, &action, syscall_ret);
+    syscall_ret
+}
+
+/// Construct an rt_sigframe on the user stack and rewrite the SYSCALL saved
+/// frame so that sysretq "returns" into the signal handler.
+fn deliver_signal(
+    pid: crate::process::ProcessId,
+    signum: u8,
+    action: &crate::signal::SigAction,
+    syscall_ret: i64,
+) {
+    use crate::signal::*;
+
+    let frame_ptr = get_saved_frame_ptr();
+    let user_rsp = get_saved_user_rsp();
+    let orig_rax = syscall_ret as u64;
+
+    let old_blocked = crate::process::with_process_ref(pid, |p| p.signal.blocked)
+        .unwrap_or(0);
+
+    // Block sa_mask + the delivered signal during handler execution.
+    crate::process::with_process(pid, |p| {
+        p.signal.blocked |= action.mask | (1u64 << (signum - 1));
+        let unblockable = (1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1));
+        p.signal.blocked &= !unblockable;
+    });
+
+    // rt_sigframe layout (Linux x86_64):
+    //   +0x000: pretcode     (8 bytes, sa_restorer address)
+    //   +0x008: ucontext_t   (uc_flags 8, uc_link 8, uc_stack 24,
+    //                          sigcontext 256, fpstate_ptr 8+reserved 64,
+    //                          uc_sigmask 8) = 376 bytes
+    //   +0x180: siginfo_t    (128 bytes)
+    //   Total: 512 bytes
+    //
+    // sigcontext (32 u64s): r8 r9 r10 r11 r12 r13 r14 r15
+    //   rdi rsi rbp rbx rdx rax rcx rsp rip eflags
+    //   {cs,gs,fs,ss} err trapno oldmask cr2
+    //   fpstate reserved1[8]
+    const PRETCODE_SIZE: u64 = 8;
+    const UC_HEADER: u64 = 8 + 8 + 24;           // uc_flags + uc_link + uc_stack
+    const SIGCONTEXT_SIZE: u64 = 32 * 8;          // 256 bytes
+    const UC_TAIL: u64 = 8;                       // uc_sigmask
+    const UCONTEXT_SIZE: u64 = UC_HEADER + SIGCONTEXT_SIZE + UC_TAIL; // 376
+    const SIGINFO_SIZE: u64 = 128;
+    const FRAME_SIZE: u64 = PRETCODE_SIZE + UCONTEXT_SIZE + SIGINFO_SIZE; // 512
+
+    // ABI: at function entry, RSP % 16 == 8 (as if `call` pushed the
+    // return address).  Match Linux's align_sigframe: ((sp-8) & ~15) + 8.
+    let sp = user_rsp - FRAME_SIZE;
+    let frame_base = ((sp - 8) & !0xF) + 8;
+
+    unsafe { core::ptr::write_bytes(frame_base as *mut u8, 0, FRAME_SIZE as usize); }
+
+    // pretcode
+    unsafe { *(frame_base as *mut u64) = action.restorer; }
+
+    // ucontext_t
+    let uc_base = frame_base + PRETCODE_SIZE;
+    let sc_base = uc_base + UC_HEADER;
+
+    // sigcontext registers (Linux x86_64 order)
+    let saved = unsafe { &*frame_ptr };
+    unsafe {
+        let sc = sc_base as *mut u64;
+        sc.add(0).write(saved.r8);
+        sc.add(1).write(saved.r9);
+        sc.add(2).write(saved.r10);
+        sc.add(3).write(saved.r11);     // r11 (user RFLAGS from SYSCALL)
+        // r12-r15, rbp, rbx = 0 (not saved by SYSCALL stub; zeroed above)
+        sc.add(8).write(saved.rdi);
+        sc.add(9).write(saved.rsi);
+        sc.add(12).write(saved.rdx);
+        sc.add(13).write(orig_rax);     // rax (syscall return value)
+        sc.add(14).write(saved.rcx);    // rcx (user RIP from SYSCALL)
+        sc.add(15).write(user_rsp);     // rsp
+        sc.add(16).write(saved.rcx);    // rip (same as rcx)
+        sc.add(17).write(saved.r11);    // eflags (same as r11)
+    }
+
+    // uc_sigmask — old blocked mask, restored by rt_sigreturn
+    unsafe {
+        *((sc_base + SIGCONTEXT_SIZE) as *mut u64) = old_blocked;
+    }
+
+    // siginfo_t: just si_signo
+    let siginfo_base = uc_base + UCONTEXT_SIZE;
+    unsafe { *(siginfo_base as *mut i32) = signum as i32; }
+
+    // Rewrite saved frame so sysretq enters the handler.
+    unsafe {
+        let frame = &mut *frame_ptr;
+        frame.rcx = action.handler;
+        frame.rdi = signum as u64;
+        if action.flags & SA_SIGINFO != 0 {
+            frame.rsi = siginfo_base;
+            frame.rdx = uc_base;
+        } else {
+            frame.rsi = 0;
+            frame.rdx = 0;
+        }
+        frame.r11 = saved.r11;
+    }
+
+    set_saved_user_rsp(frame_base);
+
+    crate::serial_println!(
+        "[signal] pid={} delivering sig={} handler={:#x} restorer={:#x} frame={:#x} user_rsp={:#x}",
+        pid.as_u64(), signum, action.handler, action.restorer, frame_base, user_rsp
+    );
 }

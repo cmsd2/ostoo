@@ -757,7 +757,9 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
     // Round-robin: pop from the front of the ready queue.
     let next_idx = match sched.ready_queue.pop_front() {
         Some(idx) => idx,
-        None => return current_rsp,
+        None => {
+            return current_rsp;
+        }
     };
 
     sched.current_idx = next_idx;

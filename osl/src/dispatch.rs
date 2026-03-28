@@ -51,8 +51,9 @@ fn syscall_inner(
         SYS_MPROTECT       => sys_mprotect(a1, a2, a3),
         SYS_MUNMAP         => sys_munmap(a1, a2),
         SYS_BRK            => sys_brk(a1),
-        SYS_RT_SIGACTION   => 0, // stub (no signal support)
-        SYS_RT_SIGPROCMASK => 0, // stub (no signal support)
+        SYS_RT_SIGACTION   => sys_rt_sigaction(a1, a2, a3, a4),
+        SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(a1, a2, a3, a4),
+        SYS_RT_SIGRETURN   => crate::signal::sys_rt_sigreturn(),
         SYS_IOCTL          => -errno::ENOTTY,
         SYS_WRITEV         => sys_writev(a1, a2, a3),
         SYS_MADVISE        => 0, // no-op
@@ -63,6 +64,7 @@ fn syscall_inner(
         SYS_EXIT
         | SYS_EXIT_GROUP   => sys_exit(a1 as i32),
         SYS_WAIT4          => sys_wait4(a1, a2, a3),
+        SYS_KILL           => crate::signal::sys_kill(a1, a2),
         SYS_FCNTL          => sys_fcntl(a1, a2, a3),
         SYS_GETCWD         => sys_getcwd(a1, a2),
         SYS_CHDIR          => sys_chdir(a1),
@@ -175,48 +177,11 @@ fn sys_exit(code: i32) -> i64 {
     let pid = libkernel::process::current_pid();
     if pid != libkernel::process::ProcessId::KERNEL {
         libkernel::serial_println!("[kernel] pid {} exited with code {}", pid.as_u64(), code);
-
-        // If this is a vfork child, unblock the parent before marking zombie.
-        let vfork_parent_thread = libkernel::process::with_process(pid, |p| {
-            p.vfork_parent_thread.take()
-        });
-        if let Some(Some(thread_idx)) = vfork_parent_thread {
-            libkernel::task::scheduler::unblock(thread_idx);
-        }
-
-        // Close all fds before marking zombie so resources (IRQ handles,
-        // completion ports, pipes) are released while page tables are active.
-        libkernel::process::with_process(pid, |p| p.close_all_fds());
-
-        // Free all user-space pages and page tables.
-        // Skip if the PML4 is shared with the parent (CLONE_VM/vfork child
-        // that called _exit without execve).
-        let cleanup_info = libkernel::process::with_process(pid, |p| {
-            let info = (p.pml4_phys, p.pml4_shared);
-            p.vma_map.clear();
-            info
-        });
-        if let Some((pml4_phys, shared)) = cleanup_info {
-            if !shared && pml4_phys.as_u64() != 0 {
-                libkernel::memory::with_memory(|mem| {
-                    mem.cleanup_user_address_space(pml4_phys, true);
-                });
-            }
-        }
-
-        let parent_pid = libkernel::process::with_process_ref(pid, |p| p.parent_pid);
-        libkernel::process::mark_zombie(pid, code);
-
-        if let Some(parent_pid) = parent_pid {
-            let wait_thread = libkernel::process::with_process(parent_pid, |pp| pp.wait_thread.take());
-            if let Some(Some(thread_idx)) = wait_thread {
-                libkernel::task::scheduler::unblock(thread_idx);
-            }
-        }
+        libkernel::process::terminate_process(pid, code);
     } else {
         libkernel::println!("\n[kernel] kernel sys_exit({}) — halting", code);
+        libkernel::task::scheduler::kill_current_thread();
     }
-    libkernel::task::scheduler::kill_current_thread();
 }
 
 fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
@@ -632,6 +597,110 @@ fn prot_to_page_flags(prot: u32) -> PageTableFlags {
         f |= PageTableFlags::NO_EXECUTE;
     }
     f
+}
+
+// ---------------------------------------------------------------------------
+// Signal syscalls
+
+fn sys_rt_sigaction(signum: u64, act_ptr: u64, oldact_ptr: u64, sigsetsize: u64) -> i64 {
+    use libkernel::signal::*;
+
+    if sigsetsize != 8 {
+        return -errno::EINVAL;
+    }
+    let sig = signum as u8;
+    if sig < 1 || sig as usize > NUM_SIGNALS || sig == SIGKILL || sig == SIGSTOP {
+        return -errno::EINVAL;
+    }
+
+    let pid = libkernel::process::current_pid();
+    let idx = (sig - 1) as usize;
+
+    // Write old action to user memory if requested.
+    if oldact_ptr != 0 {
+        if !validate_user_buf(oldact_ptr, 32) {
+            return -errno::EFAULT;
+        }
+        let old = match libkernel::process::with_process_ref(pid, |p| p.signal.actions[idx]) {
+            Some(a) => a,
+            None => return -errno::ESRCH,
+        };
+        unsafe {
+            let p = oldact_ptr as *mut u64;
+            p.write(old.handler);
+            p.add(1).write(old.flags);
+            p.add(2).write(old.restorer);
+            p.add(3).write(old.mask);
+        }
+    }
+
+    // Read new action from user memory if provided.
+    if act_ptr != 0 {
+        if !validate_user_buf(act_ptr, 32) {
+            return -errno::EFAULT;
+        }
+        let action = unsafe {
+            let p = act_ptr as *const u64;
+            SigAction {
+                handler: p.read(),
+                flags: p.add(1).read(),
+                restorer: p.add(2).read(),
+                mask: p.add(3).read(),
+            }
+        };
+        libkernel::process::with_process(pid, |p| {
+            p.signal.actions[idx] = action;
+        });
+    }
+
+    0
+}
+
+fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64, sigsetsize: u64) -> i64 {
+    use libkernel::signal::*;
+
+    if sigsetsize != 8 {
+        return -errno::EINVAL;
+    }
+
+    let pid = libkernel::process::current_pid();
+
+    // Write old mask to user memory.
+    if oldset_ptr != 0 {
+        if !validate_user_buf(oldset_ptr, 8) {
+            return -errno::EFAULT;
+        }
+        let old_mask = match libkernel::process::with_process_ref(pid, |p| p.signal.blocked) {
+            Some(m) => m,
+            None => return -errno::ESRCH,
+        };
+        unsafe { *(oldset_ptr as *mut u64) = old_mask; }
+    }
+
+    // Apply new mask if provided.
+    if set_ptr != 0 {
+        if !validate_user_buf(set_ptr, 8) {
+            return -errno::EFAULT;
+        }
+        let set = unsafe { *(set_ptr as *const u64) };
+        // Cannot block SIGKILL or SIGSTOP.
+        let unblockable = (1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1));
+
+        libkernel::process::with_process(pid, |p| {
+            match how {
+                SIG_BLOCK => p.signal.blocked |= set & !unblockable,
+                SIG_UNBLOCK => p.signal.blocked &= !set,
+                SIG_SETMASK => p.signal.blocked = set & !unblockable,
+                _ => {} // EINVAL handled below
+            }
+        });
+
+        if how > SIG_SETMASK {
+            return -errno::EINVAL;
+        }
+    }
+
+    0
 }
 
 // ---------------------------------------------------------------------------

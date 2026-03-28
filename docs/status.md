@@ -292,6 +292,19 @@ are present, racing all event sources in a single future.
 - On close, the original IO APIC entry is restored.
 - Demo: `user/irq_demo.c` — keyboard scancode display via OP_IRQ_WAIT.
 
+### POSIX Signals (`libkernel/src/signal.rs`, `osl/src/signal.rs`)
+- Phase 1: basic signal infrastructure and delivery on SYSCALL return.
+- `rt_sigaction` (13): install/query signal handlers (SA_SIGINFO, SA_RESTORER).
+- `rt_sigprocmask` (14): SIG_BLOCK/UNBLOCK/SETMASK for the signal mask.
+- `kill` (62): send a signal to a specific pid.
+- `rt_sigreturn` (15): restore context from rt_sigframe after handler returns.
+- Signal delivery via `check_pending_signals` in the SYSCALL return path:
+  constructs a Linux-ABI-compatible `rt_sigframe` on the user stack, rewrites
+  the saved register frame so `sysretq` "returns" into the handler.
+- Default actions: SIG_DFL terminate (SIGKILL, SIGTERM, etc.) or ignore (SIGCHLD).
+- Demo: `user/sig_demo.c` — SIGUSR1 self-signal with handler verification.
+- See [`docs/signals.md`](signals.md) for full design.
+
 ### Dummy Driver (`devices/src/dummy.rs`)
 - Example actor with `#[on_tick]` heartbeat, `#[on_message(SetInterval)]`,
   and `#[on_info]`.
@@ -387,9 +400,10 @@ output but functionally harmless.
 
 ### Process Model
 
-5. **Signals** — `rt_sigaction`, `rt_sigreturn`, signal frame push/pop.
-   Ctrl+C (`SIGINT`) should terminate the foreground process.  See
-   [`docs/userspace-plan.md`](userspace-plan.md) Phase 7.
+5. **Signals Phase 2+** — Phase 1 (basic signal delivery) is complete:
+   `rt_sigaction`, `rt_sigprocmask`, `kill`, signal delivery on SYSCALL return,
+   `rt_sigreturn`.  Remaining: exception-generated signals (SIGSEGV, SIGILL),
+   SIGINT from Ctrl+C, SIGCHLD on child exit.  See [`docs/signals.md`](signals.md).
 
 6. **`fork` + CoW page faults** — standard POSIX `fork`.  `clone(CLONE_VM|CLONE_VFORK)`
    and `execve` are now implemented, enabling unpatched musl `posix_spawn` and

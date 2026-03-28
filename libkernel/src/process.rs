@@ -7,6 +7,7 @@ use x86_64::PhysAddr;
 use x86_64::structures::paging::PageTableFlags;
 
 use crate::file::{FileError, FdEntry, FdObject, FD_CLOEXEC};
+use crate::signal::SignalState;
 
 // ---------------------------------------------------------------------------
 // VMA (Virtual Memory Area)
@@ -116,6 +117,8 @@ pub struct Process {
     /// True when this process shares its PML4 with the parent (CLONE_VM).
     /// Cleanup must not free the PML4 or its pages in this case.
     pub pml4_shared: bool,
+    /// Signal state (dispositions, pending mask, blocked mask).
+    pub signal: SignalState,
 }
 
 const PROCESS_KERNEL_STACK_SIZE: usize = crate::consts::KERNEL_STACK_SIZE;
@@ -151,6 +154,7 @@ impl Process {
             wait_thread: None,
             vfork_parent_thread: None,
             pml4_shared: false,
+            signal: SignalState::new(),
         }
     }
 
@@ -588,4 +592,48 @@ pub fn find_zombie_child(parent_pid: ProcessId, target_pid: i64) -> Option<(Proc
 
 pub fn has_children(parent_pid: ProcessId) -> bool {
     PROCESSES.has_children(parent_pid)
+}
+
+/// Terminate a process: unblock vfork parent, close fds, free address space,
+/// mark zombie, wake parent's wait_thread, and kill the scheduler thread.
+///
+/// Shared by `sys_exit` and signal default-terminate. Does not return.
+pub fn terminate_process(pid: ProcessId, exit_code: i32) -> ! {
+    // Unblock vfork parent if this is a vfork child.
+    let vfork_parent_thread = with_process(pid, |p| p.vfork_parent_thread.take());
+    if let Some(Some(thread_idx)) = vfork_parent_thread {
+        crate::task::scheduler::unblock(thread_idx);
+    }
+
+    // Close all fds before marking zombie so resources (IRQ handles,
+    // completion ports, pipes) are released while page tables are active.
+    with_process(pid, |p| p.close_all_fds());
+
+    // Free all user-space pages and page tables.
+    // Skip if the PML4 is shared with the parent (CLONE_VM/vfork child
+    // that called _exit without execve).
+    let cleanup_info = with_process(pid, |p| {
+        let info = (p.pml4_phys, p.pml4_shared);
+        p.vma_map.clear();
+        info
+    });
+    if let Some((pml4_phys, shared)) = cleanup_info {
+        if !shared && pml4_phys.as_u64() != 0 {
+            crate::memory::with_memory(|mem| {
+                mem.cleanup_user_address_space(pml4_phys, true);
+            });
+        }
+    }
+
+    let parent_pid = with_process_ref(pid, |p| p.parent_pid);
+    mark_zombie(pid, exit_code);
+
+    if let Some(parent_pid) = parent_pid {
+        let wait_thread = with_process(parent_pid, |pp| pp.wait_thread.take());
+        if let Some(Some(thread_idx)) = wait_thread {
+            crate::task::scheduler::unblock(thread_idx);
+        }
+    }
+
+    crate::task::scheduler::kill_current_thread();
 }
