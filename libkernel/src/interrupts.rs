@@ -19,14 +19,14 @@ pub const DYNAMIC_BASE: u8 = 0x40;
 /// Number of dynamically allocatable vectors.
 pub const DYNAMIC_COUNT: usize = 16;
 
-static DYNAMIC_HANDLERS: spin::Mutex<[Option<fn()>; DYNAMIC_COUNT]> =
+static DYNAMIC_HANDLERS: spin::Mutex<[Option<fn(usize)>; DYNAMIC_COUNT]> =
     spin::Mutex::new([None; DYNAMIC_COUNT]);
 
 fn dispatch_dynamic(idx: usize) {
     // Copy the fn pointer out before calling so the lock is released first.
     let handler = DYNAMIC_HANDLERS.lock()[idx];
     if let Some(f) = handler {
-        f();
+        f(idx);
     }
     send_eoi(DYNAMIC_BASE + idx as u8);
 }
@@ -61,7 +61,7 @@ const DYN_TRAMPOLINES: [IrqTrampoline; DYNAMIC_COUNT] = [
 /// Returns the assigned vector number, or `None` if all 16 are in use.
 /// Safe to call from any kernel thread; disables interrupts while updating
 /// the table to avoid deadlock with the ISR dispatcher.
-pub fn register_handler(handler: fn()) -> Option<u8> {
+pub fn register_handler(handler: fn(usize)) -> Option<u8> {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut handlers = DYNAMIC_HANDLERS.lock();
         for (i, slot) in handlers.iter_mut().enumerate() {

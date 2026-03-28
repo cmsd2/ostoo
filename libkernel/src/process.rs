@@ -186,6 +186,16 @@ impl Process {
         }
     }
 
+    /// Close all open file descriptors.  Called during process exit to release
+    /// resources (IRQ handles, completion ports, pipes, etc.) promptly.
+    pub fn close_all_fds(&mut self) {
+        for slot in self.fd_table.iter_mut() {
+            if let Some(entry) = slot.take() {
+                entry.object.close();
+            }
+        }
+    }
+
     /// Get the object for an open file descriptor.
     pub fn get_fd(&self, fd: usize) -> Result<FdObject, FileError> {
         self.fd_table.get(fd)

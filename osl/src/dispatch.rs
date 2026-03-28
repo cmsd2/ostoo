@@ -80,6 +80,7 @@ fn syscall_inner(
         SYS_IO_CREATE      => crate::io_port::sys_io_create(a1 as u32),
         SYS_IO_SUBMIT      => crate::io_port::sys_io_submit(a1 as i32, a2, a3 as u32),
         SYS_IO_WAIT        => crate::io_port::sys_io_wait(a1 as i32, a2, a3 as u32, a4 as u32, a5),
+        SYS_IRQ_CREATE     => crate::irq::sys_irq_create(a1 as u32),
         other              => {
             log::warn!("unhandled syscall nr={} a1={:#x} a2={:#x} a3={:#x}",
                 other, a1, a2, a3);
@@ -182,6 +183,10 @@ fn sys_exit(code: i32) -> i64 {
         if let Some(Some(thread_idx)) = vfork_parent_thread {
             libkernel::task::scheduler::unblock(thread_idx);
         }
+
+        // Close all fds before marking zombie so resources (IRQ handles,
+        // completion ports, pipes) are released while page tables are active.
+        libkernel::process::with_process(pid, |p| p.close_all_fds());
 
         let parent_pid = libkernel::process::with_process_ref(pid, |p| p.parent_pid);
         libkernel::process::mark_zombie(pid, code);

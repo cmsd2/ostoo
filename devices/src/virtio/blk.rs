@@ -18,7 +18,7 @@ use super::KernelHal;
 static IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Called from the interrupt handler registered for this device.
-pub fn virtio_blk_irq_handler() {
+pub fn virtio_blk_irq_handler(_slot: usize) {
     IRQ_PENDING.store(true, Ordering::Release);
     // No AtomicWaker wake here — we use polling in CompletionFuture for MVP.
 }

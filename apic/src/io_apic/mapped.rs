@@ -57,6 +57,11 @@ impl MappedIoApic {
         unsafe { self.read_reg_64(IoApic64BitRegisterIndex::RedirectionEntry(gsi_offset)) }
     }
 
+    /// Write a single 64-bit redirection entry. `gsi_offset` = gsi − `self.interrupt_base`.
+    pub fn write_redirect_entry(&self, gsi_offset: u32, entry: u64) {
+        unsafe { self.write_reg_64(IoApic64BitRegisterIndex::RedirectionEntry(gsi_offset), entry); }
+    }
+
     pub fn mask_all(&self) {
         let max = self.max_redirect_entries();
         for i in 0..=max {
@@ -69,6 +74,12 @@ impl MappedIoApic {
     pub fn mask_entry(&self, gsi_offset: u32) {
         let entry = unsafe { self.read_reg_64(IoApic64BitRegisterIndex::RedirectionEntry(gsi_offset)) };
         unsafe { self.write_reg_64(IoApic64BitRegisterIndex::RedirectionEntry(gsi_offset), entry | (1 << 16)); }
+    }
+
+    /// Unmask a single redirection entry. `gsi_offset` = gsi - `self.interrupt_base`.
+    pub fn unmask_entry(&self, gsi_offset: u32) {
+        let entry = unsafe { self.read_reg_64(IoApic64BitRegisterIndex::RedirectionEntry(gsi_offset)) };
+        unsafe { self.write_reg_64(IoApic64BitRegisterIndex::RedirectionEntry(gsi_offset), entry & !(1 << 16)); }
     }
 
     /// Program a redirection entry. `gsi_offset` = gsi - `self.interrupt_base`.

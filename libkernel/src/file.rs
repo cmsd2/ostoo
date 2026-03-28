@@ -6,6 +6,7 @@ use snafu::Snafu;
 use spin::Mutex;
 
 use crate::completion_port::CompletionPort;
+use crate::irq_handle::IrqInner;
 use crate::irq_mutex::IrqMutex;
 
 // ---------------------------------------------------------------------------
@@ -23,6 +24,8 @@ pub enum FdObject {
     File(Arc<dyn FileHandle>),
     /// A completion port for async I/O notification.
     Port(Arc<IrqMutex<CompletionPort>>),
+    /// An IRQ file descriptor for userspace interrupt delivery.
+    Irq(Arc<IrqMutex<IrqInner>>),
 }
 
 impl Clone for FdObject {
@@ -30,6 +33,7 @@ impl Clone for FdObject {
         match self {
             FdObject::File(h) => FdObject::File(h.clone()),
             FdObject::Port(p) => FdObject::Port(p.clone()),
+            FdObject::Irq(i) => FdObject::Irq(i.clone()),
         }
     }
 }
@@ -40,6 +44,10 @@ impl FdObject {
         match self {
             FdObject::File(h) => h.close(),
             FdObject::Port(_) => {} // no-op
+            FdObject::Irq(i) => {
+                let inner = i.lock();
+                crate::irq_handle::close_irq(&inner);
+            }
         }
     }
 
@@ -55,6 +63,14 @@ impl FdObject {
     pub fn as_port(&self) -> Option<&Arc<IrqMutex<CompletionPort>>> {
         match self {
             FdObject::Port(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Get the inner IrqInner, if this is an Irq.
+    pub fn as_irq(&self) -> Option<&Arc<IrqMutex<IrqInner>>> {
+        match self {
+            FdObject::Irq(i) => Some(i),
             _ => None,
         }
     }

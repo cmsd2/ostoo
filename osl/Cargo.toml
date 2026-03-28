@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2018"
 
 [dependencies]
+apic      = { workspace = true }
 devices   = { workspace = true }
 libkernel = { workspace = true }
 log       = { workspace = true }

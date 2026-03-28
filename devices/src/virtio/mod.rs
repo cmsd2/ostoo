@@ -122,6 +122,6 @@ pub fn create_blk_transport(bus: u8, device: u8, function: u8) -> Option<PciTran
 
 /// Register a dynamic interrupt handler for the virtio-blk device.
 /// Returns the assigned vector, or `None` if all dynamic slots are in use.
-pub fn register_blk_irq(handler: fn()) -> Option<u8> {
+pub fn register_blk_irq(handler: fn(usize)) -> Option<u8> {
     libkernel::interrupts::register_handler(handler)
 }

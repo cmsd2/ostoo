@@ -594,16 +594,16 @@ model.
 | **Delivers** | OP_READ and OP_WRITE on console, pipe, and VFS file fds |
 | **Test** | Submit OP_WRITE to stdout + OP_READ from a file fd, reap both completions.  Verify data matches. |
 
-### Phase 3: OP_IRQ_WAIT
+### Phase 3: OP_IRQ_WAIT — **Implemented**
 
 **Goal:** Hardware interrupt delivery through the completion port.
 
 | Item | Detail |
 |---|---|
-| **Files** | `libkernel/src/file.rs` (IrqHandle with port integration), `osl/src/io_port.rs` (OP_IRQ_WAIT handler) |
-| **Dependencies** | Phase 1; [microkernel-design.md](microkernel-design.md) Phase B (IRQ fd infrastructure) |
-| **Delivers** | Submit OP_IRQ_WAIT on an IRQ fd, ISR posts completion to port |
-| **Test** | Register IRQ fd for a timer interrupt, submit OP_IRQ_WAIT, verify completion arrives after interrupt fires. |
+| **Files** | `libkernel/src/irq_handle.rs` (IrqInner, IRQ slot table, ISR dispatch), `libkernel/src/file.rs` (FdObject::Irq variant), `libkernel/src/completion_port.rs` (OP_IRQ_WAIT constant), `osl/src/irq.rs` (sys_irq_create), `osl/src/io_port.rs` (OP_IRQ_WAIT handler in io_submit) |
+| **Dependencies** | Phase 1; IO APIC route/mask/unmask (apic crate) |
+| **Delivers** | `irq_create(gsi)` syscall (504), submit OP_IRQ_WAIT on an IRQ fd, ISR masks line and posts completion to port, rearm via another OP_IRQ_WAIT unmasks |
+| **Test** | `user/irq_demo.c`: create IRQ fd for keyboard GSI 1, submit OP_IRQ_WAIT, press key, verify completion with scancode in result. |
 
 ### Phase 4: OP_RING_WAIT
 

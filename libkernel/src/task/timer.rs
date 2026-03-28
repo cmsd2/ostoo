@@ -8,10 +8,11 @@ use x86_64::instructions::interrupts;
 /// LAPIC timer is configured at 1000 Hz → 1 tick = 1 ms.
 pub const TICKS_PER_SECOND: u64 = 1000;
 
-const MAX_WAKERS: usize = 8;
+const MAX_WAKERS: usize = 16;
 
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 static WAKERS: Mutex<[Option<Waker>; MAX_WAKERS]> = Mutex::new([
+    None, None, None, None, None, None, None, None,
     None, None, None, None, None, None, None, None,
 ]);
 

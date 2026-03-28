@@ -5,11 +5,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
 
 use libkernel::completion_port::{
     CompletionPort, Completion,
-    OP_NOP, OP_TIMEOUT, OP_READ, OP_WRITE,
+    OP_NOP, OP_TIMEOUT, OP_READ, OP_WRITE, OP_IRQ_WAIT,
 };
 use libkernel::irq_mutex::IrqMutex;
 use libkernel::file::{FileHandle, FileError, FdObject};
@@ -51,6 +52,30 @@ impl Future for HandleWriteFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.handle.poll_write(cx, &self.buf)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CancellableDelay — a Delay that completes early when a cancel flag is set
+
+struct CancellableDelay {
+    delay: timer::Delay,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Future for CancellableDelay {
+    /// Returns `true` if the delay expired naturally, `false` if cancelled.
+    type Output = bool;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
+        if self.cancel.load(Ordering::Acquire) {
+            return Poll::Ready(false);
+        }
+        let this = self.get_mut();
+        match Pin::new(&mut this.delay).poll(cx) {
+            Poll::Ready(()) => Poll::Ready(true),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -103,6 +128,18 @@ fn get_file_handle(fd: i32) -> Result<Arc<dyn FileHandle>, i64> {
     match process::with_process_ref(pid, |p| p.get_fd(fd as usize)) {
         Some(Ok(obj)) => match obj.as_file() {
             Some(h) => Ok(h.clone()),
+            None => Err(-errno::EBADF),
+        },
+        _ => Err(-errno::EBADF),
+    }
+}
+
+/// Get an IRQ handle from the current process's fd table.
+fn get_irq_handle(fd: i32) -> Result<Arc<libkernel::irq_mutex::IrqMutex<libkernel::irq_handle::IrqInner>>, i64> {
+    let pid = process::current_pid();
+    match process::with_process_ref(pid, |p| p.get_fd(fd as usize)) {
+        Some(Ok(obj)) => match obj.as_irq() {
+            Some(i) => Ok(i.clone()),
             None => Err(-errno::EBADF),
         },
         _ => Err(-errno::EBADF),
@@ -313,6 +350,26 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                 }
             }
 
+            OP_IRQ_WAIT => {
+                let irq = match get_irq_handle(sub.fd) {
+                    Ok(i) => i,
+                    Err(_) => {
+                        port.lock().post(Completion {
+                            user_data: sub.user_data,
+                            result: -errno::EBADF,
+                            flags: 0,
+                            opcode: OP_IRQ_WAIT,
+                            read_buf: None,
+                            read_dest: 0,
+                        });
+                        processed += 1;
+                        continue;
+                    }
+                };
+                // Arm: register port + user_data, unmask the GSI.
+                libkernel::irq_handle::arm_irq(&irq, port.clone(), sub.user_data);
+            }
+
             _ => {
                 port.lock().post(Completion {
                     user_data: sub.user_data,
@@ -364,14 +421,23 @@ pub fn sys_io_wait(port_fd: i32, completions_ptr: u64, max: u32, min: u32, timeo
         None
     };
 
-    // If timeout > 0, spawn a timer task to wake us on deadline
+    // If timeout > 0, spawn a cancellable timer task to wake us on deadline.
+    // The cancel flag is set when io_wait returns early, so the timer task
+    // stops re-registering wakers and frees its WAKERS slot promptly.
     let thread_idx = scheduler::current_thread_idx();
+    let cancel = Arc::new(AtomicBool::new(false));
     if let Some(deadline_tick) = deadline {
         let ms = deadline_tick.saturating_sub(timer::ticks());
+        let cancel_clone = cancel.clone();
         executor::spawn(Task::new(async move {
-            timer::Delay::from_millis(ms).await;
-            // Spurious wakeup if already unblocked — unblock on non-Blocked is a no-op
-            scheduler::unblock(thread_idx);
+            let expired = CancellableDelay {
+                delay: timer::Delay::from_millis(ms),
+                cancel: cancel_clone,
+            }.await;
+            if expired {
+                // Spurious wakeup if already unblocked — unblock on non-Blocked is a no-op
+                scheduler::unblock(thread_idx);
+            }
         }));
     }
 
@@ -415,6 +481,8 @@ pub fn sys_io_wait(port_fd: i32, completions_ptr: u64, max: u32, min: u32, timeo
                         opcode: c.opcode,
                     };
                 }
+                // Cancel the timeout task so it stops occupying a WAKERS slot.
+                cancel.store(true, Ordering::Release);
                 return count as i64;
             }
 

@@ -8,5 +8,6 @@ pub mod errno;
 pub mod exec;
 pub mod file;
 pub mod io_port;
+pub mod irq;
 pub mod spawn;
 pub mod syscall_nr;

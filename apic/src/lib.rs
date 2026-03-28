@@ -100,6 +100,87 @@ fn route_isa_irq(io_apics: &[MappedIoApic], isa_irq: u8, vector: u8, lapic_id: u
     warn!("[apic] route_isa_irq: no IO APIC found for gsi={}", gsi);
 }
 
+// ---------------------------------------------------------------------------
+// Public GSI management (for IRQ fd infrastructure)
+
+/// Program an IO APIC redirection entry for `gsi` → `vector`, targeting LAPIC 0
+/// (BSP), edge-triggered, active-high. The entry is initially **masked**.
+/// Returns `true` if the GSI was found in an IO APIC.
+pub fn route_gsi(gsi: u32, vector: u8) -> bool {
+    let io_apics = IO_APICS.lock();
+    for apic in io_apics.iter() {
+        let max = apic.max_redirect_entries();
+        let end_gsi = apic.interrupt_base + max + 1;
+        if gsi >= apic.interrupt_base && gsi < end_gsi {
+            let offset = gsi - apic.interrupt_base;
+            // Program the entry as masked (set_irq unmasks, so we program then mask).
+            apic.set_irq(offset, vector, 0, false, false);
+            apic.mask_entry(offset);
+            info!("[apic] route_gsi: gsi={} vector={:#x} (masked)", gsi, vector);
+            return true;
+        }
+    }
+    warn!("[apic] route_gsi: no IO APIC found for gsi={}", gsi);
+    false
+}
+
+/// Mask the IO APIC redirection entry for the given GSI.
+pub fn mask_gsi(gsi: u32) {
+    let io_apics = IO_APICS.lock();
+    for apic in io_apics.iter() {
+        let max = apic.max_redirect_entries();
+        let end_gsi = apic.interrupt_base + max + 1;
+        if gsi >= apic.interrupt_base && gsi < end_gsi {
+            let offset = gsi - apic.interrupt_base;
+            apic.mask_entry(offset);
+            return;
+        }
+    }
+}
+
+/// Read the full 64-bit IO APIC redirection entry for the given GSI.
+/// Returns `None` if the GSI is not handled by any IO APIC.
+pub fn read_gsi_entry(gsi: u32) -> Option<u64> {
+    let io_apics = IO_APICS.lock();
+    for apic in io_apics.iter() {
+        let max = apic.max_redirect_entries();
+        let end_gsi = apic.interrupt_base + max + 1;
+        if gsi >= apic.interrupt_base && gsi < end_gsi {
+            let offset = gsi - apic.interrupt_base;
+            return Some(apic.read_redirect_entry(offset));
+        }
+    }
+    None
+}
+
+/// Write a full 64-bit IO APIC redirection entry for the given GSI.
+pub fn write_gsi_entry(gsi: u32, entry: u64) {
+    let io_apics = IO_APICS.lock();
+    for apic in io_apics.iter() {
+        let max = apic.max_redirect_entries();
+        let end_gsi = apic.interrupt_base + max + 1;
+        if gsi >= apic.interrupt_base && gsi < end_gsi {
+            let offset = gsi - apic.interrupt_base;
+            apic.write_redirect_entry(offset, entry);
+            return;
+        }
+    }
+}
+
+/// Unmask the IO APIC redirection entry for the given GSI.
+pub fn unmask_gsi(gsi: u32) {
+    let io_apics = IO_APICS.lock();
+    for apic in io_apics.iter() {
+        let max = apic.max_redirect_entries();
+        let end_gsi = apic.interrupt_base + max + 1;
+        if gsi >= apic.interrupt_base && gsi < end_gsi {
+            let offset = gsi - apic.interrupt_base;
+            apic.unmask_entry(offset);
+            return;
+        }
+    }
+}
+
 fn init_io_apic(io_apic: &AcpiIoApic, remap_addr: VirtAddr, mem: &mut MemoryServices) -> MappedIoApic {
     map(remap_addr, PhysAddr::new(io_apic.address as u64), mem);
 

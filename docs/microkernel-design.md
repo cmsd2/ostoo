@@ -307,8 +307,9 @@ independently useful:
 
 1. **`mmap(MAP_SHARED)`** — shared memory between processes (needed for
    efficient multi-process programs even without microkernel goals)
-2. **IRQ fd** — `IrqHandle` implementing `FileHandle`, blocks on read until
-   interrupt fires
+2. **IRQ fd** — `irq_create(gsi)` syscall (504) returns an fd backed by
+   `FdObject::Irq`.  Used with `OP_IRQ_WAIT` on a completion port.
+   **Implemented** (see `libkernel/src/irq_handle.rs`, `osl/src/irq.rs`)
 3. **Device MMIO mapping** — map physical BAR regions to userspace via an fd
 4. **DMA allocation syscall** — allocate pinned, physically-contiguous pages
    accessible from userspace
