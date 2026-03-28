@@ -36,3 +36,6 @@ pub const SYS_SET_ROBUST_LIST: u64 = 273;
 pub const SYS_PIPE2: u64 = 293;
 pub const SYS_GETRANDOM: u64 = 318;
 pub const SYS_SPAWN: u64 = 500;
+pub const SYS_IO_CREATE: u64 = 501;
+pub const SYS_IO_SUBMIT: u64 = 502;
+pub const SYS_IO_WAIT: u64 = 503;

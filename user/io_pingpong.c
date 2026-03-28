@@ -1,0 +1,233 @@
+/*
+ * io_pingpong — Two-process pipe ping-pong using completion ports.
+ *
+ * Parent creates two pipe pairs, spawns io_pong as a child,
+ * then uses a completion port to submit OP_READ + OP_TIMEOUT
+ * for each round.
+ */
+
+#include <unistd.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <spawn.h>
+
+/* ── helpers ─────────────────────────────────────────────────────────── */
+
+static void puts_stdout(const char *s) {
+    write(1, s, strlen(s));
+}
+
+static void put_char(char c) {
+    write(1, &c, 1);
+}
+
+static void put_num(long n) {
+    char buf[20];
+    int i = 0;
+    int neg = 0;
+    if (n < 0) { neg = 1; n = -n; }
+    if (n == 0) { put_char('0'); return; }
+    while (n > 0) {
+        buf[i++] = '0' + (n % 10);
+        n /= 10;
+    }
+    if (neg) put_char('-');
+    while (--i >= 0) put_char(buf[i]);
+}
+
+/* int-to-string for fd args */
+static void itoa_buf(int val, char *buf, int bufsz) {
+    int i = 0;
+    int neg = 0;
+    if (val < 0) { neg = 1; val = -val; }
+    char tmp[20];
+    if (val == 0) { tmp[i++] = '0'; }
+    while (val > 0 && i < 18) {
+        tmp[i++] = '0' + (val % 10);
+        val /= 10;
+    }
+    int pos = 0;
+    if (neg && pos < bufsz - 1) buf[pos++] = '-';
+    while (--i >= 0 && pos < bufsz - 1) buf[pos++] = tmp[i];
+    buf[pos] = '\0';
+}
+
+/* ── syscall wrappers ────────────────────────────────────────────────── */
+
+#define SYS_IO_CREATE 501
+#define SYS_IO_SUBMIT 502
+#define SYS_IO_WAIT   503
+
+#define OP_NOP     0
+#define OP_TIMEOUT 1
+#define OP_READ    2
+#define OP_WRITE   3
+
+struct io_submission {
+    unsigned long user_data;
+    unsigned int  opcode;
+    unsigned int  flags;
+    int           fd;
+    int           _pad;
+    unsigned long buf_addr;
+    unsigned int  buf_len;
+    unsigned int  offset;
+    unsigned long timeout_ns;
+};
+
+struct io_completion {
+    unsigned long user_data;
+    long          result;
+    unsigned int  flags;
+    unsigned int  opcode;
+};
+
+static long io_create(unsigned int flags) {
+    return syscall(SYS_IO_CREATE, flags);
+}
+
+static long io_submit(int port_fd, struct io_submission *entries, unsigned int count) {
+    return syscall(SYS_IO_SUBMIT, port_fd, entries, count);
+}
+
+static long io_wait(int port_fd, struct io_completion *comps, unsigned int max,
+                    unsigned int min, unsigned long timeout_ns) {
+    return syscall(SYS_IO_WAIT, port_fd, comps, max, min, timeout_ns);
+}
+
+/* ── main ────────────────────────────────────────────────────────────── */
+
+#define TAG_READ    100
+#define TAG_TIMER   200
+#define ROUNDS      5
+
+int main(void) {
+    puts_stdout("io_pingpong: starting\n");
+
+    /* Create two pipe pairs: parent→child and child→parent */
+    int to_child[2];    /* [0]=read, [1]=write */
+    int from_child[2];  /* [0]=read, [1]=write */
+
+    if (syscall(293, to_child, 0) < 0) {
+        puts_stdout("pipe2(to_child) failed\n");
+        _exit(1);
+    }
+    if (syscall(293, from_child, 0) < 0) {
+        puts_stdout("pipe2(from_child) failed\n");
+        _exit(1);
+    }
+
+    /* Before spawning, dup child's fds to known numbers:
+     * Child expects:  argv[1] = read fd (to_child[0])
+     *                 argv[2] = write fd (from_child[1])
+     */
+    char rd_str[8], wr_str[8];
+    itoa_buf(to_child[0], rd_str, sizeof(rd_str));
+    itoa_buf(from_child[1], wr_str, sizeof(wr_str));
+
+    /* Spawn io_pong child */
+    pid_t child_pid;
+    char *child_argv[] = { "/io_pong", rd_str, wr_str, (char *)0 };
+    int err = posix_spawn(&child_pid, "/io_pong", 0, 0, child_argv, (char **)0);
+    if (err != 0) {
+        puts_stdout("posix_spawn(io_pong) failed\n");
+        _exit(1);
+    }
+
+    puts_stdout("io_pingpong: child pid = ");
+    put_num(child_pid);
+    put_char('\n');
+
+    /* Close child's ends in parent */
+    close(to_child[0]);
+    close(from_child[1]);
+
+    /* Create completion port */
+    long port_fd = io_create(0);
+    if (port_fd < 0) {
+        puts_stdout("io_create failed\n");
+        _exit(1);
+    }
+
+    char send_buf[64];
+    char recv_buf[64];
+
+    for (int round = 0; round < ROUNDS; round++) {
+        /* Format and send "ping N" */
+        memset(send_buf, 0, sizeof(send_buf));
+        const char *prefix = "ping ";
+        int plen = (int)strlen(prefix);
+        memcpy(send_buf, prefix, plen);
+        /* append round number */
+        char numstr[8];
+        itoa_buf(round, numstr, sizeof(numstr));
+        int nlen = (int)strlen(numstr);
+        memcpy(send_buf + plen, numstr, nlen);
+        int msg_len = plen + nlen;
+
+        write(to_child[1], send_buf, msg_len);
+
+        puts_stdout("  sent: ");
+        write(1, send_buf, msg_len);
+        put_char('\n');
+
+        /* Submit OP_READ + OP_TIMEOUT to the port */
+        struct io_submission subs[2];
+        memset(subs, 0, sizeof(subs));
+
+        memset(recv_buf, 0, sizeof(recv_buf));
+        subs[0].user_data = TAG_READ;
+        subs[0].opcode = OP_READ;
+        subs[0].fd = from_child[0];
+        subs[0].buf_addr = (unsigned long)recv_buf;
+        subs[0].buf_len = sizeof(recv_buf) - 1;
+
+        subs[1].user_data = TAG_TIMER;
+        subs[1].opcode = OP_TIMEOUT;
+        subs[1].timeout_ns = 1000000000UL; /* 1 second */
+
+        io_submit((int)port_fd, subs, 2);
+
+        /* Wait for at least 1 completion */
+        struct io_completion comps[2];
+        long got = io_wait((int)port_fd, comps, 2, 1, 0);
+
+        for (long i = 0; i < got; i++) {
+            if (comps[i].user_data == TAG_READ && comps[i].result > 0) {
+                puts_stdout("  recv: ");
+                write(1, recv_buf, (size_t)comps[i].result);
+                put_char('\n');
+            } else if (comps[i].user_data == TAG_TIMER) {
+                puts_stdout("  (timer fired)\n");
+            }
+        }
+
+        /* If we only got the timer, drain the read too (or vice versa) */
+        if (got == 1) {
+            long got2 = io_wait((int)port_fd, comps, 1, 1, 2000000000UL);
+            for (long i = 0; i < got2; i++) {
+                if (comps[i].user_data == TAG_READ && comps[i].result > 0) {
+                    puts_stdout("  recv: ");
+                    write(1, recv_buf, (size_t)comps[i].result);
+                    put_char('\n');
+                } else if (comps[i].user_data == TAG_TIMER) {
+                    puts_stdout("  (timer fired)\n");
+                }
+            }
+        }
+    }
+
+    /* Close pipes to signal EOF to child */
+    close(to_child[1]);
+    close(from_child[0]);
+    close((int)port_fd);
+
+    /* Wait for child */
+    int status = 0;
+    waitpid(child_pid, &status, 0);
+
+    puts_stdout("io_pingpong: done\n");
+    _exit(0);
+    return 0;
+}

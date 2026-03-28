@@ -9,7 +9,7 @@ use x86_64::structures::paging::PageTableFlags;
 use crate::errno;
 use crate::syscall_nr::*;
 use libkernel::consts::{PAGE_SIZE, PAGE_MASK};
-use libkernel::file::{FileHandle, FdEntry, FD_CLOEXEC};
+use libkernel::file::{FileHandle, FdEntry, FdObject, FD_CLOEXEC};
 
 pub(crate) const USER_DATA_FLAGS: PageTableFlags = PageTableFlags::PRESENT
     .union(PageTableFlags::WRITABLE)
@@ -77,6 +77,9 @@ fn syscall_inner(
         SYS_PIPE2          => sys_pipe2(a1, a2),
         SYS_GETRANDOM      => sys_getrandom(a1, a2, a3),
         SYS_SPAWN          => sys_spawn(a1, a2, a3, a4),
+        SYS_IO_CREATE      => crate::io_port::sys_io_create(a1 as u32),
+        SYS_IO_SUBMIT      => crate::io_port::sys_io_submit(a1 as i32, a2, a3 as u32),
+        SYS_IO_WAIT        => crate::io_port::sys_io_wait(a1 as i32, a2, a3 as u32, a4 as u32, a5),
         other              => {
             log::warn!("unhandled syscall nr={} a1={:#x} a2={:#x} a3={:#x}",
                 other, a1, a2, a3);
@@ -111,10 +114,14 @@ pub(crate) fn read_user_string(ptr: u64, max_len: usize) -> Option<alloc::string
 }
 
 /// Get a file handle from the current process's fd table, returning a Linux errno on failure.
+/// Returns EBADF if the fd refers to a non-file object (e.g. a completion port).
 fn get_fd_handle(fd: u64) -> Result<Arc<dyn FileHandle>, i64> {
     let pid = libkernel::process::current_pid();
     match libkernel::process::with_process_ref(pid, |p| p.get_fd(fd as usize)) {
-        Some(Ok(h)) => Ok(h),
+        Some(Ok(obj)) => match obj.as_file() {
+            Some(h) => Ok(h.clone()),
+            None => Err(-errno::EBADF),
+        },
         Some(Err(e)) => Err(errno::file_errno(e)),
         None => Err(-errno::EBADF),
     }
@@ -378,7 +385,7 @@ fn sys_open(path_ptr: u64, flags: u64, _mode: u64) -> i64 {
         match vfs_read_file(&resolved, pid) {
             Ok(data) => {
                 let handle: Arc<dyn FileHandle> = Arc::new(crate::file::VfsHandle::new(data));
-                return match libkernel::process::with_process(pid, |p| p.alloc_fd(handle)) {
+                return match libkernel::process::with_process(pid, |p| p.alloc_fd(FdObject::File(handle))) {
                     Some(Ok(fd)) => fd as i64,
                     Some(Err(e)) => errno::file_errno(e),
                     None => -errno::EBADF,
@@ -394,8 +401,8 @@ fn sys_open(path_ptr: u64, flags: u64, _mode: u64) -> i64 {
     // Try as directory.
     match vfs_list_dir(&resolved) {
         Ok(entries) => {
-            let handle = Arc::new(crate::file::DirHandle::new(entries));
-            match libkernel::process::with_process(pid, |p| p.alloc_fd(handle)) {
+            let handle: Arc<dyn FileHandle> = Arc::new(crate::file::DirHandle::new(entries));
+            match libkernel::process::with_process(pid, |p| p.alloc_fd(FdObject::File(handle))) {
                 Some(Ok(fd)) => fd as i64,
                 Some(Err(e)) => errno::file_errno(e),
                 None => -errno::EBADF,
@@ -585,8 +592,8 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> i64 {
     let pid = libkernel::process::current_pid();
     match libkernel::process::with_process(pid, |p| {
         let entry = p.get_fd_entry(oldfd)?;
-        // New entry inherits the handle but NOT the CLOEXEC flag (POSIX).
-        p.set_fd(newfd, FdEntry::new(entry.handle));
+        // New entry inherits the object but NOT the CLOEXEC flag (POSIX).
+        p.set_fd(newfd, FdEntry::from_object(entry.object, 0));
         Ok(newfd)
     }) {
         Some(Ok(fd)) => fd as i64,
@@ -610,8 +617,8 @@ fn sys_pipe2(fds_ptr: u64, flags: u64) -> i64 {
 
     let pid = libkernel::process::current_pid();
     match libkernel::process::with_process(pid, |p| {
-        let rfd = p.alloc_fd_with_flags(Arc::new(reader), fd_flags)?;
-        let wfd = match p.alloc_fd_with_flags(Arc::new(writer), fd_flags) {
+        let rfd = p.alloc_fd_with_flags(FdObject::File(Arc::new(reader)), fd_flags)?;
+        let wfd = match p.alloc_fd_with_flags(FdObject::File(Arc::new(writer)), fd_flags) {
             Ok(fd) => fd,
             Err(e) => {
                 p.close_fd(rfd).ok();

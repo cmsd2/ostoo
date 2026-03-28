@@ -34,6 +34,7 @@ pub mod process;
 pub mod elf;
 pub mod md5;
 pub mod file;
+pub mod completion_port;
 pub mod console;
 pub mod consts;
 pub mod msr;

@@ -3,6 +3,10 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use snafu::Snafu;
+use spin::Mutex;
+
+use crate::completion_port::CompletionPort;
+use crate::irq_mutex::IrqMutex;
 
 // ---------------------------------------------------------------------------
 // FD flags
@@ -11,28 +15,86 @@ use snafu::Snafu;
 pub const FD_CLOEXEC: u32 = 1;
 
 // ---------------------------------------------------------------------------
-// FdEntry — wraps a FileHandle + per-FD flags
+// FdObject — what a file descriptor actually refers to
 
-/// A file descriptor table entry: the handle plus per-FD flags (e.g. CLOEXEC).
+/// The kernel object referenced by a file descriptor.
+pub enum FdObject {
+    /// A regular I/O endpoint (console, pipe, VFS file, directory).
+    File(Arc<dyn FileHandle>),
+    /// A completion port for async I/O notification.
+    Port(Arc<IrqMutex<CompletionPort>>),
+}
+
+impl Clone for FdObject {
+    fn clone(&self) -> Self {
+        match self {
+            FdObject::File(h) => FdObject::File(h.clone()),
+            FdObject::Port(p) => FdObject::Port(p.clone()),
+        }
+    }
+}
+
+impl FdObject {
+    /// Close the underlying object.
+    pub fn close(&self) {
+        match self {
+            FdObject::File(h) => h.close(),
+            FdObject::Port(_) => {} // no-op
+        }
+    }
+
+    /// Get the inner FileHandle, if this is a File.
+    pub fn as_file(&self) -> Option<&Arc<dyn FileHandle>> {
+        match self {
+            FdObject::File(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// Get the inner CompletionPort, if this is a Port.
+    pub fn as_port(&self) -> Option<&Arc<IrqMutex<CompletionPort>>> {
+        match self {
+            FdObject::Port(p) => Some(p),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FdEntry — wraps an FdObject + per-FD flags
+
+/// A file descriptor table entry: the object plus per-FD flags (e.g. CLOEXEC).
 pub struct FdEntry {
-    pub handle: Arc<dyn FileHandle>,
+    pub object: FdObject,
     pub flags: u32,
 }
 
 impl FdEntry {
     pub fn new(handle: Arc<dyn FileHandle>) -> Self {
-        FdEntry { handle, flags: 0 }
+        FdEntry { object: FdObject::File(handle), flags: 0 }
     }
 
     pub fn with_flags(handle: Arc<dyn FileHandle>, flags: u32) -> Self {
-        FdEntry { handle, flags }
+        FdEntry { object: FdObject::File(handle), flags }
+    }
+
+    pub fn new_port(port: Arc<IrqMutex<CompletionPort>>) -> Self {
+        FdEntry { object: FdObject::Port(port), flags: 0 }
+    }
+
+    pub fn port_with_flags(port: Arc<IrqMutex<CompletionPort>>, flags: u32) -> Self {
+        FdEntry { object: FdObject::Port(port), flags }
+    }
+
+    pub fn from_object(object: FdObject, flags: u32) -> Self {
+        FdEntry { object, flags }
     }
 }
 
 impl Clone for FdEntry {
     fn clone(&self) -> Self {
         FdEntry {
-            handle: self.handle.clone(),
+            object: self.object.clone(),
             flags: self.flags,
         }
     }
@@ -104,7 +166,6 @@ impl FileHandle for ConsoleHandle {
 // Pipe — in-kernel pipe for IPC
 
 use alloc::collections::VecDeque;
-use spin::Mutex;
 
 struct PipeInner {
     buffer: VecDeque<u8>,

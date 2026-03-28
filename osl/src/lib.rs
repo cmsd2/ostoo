@@ -7,5 +7,6 @@ pub mod dispatch;
 pub mod errno;
 pub mod exec;
 pub mod file;
+pub mod io_port;
 pub mod spawn;
 pub mod syscall_nr;

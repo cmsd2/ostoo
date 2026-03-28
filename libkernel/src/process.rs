@@ -1,12 +1,11 @@
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::PhysAddr;
 
-use crate::file::{FileHandle, FileError, FdEntry, FD_CLOEXEC};
+use crate::file::{FileError, FdEntry, FdObject, FD_CLOEXEC};
 
 // ---------------------------------------------------------------------------
 // ProcessId
@@ -108,24 +107,24 @@ impl Process {
         }
     }
 
-    /// Allocate the lowest available file descriptor for the given handle.
-    pub fn alloc_fd(&mut self, handle: Arc<dyn FileHandle>) -> Result<usize, FileError> {
-        self.alloc_fd_with_flags(handle, 0)
+    /// Allocate the lowest available file descriptor for the given object.
+    pub fn alloc_fd(&mut self, object: FdObject) -> Result<usize, FileError> {
+        self.alloc_fd_with_flags(object, 0)
     }
 
     /// Allocate the lowest available file descriptor with the given flags.
-    pub fn alloc_fd_with_flags(&mut self, handle: Arc<dyn FileHandle>, flags: u32) -> Result<usize, FileError> {
+    pub fn alloc_fd_with_flags(&mut self, object: FdObject, flags: u32) -> Result<usize, FileError> {
         // Search for the first None slot.
         for (i, slot) in self.fd_table.iter().enumerate() {
             if slot.is_none() {
-                self.fd_table[i] = Some(FdEntry::with_flags(handle, flags));
+                self.fd_table[i] = Some(FdEntry::from_object(object, flags));
                 return Ok(i);
             }
         }
         // No free slot — extend if under limit.
         if self.fd_table.len() < crate::file::MAX_FDS {
             let fd = self.fd_table.len();
-            self.fd_table.push(Some(FdEntry::with_flags(handle, flags)));
+            self.fd_table.push(Some(FdEntry::from_object(object, flags)));
             Ok(fd)
         } else {
             Err(FileError::TooManyOpenFiles)
@@ -138,15 +137,15 @@ impl Process {
             return Err(FileError::BadFd);
         }
         match self.fd_table[fd].take() {
-            Some(entry) => { entry.handle.close(); Ok(()) }
+            Some(entry) => { entry.object.close(); Ok(()) }
             None => Err(FileError::BadFd),
         }
     }
 
-    /// Get a handle to an open file descriptor.
-    pub fn get_fd(&self, fd: usize) -> Result<Arc<dyn FileHandle>, FileError> {
+    /// Get the object for an open file descriptor.
+    pub fn get_fd(&self, fd: usize) -> Result<FdObject, FileError> {
         self.fd_table.get(fd)
-            .and_then(|slot| slot.as_ref().map(|e| e.handle.clone()))
+            .and_then(|slot| slot.as_ref().map(|e| e.object.clone()))
             .ok_or(FileError::BadFd)
     }
 
@@ -174,7 +173,7 @@ impl Process {
         }
         // Close existing fd silently.
         if let Some(old) = self.fd_table[fd].take() {
-            old.handle.close();
+            old.object.close();
         }
         self.fd_table[fd] = Some(entry);
     }
@@ -191,7 +190,7 @@ impl Process {
         for slot in self.fd_table.iter_mut() {
             if let Some(entry) = slot {
                 if entry.flags & FD_CLOEXEC != 0 {
-                    entry.handle.close();
+                    entry.object.close();
                     *slot = None;
                 }
             }
