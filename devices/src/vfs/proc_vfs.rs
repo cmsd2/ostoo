@@ -102,9 +102,9 @@ fn gen_meminfo() -> String {
         heap_used, heap_free, heap_total / 1024);
 
     // Frame allocator
-    let (frames_alloc, frames_total) = libkernel::memory::with_memory(|m| m.frame_stats());
-    let _ = writeln!(s, "Frames: {} allocated / {} usable ({} MiB usable)",
-        frames_alloc, frames_total, frames_total as u64 * 4 / 1024);
+    let (frames_alloc, frames_total, free_list) = libkernel::memory::with_memory(|m| m.frame_stats());
+    let _ = writeln!(s, "Frames: {} allocated / {} usable ({} MiB usable), {} on free list",
+        frames_alloc, frames_total, frames_total as u64 * 4 / 1024, free_list);
 
     // Known virtual regions
     let _ = writeln!(s, "Known virtual regions:");

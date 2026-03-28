@@ -239,6 +239,85 @@ impl Process {
             .ok_or(FileError::BadFd)
     }
 
+    /// Remove or split VMAs that overlap `[start .. start+len)`.
+    ///
+    /// Returns a list of `(page_base, page_count)` ranges whose pages should
+    /// be unmapped and freed by the caller (with MEMORY lock held separately).
+    pub fn munmap_vmas(&mut self, start: u64, len: u64) -> Vec<(u64, usize)> {
+        let end = start + len;
+        let page_size = crate::consts::PAGE_SIZE;
+
+        // Collect keys of VMAs that overlap [start, end).
+        let overlapping: Vec<u64> = self.vma_map.range(..end)
+            .filter(|(_, vma)| vma.start + vma.len > start)
+            .map(|(&k, _)| k)
+            .collect();
+
+        let mut pages_to_free: Vec<(u64, usize)> = Vec::new();
+        let mut to_remove: Vec<u64> = Vec::new();
+        let mut to_insert: Vec<(u64, Vma)> = Vec::new();
+
+        for key in &overlapping {
+            let vma = &self.vma_map[key];
+            let vma_start = vma.start;
+            let vma_end = vma.start + vma.len;
+
+            if start <= vma_start && end >= vma_end {
+                // Case 1: entire VMA consumed
+                let count = (vma.len / page_size) as usize;
+                pages_to_free.push((vma_start, count));
+                to_remove.push(*key);
+            } else if start <= vma_start && end < vma_end {
+                // Case 2: front consumed — shrink start
+                let removed = end - vma_start;
+                let count = (removed / page_size) as usize;
+                pages_to_free.push((vma_start, count));
+                let mut new_vma = vma.clone();
+                new_vma.start = end;
+                new_vma.len = vma.len - removed;
+                to_remove.push(*key);
+                to_insert.push((end, new_vma));
+            } else if start > vma_start && end >= vma_end {
+                // Case 3: tail consumed — shrink len
+                let removed = vma_end - start;
+                let count = (removed / page_size) as usize;
+                pages_to_free.push((start, count));
+                let mut new_vma = vma.clone();
+                new_vma.len = start - vma_start;
+                to_remove.push(*key);
+                to_insert.push((vma_start, new_vma));
+            } else {
+                // Case 4: middle consumed — split into two fragments
+                let removed = end - start;
+                let count = (removed / page_size) as usize;
+                pages_to_free.push((start, count));
+
+                // Left fragment: [vma_start, start)
+                let mut left = vma.clone();
+                left.len = start - vma_start;
+
+                // Right fragment: [end, vma_end)
+                let mut right = vma.clone();
+                right.start = end;
+                right.len = vma_end - end;
+
+                to_remove.push(*key);
+                to_insert.push((vma_start, left));
+                to_insert.push((end, right));
+            }
+        }
+
+        // Apply mutations
+        for key in to_remove {
+            self.vma_map.remove(&key);
+        }
+        for (key, vma) in to_insert {
+            self.vma_map.insert(key, vma);
+        }
+
+        pages_to_free
+    }
+
     /// Close all file descriptors that have FD_CLOEXEC set.
     pub fn close_cloexec_fds(&mut self) {
         for slot in self.fd_table.iter_mut() {

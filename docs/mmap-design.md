@@ -25,7 +25,8 @@ Each phase is self-contained and independently testable.
 
 ### munmap (syscall 11)
 
-Stub — returns 0 but does not unmap pages or free frames.
+Implemented — unmaps pages, frees frames to the free list, and splits/removes
+VMAs.  Supports partial unmaps (front, tail, middle split).
 
 ### mprotect (syscall 10)
 
@@ -92,7 +93,7 @@ userspace — should page-fault.
 
 ---
 
-## Phase 2: Frame Free List + munmap
+## Phase 2: Frame Free List + munmap ✓ (implemented)
 
 **Goal:** Actually free physical frames when `munmap` is called.
 
@@ -140,6 +141,22 @@ fn sys_munmap(addr: u64, length: u64) -> i64
 | `libkernel/src/memory/` | Add `unmap_user_page`, frame free list |
 | `osl/src/dispatch.rs` | Implement `sys_munmap` |
 | `libkernel/src/process.rs` | VMA split/remove helpers |
+
+### Contiguous DMA allocations
+
+`alloc_dma_pages(pages)` with `pages > 1` bypasses the free list and uses
+`allocate_frame_sequential` to guarantee physical contiguity.  The sequential
+allocator walks the boot-time memory map and can be exhausted — once `next`
+exceeds the total usable frames, it returns `None` even if the free list has
+recycled frames available.
+
+In practice this is fine because multi-page contiguous allocations only happen
+during early boot (VirtIO descriptor rings).  If this becomes a problem in the
+future, options include:
+
+- Fall back to the free list for single-frame DMA when sequential is exhausted.
+- Replace the sequential allocator with a buddy allocator that can satisfy
+  contiguous requests from recycled frames.
 
 ### Test
 

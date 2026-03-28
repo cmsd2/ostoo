@@ -158,12 +158,18 @@ impl MemoryServices {
     /// Allocate `pages` physically-contiguous 4 KiB frames for DMA.
     ///
     /// Returns the base physical address, or `None` if frames are exhausted.
-    /// Panics if the allocated frames are not physically contiguous (very
-    /// unlikely with the sequential bootloader frame allocator).
+    /// For `pages > 1`, bypasses the free list to ensure contiguity.
+    /// Panics if the allocated frames are not physically contiguous.
     pub fn alloc_dma_pages(&mut self, pages: usize) -> Option<PhysAddr> {
         let mut base: Option<PhysAddr> = None;
         for i in 0..pages {
-            let frame = self.frame_allocator.allocate_frame()?;
+            // For single-page allocs the free list is fine (trivially contiguous).
+            // For multi-page allocs use the sequential allocator to guarantee contiguity.
+            let frame = if pages > 1 {
+                self.frame_allocator.allocate_frame_sequential()
+            } else {
+                self.frame_allocator.allocate_frame()
+            }?;
             let paddr = frame.start_address();
             if i == 0 {
                 base = Some(paddr);
@@ -199,11 +205,12 @@ impl MemoryServices {
         Ok(())
     }
 
-    /// `(frames_allocated, total_usable_frames)` since boot.
-    pub fn frame_stats(&self) -> (usize, usize) {
+    /// `(frames_allocated, total_usable_frames, free_list_len)` since boot.
+    pub fn frame_stats(&self) -> (usize, usize, usize) {
         (
             self.frame_allocator.frames_allocated(),
             self.frame_allocator.total_usable_frames(),
+            self.frame_allocator.free_list_len(),
         )
     }
 
@@ -279,6 +286,51 @@ impl MemoryServices {
             table.map_to(page, frame, flags, &mut self.frame_allocator)?.ignore();
         }
         Ok(())
+    }
+
+    /// Unmap a single 4 KiB page from a page table rooted at `pml4_phys`.
+    ///
+    /// Returns the physical frame that was mapped, or `None` if the page was
+    /// not mapped. If `flush_tlb` is true the TLB entry is invalidated (use
+    /// when the target PML4 is the active address space).
+    pub fn unmap_user_page(
+        &mut self,
+        pml4_phys: PhysAddr,
+        vaddr: VirtAddr,
+        flush_tlb: bool,
+    ) -> Option<PhysFrame> {
+        let pml4_virt = self.phys_mem_offset + pml4_phys.as_u64();
+        let pml4: &mut PageTable = unsafe { &mut *pml4_virt.as_mut_ptr() };
+        let mut table = unsafe { OffsetPageTable::new(pml4, self.phys_mem_offset) };
+        let page = Page::<Size4KiB>::containing_address(vaddr);
+        match table.unmap(page) {
+            Ok((frame, flush_token)) => {
+                if flush_tlb {
+                    flush_token.flush();
+                } else {
+                    flush_token.ignore();
+                }
+                Some(frame)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Unmap a single user page and return its frame to the free list.
+    ///
+    /// Returns `true` if a frame was freed, `false` if the page was not mapped.
+    pub fn unmap_and_free_user_page(
+        &mut self,
+        pml4_phys: PhysAddr,
+        vaddr: VirtAddr,
+        flush_tlb: bool,
+    ) -> bool {
+        if let Some(frame) = self.unmap_user_page(pml4_phys, vaddr, flush_tlb) {
+            self.frame_allocator.deallocate_frame(frame);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -361,6 +413,10 @@ pub fn init_services(
         max_phys_aligned / (1024 * 1024),
         max_phys_aligned / two_mib,
     );
+
+    // Tell the frame allocator where the physical identity map lives so it
+    // can read/write the intrusive free-list pointers in freed pages.
+    frame_allocator.set_phys_mem_offset(PHYS_MAP_BASE);
 
     let mut m = MEMORY.lock();
     assert!(m.is_none(), "memory::init_services called more than once");

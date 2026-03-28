@@ -49,7 +49,7 @@ fn syscall_inner(
         SYS_LSEEK          => -errno::ESPIPE, // stdout is not seekable
         SYS_MMAP           => sys_mmap(a1, a2, a3, a4, a5),
         SYS_MPROTECT       => 0, // no-op
-        SYS_MUNMAP         => 0, // stub (leak frames)
+        SYS_MUNMAP         => sys_munmap(a1, a2),
         SYS_BRK            => sys_brk(a1),
         SYS_RT_SIGACTION   => 0, // stub (no signal support)
         SYS_RT_SIGPROCMASK => 0, // stub (no signal support)
@@ -371,6 +371,47 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, _a5: u64) -> i64 {
     } else {
         -errno::ENOMEM
     }
+}
+
+fn sys_munmap(addr: u64, length: u64) -> i64 {
+    use libkernel::process;
+    use libkernel::memory::with_memory;
+
+    if addr & PAGE_MASK != 0 || length == 0 {
+        return -errno::EINVAL;
+    }
+
+    let pid = process::current_pid();
+    if pid == process::ProcessId::KERNEL {
+        return -errno::EINVAL;
+    }
+
+    let aligned_len = (length + PAGE_MASK) & !PAGE_MASK;
+
+    // Step 1: split/remove VMAs (PROCESS_TABLE lock).
+    let result = process::with_process(pid, |p| {
+        (p.pml4_phys, p.munmap_vmas(addr, aligned_len))
+    });
+    let (pml4_phys, pages_to_free) = match result {
+        Some(v) => v,
+        None => return -errno::EINVAL,
+    };
+
+    if pages_to_free.is_empty() {
+        return 0; // Linux no-op semantics: no overlap is not an error
+    }
+
+    // Step 2: unmap and free pages (MEMORY lock, separate from PROCESS_TABLE).
+    with_memory(|mem| {
+        for (base, count) in &pages_to_free {
+            for i in 0..*count {
+                let vaddr = x86_64::VirtAddr::new(base + (i as u64) * PAGE_SIZE);
+                mem.unmap_and_free_user_page(pml4_phys, vaddr, true);
+            }
+        }
+    });
+
+    0
 }
 
 // ---------------------------------------------------------------------------
