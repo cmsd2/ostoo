@@ -41,7 +41,8 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
     let resolved = resolve_user_path(&path);
 
     // 2. Read ELF from VFS.
-    let elf_data = match vfs_read_file(&resolved) {
+    let pid = libkernel::process::current_pid();
+    let elf_data = match vfs_read_file(&resolved, pid) {
         Ok(data) => data,
         Err(_) => return -errno::ENOENT,
     };

@@ -2,6 +2,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::sync::Arc;
 use lazy_static::lazy_static;
+use libkernel::process::ProcessId;
 use spin::Mutex;
 
 pub mod exfat_vfs;
@@ -50,11 +51,11 @@ impl AnyVfs {
         }
     }
 
-    pub async fn read_file(&self, path: &str) -> Result<Vec<u8>, VfsError> {
+    pub async fn read_file(&self, path: &str, caller_pid: ProcessId) -> Result<Vec<u8>, VfsError> {
         match self {
             AnyVfs::Exfat(fs) => fs.read_file(path).await,
             AnyVfs::Plan9(fs) => fs.read_file(path).await,
-            AnyVfs::Proc(fs)  => fs.read_file(path).await,
+            AnyVfs::Proc(fs)  => fs.read_file(path, caller_pid).await,
         }
     }
 
@@ -154,9 +155,12 @@ fn child_mount_names(dir: &str) -> Vec<String> {
 }
 
 /// Read a file through the VFS.  `path` must be absolute.
-pub async fn read_file(path: &str) -> Result<Vec<u8>, VfsError> {
+///
+/// `caller_pid` identifies the process that initiated the read — used by
+/// proc-fs to generate per-process content like `/proc/maps`.
+pub async fn read_file(path: &str, caller_pid: ProcessId) -> Result<Vec<u8>, VfsError> {
     let (fs, rel) = resolve(path).ok_or(VfsError::NoFilesystem)?;
-    fs.read_file(&rel).await
+    fs.read_file(&rel, caller_pid).await
 }
 
 /// Invoke `f` with a snapshot of the current mount table (for listing).

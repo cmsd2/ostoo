@@ -17,6 +17,7 @@ impl ProcVfs {
                 VfsDirEntry { name: "idt".to_string(),      is_dir: false, size: 0 },
                 VfsDirEntry { name: "ioapic".to_string(),   is_dir: false, size: 0 },
                 VfsDirEntry { name: "lapic".to_string(),    is_dir: false, size: 0 },
+                VfsDirEntry { name: "maps".to_string(),     is_dir: false, size: 0 },
                 VfsDirEntry { name: "meminfo".to_string(),  is_dir: false, size: 0 },
                 VfsDirEntry { name: "memmap".to_string(),   is_dir: false, size: 0 },
                 VfsDirEntry { name: "pci".to_string(),      is_dir: false, size: 0 },
@@ -29,7 +30,7 @@ impl ProcVfs {
         }
     }
 
-    pub async fn read_file(&self, path: &str) -> Result<Vec<u8>, VfsError> {
+    pub async fn read_file(&self, path: &str, caller_pid: libkernel::process::ProcessId) -> Result<Vec<u8>, VfsError> {
         match path {
             "/tasks"   => Ok(gen_tasks().into_bytes()),
             "/uptime"  => Ok(gen_uptime().into_bytes()),
@@ -42,6 +43,7 @@ impl ProcVfs {
             "/idt"     => Ok(gen_idt().into_bytes()),
             "/pci"     => Ok(gen_pci().into_bytes()),
             "/lapic"   => Ok(gen_lapic().into_bytes()),
+            "/maps"    => Ok(gen_maps(caller_pid).into_bytes()),
             "/ioapic"  => Ok(gen_ioapic().into_bytes()),
             _ => Err(VfsError::NotFound),
         }
@@ -347,6 +349,58 @@ fn fmt_flags(flags: x86_64::structures::paging::PageTableFlags) -> [u8; 4] {
 
 fn sign_extend(addr: u64) -> u64 {
     if addr & (1 << 47) != 0 { addr | 0xffff_0000_0000_0000 } else { addr }
+}
+
+// ---------------------------------------------------------------------------
+// maps — per-process memory map (like /proc/self/maps)
+
+fn gen_maps(pid: libkernel::process::ProcessId) -> String {
+    use libkernel::process;
+
+    let mut s = String::new();
+    if pid == process::ProcessId::KERNEL {
+        let _ = writeln!(s, "(kernel — no user address space)");
+        return s;
+    }
+
+    let info = process::with_process_ref(pid, |p| {
+        (
+            p.brk_base,
+            p.brk_current,
+            p.user_stack_top,
+            p.mmap_regions.clone(),
+        )
+    });
+
+    let Some((brk_base, brk_current, user_stack_top, mmap_regions)) = info else {
+        let _ = writeln!(s, "(process not found)");
+        return s;
+    };
+
+    // Heap (brk region)
+    if brk_current > brk_base {
+        let _ = writeln!(s, "{:012x}-{:012x} rw-p 00000000 00:00 0  [heap]",
+            brk_base, brk_current);
+    }
+
+    // mmap regions (anonymous, all currently rw-p)
+    let mut regions = mmap_regions;
+    regions.sort_by_key(|&(start, _)| start);
+    for (start, len) in &regions {
+        let _ = writeln!(s, "{:012x}-{:012x} rw-p 00000000 00:00 0",
+            start, start + len);
+    }
+
+    // User stack — grows down, so the mapped region ends at user_stack_top.
+    // The stack size is 8 pages (32 KiB) as set in osl::spawn / osl::exec.
+    const STACK_SIZE: u64 = 8 * 0x1000;
+    if user_stack_top > STACK_SIZE {
+        let stack_base = user_stack_top - STACK_SIZE;
+        let _ = writeln!(s, "{:012x}-{:012x} rw-p 00000000 00:00 0  [stack]",
+            stack_base, user_stack_top);
+    }
+
+    s
 }
 
 // ---------------------------------------------------------------------------

@@ -323,7 +323,7 @@ async fn status_task() {
 async fn launch_userspace_shell() {
     Delay::from_millis(100).await; // let VFS settle
 
-    let data = match devices::vfs::read_file("/shell").await {
+    let data = match devices::vfs::read_file("/shell", libkernel::process::ProcessId::KERNEL).await {
         Ok(d) => d,
         Err(e) => {
             info!("[kernel] /shell not found ({:?}), using kernel shell", e);

@@ -131,10 +131,10 @@ pub(crate) fn resolve_user_path(path: &str) -> alloc::string::String {
 // ---------------------------------------------------------------------------
 // VFS helpers (direct calls into devices::vfs, no callback trampolines)
 
-pub(crate) fn vfs_read_file(path: &str) -> Result<alloc::vec::Vec<u8>, devices::vfs::VfsError> {
+pub(crate) fn vfs_read_file(path: &str, caller_pid: libkernel::process::ProcessId) -> Result<alloc::vec::Vec<u8>, devices::vfs::VfsError> {
     let path = alloc::string::String::from(path);
     crate::blocking::blocking(async move {
-        devices::vfs::read_file(&path).await
+        devices::vfs::read_file(&path, caller_pid).await
     })
 }
 
@@ -368,16 +368,16 @@ fn sys_open(path_ptr: u64, flags: u64, _mode: u64) -> i64 {
     };
 
     let resolved = resolve_user_path(&path);
+    let pid = libkernel::process::current_pid();
 
     const O_DIRECTORY: u64 = 0o200000;
     let want_dir = flags & O_DIRECTORY != 0;
 
     // Try to open as file first (unless O_DIRECTORY), then fall back to dir.
     if !want_dir {
-        match vfs_read_file(&resolved) {
+        match vfs_read_file(&resolved, pid) {
             Ok(data) => {
-                let handle = Arc::new(crate::file::VfsHandle::new(data));
-                let pid = libkernel::process::current_pid();
+                let handle: Arc<dyn FileHandle> = Arc::new(crate::file::VfsHandle::new(data));
                 return match libkernel::process::with_process(pid, |p| p.alloc_fd(handle)) {
                     Some(Ok(fd)) => fd as i64,
                     Some(Err(e)) => errno::file_errno(e),
@@ -395,7 +395,6 @@ fn sys_open(path_ptr: u64, flags: u64, _mode: u64) -> i64 {
     match vfs_list_dir(&resolved) {
         Ok(entries) => {
             let handle = Arc::new(crate::file::DirHandle::new(entries));
-            let pid = libkernel::process::current_pid();
             match libkernel::process::with_process(pid, |p| p.alloc_fd(handle)) {
                 Some(Ok(fd)) => fd as i64,
                 Some(Err(e)) => errno::file_errno(e),
@@ -517,12 +516,12 @@ fn sys_spawn(path_ptr: u64, path_len: u64, argv_ptr: u64, argv_count: u64) -> i6
     }
 
     // Read ELF from VFS — direct call, no callback trampolines.
-    let elf_data = match vfs_read_file(&resolved) {
+    let parent_pid = libkernel::process::current_pid();
+
+    let elf_data = match vfs_read_file(&resolved, parent_pid) {
         Ok(data) => data,
         Err(_) => return -errno::ENOENT,
     };
-
-    let parent_pid = libkernel::process::current_pid();
     let argv_slices: alloc::vec::Vec<&[u8]> = argv.iter().map(|v| v.as_slice()).collect();
 
     // Direct call to osl::spawn — no function pointer transmute.

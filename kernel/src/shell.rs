@@ -202,7 +202,7 @@ impl Shell {
         let cwd  = self.cwd.lock().clone();
         let path = resolve_path(&cwd, path);
 
-        match devices::vfs::read_file(&path).await {
+        match devices::vfs::read_file(&path, libkernel::process::ProcessId::KERNEL).await {
             Ok(data) => {
                 for &b in &data {
                     if (0x20..0x7F).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
@@ -304,7 +304,7 @@ impl Shell {
         let cwd  = self.cwd.lock().clone();
         let path = resolve_path(&cwd, path);
 
-        let data = match devices::vfs::read_file(&path).await {
+        let data = match devices::vfs::read_file(&path, libkernel::process::ProcessId::KERNEL).await {
             Ok(d) => d,
             Err(e) => { println!("exec: {:?}", e); return; }
         };
@@ -328,7 +328,7 @@ impl Shell {
         let cwd  = self.cwd.lock().clone();
         let path = resolve_path(&cwd, path);
 
-        match devices::vfs::read_file(&path).await {
+        match devices::vfs::read_file(&path, libkernel::process::ProcessId::KERNEL).await {
             Ok(data) => {
                 let digest = libkernel::md5::compute(&data);
                 println!("{}  {}", libkernel::md5::hex(&digest), path);
