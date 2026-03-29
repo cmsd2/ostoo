@@ -14,8 +14,6 @@ pub const SYS_GETCWD: u64 = 79;
 pub const SYS_CHDIR: u64 = 80;
 pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_EXIT_GROUP: u64 = 231;
-pub const SYS_SPAWN: u64 = 500;
-
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> i64 {
     let ret: i64;
@@ -133,18 +131,6 @@ pub fn chdir(path: *const u8) -> i64 {
 
 pub fn getdents64(fd: u32, buf: &mut [u8]) -> i64 {
     unsafe { syscall3(SYS_GETDENTS64, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) }
-}
-
-pub fn spawn(path: &[u8], argv: &[*const u8], argc: usize) -> i64 {
-    unsafe {
-        syscall4(
-            SYS_SPAWN,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            argv.as_ptr() as u64,
-            argc as u64,
-        )
-    }
 }
 
 pub fn wait4(pid: i64, status: *mut u32, options: u64) -> i64 {

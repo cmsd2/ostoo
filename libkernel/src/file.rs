@@ -140,6 +140,8 @@ pub enum FileError {
     NotATty,
     #[snafu(display("too many open files"))]
     TooManyOpenFiles,
+    #[snafu(display("interrupted system call"))]
+    Interrupted,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +197,10 @@ impl FileHandle for ConsoleHandle {
         if !self.readable {
             return Err(FileError::BadFd);
         }
-        Ok(crate::console::read_input(buf))
+        match crate::console::read_input(buf) {
+            crate::console::ReadResult::Data(n) => Ok(n),
+            crate::console::ReadResult::Interrupted => Err(FileError::Interrupted),
+        }
     }
 
     fn poll_read(&self, cx: &mut core::task::Context<'_>, buf: &mut [u8])

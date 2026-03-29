@@ -636,6 +636,9 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) -> ! {
 
     let mut donate_to = None;
     if let Some(parent_pid) = parent_pid {
+        if parent_pid != ProcessId::KERNEL {
+            with_process(parent_pid, |pp| pp.signal.queue(crate::signal::SIGCHLD));
+        }
         let wait_thread = with_process(parent_pid, |pp| pp.wait_thread.take());
         if let Some(Some(thread_idx)) = wait_thread {
             crate::task::scheduler::unblock(thread_idx);

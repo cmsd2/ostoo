@@ -240,6 +240,11 @@ fn kill_user_process(pid: process::ProcessId, exit_code: i32) {
     let parent_pid = process::with_process_ref(pid, |p| p.parent_pid);
     process::mark_zombie(pid, exit_code);
     if let Some(parent_pid) = parent_pid {
+        if parent_pid != process::ProcessId::KERNEL {
+            process::with_process(parent_pid, |pp| {
+                pp.signal.queue(crate::signal::SIGCHLD);
+            });
+        }
         let wait_thread = process::with_process(parent_pid, |pp| pp.wait_thread.take());
         if let Some(Some(thread_idx)) = wait_thread {
             task::scheduler::unblock(thread_idx);
@@ -254,12 +259,21 @@ extern "x86-interrupt" fn breakpoint_handler(
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(
-    stack_frame: InterruptStackFrame)
+    mut stack_frame: InterruptStackFrame)
 {
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         let pid = process::current_pid();
-        error!("ring-3 invalid opcode (pid {}) — killing process\n{:#?}",
+        error!("ring-3 invalid opcode (pid {})\n{:#?}",
             pid.as_u64(), stack_frame);
+
+        // Try to deliver SIGILL to a user-installed signal handler.
+        if crate::syscall::deliver_signal_from_interrupt(
+            pid, crate::signal::SIGILL, &mut stack_frame, 0
+        ) {
+            return;
+        }
+
+        // No handler — kill the process.
         kill_user_process(pid, -4); // SIGILL
         unsafe { core::arch::asm!("swapgs", options(nostack, nomem)); }
         task::scheduler::kill_current_thread();
@@ -426,12 +440,15 @@ extern "x86-interrupt" fn double_fault_handler(
 }
 
 extern "x86-interrupt" fn page_fault_handler(
-    stack_frame: InterruptStackFrame,
+    mut stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
     use x86_64::registers::control::Cr2;
 
     let faulting_addr = Cr2::read();
+    // Read raw CR2 for signal delivery (may be non-canonical).
+    let cr2_raw: u64;
+    unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2_raw, options(nostack, nomem)); }
 
     // Check whether the fault came from ring 3 (RPL field of the saved CS).
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
@@ -439,8 +456,10 @@ extern "x86-interrupt" fn page_fault_handler(
         let rip = stack_frame.instruction_pointer.as_u64();
         let rsp = stack_frame.stack_pointer.as_u64();
         let fs_base = crate::msr::read_fs_base();
+        let cr2_val = cr2_raw;
+
         error!(
-            "ring-3 page fault at {:?} (pid {}, error: {:?}) — killing process\n  \
+            "ring-3 page fault at {:?} (pid {}, error: {:?})\n  \
              RIP={:#x} RSP={:#x} FS_BASE={:#x}",
             faulting_addr, pid.as_u64(), error_code, rip, rsp, fs_base
         );
@@ -465,6 +484,15 @@ extern "x86-interrupt" fn page_fault_handler(
             }
         }
 
+        // Try to deliver SIGSEGV to a user-installed signal handler.
+        if crate::syscall::deliver_signal_from_interrupt(
+            pid, crate::signal::SIGSEGV, &mut stack_frame, cr2_val
+        ) {
+            // Signal frame built, IRETQ will enter the handler.
+            return;
+        }
+
+        // No handler — kill the process.
         kill_user_process(pid, -11); // SIGSEGV
         // Restore kernel GS polarity: the CPU entered the fault handler from
         // ring 3 without swapgs, so GS.BASE is still the user value.  We must

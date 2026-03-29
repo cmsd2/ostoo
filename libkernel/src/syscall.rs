@@ -167,6 +167,11 @@ syscall_entry:
 
     call syscall_dispatch        /* returns i64 in rax */
 
+    /* Re-save frame ptr: a blocking syscall (e.g. read) may have context-
+       switched away, letting another thread's SYSCALL entry overwrite gs:40.
+       After `call` returns RSP points to our pushed frame again. */
+    mov  gs:40, rsp
+
     mov  rdi, rax               /* pass syscall return value as arg */
     call check_pending_signals  /* returns (possibly modified) rax */
 
@@ -457,4 +462,130 @@ fn deliver_signal(
         "[signal] pid={} delivering sig={} handler={:#x} restorer={:#x} frame={:#x} user_rsp={:#x}",
         pid.as_u64(), signum, action.handler, action.restorer, frame_base, user_rsp
     );
+}
+
+// ---------------------------------------------------------------------------
+// Signal delivery from hardware interrupt context (page fault, #UD, etc.)
+//
+// Unlike the SYSCALL path, in an interrupt we have an InterruptStackFrame
+// (managed by the CPU) rather than a SyscallSavedFrame.  We construct the
+// rt_sigframe on the user stack and rewrite the interrupt stack frame so
+// that IRETQ enters the handler.
+
+/// Attempt to deliver a signal to the current process from an interrupt handler.
+///
+/// `stack_frame` is the mutable interrupt stack frame pushed by the CPU.
+/// `signum` is the signal number (e.g. SIGSEGV, SIGILL).
+/// `fault_addr` is the CR2 value for page faults, or 0 for others.
+///
+/// Returns `true` if the signal was delivered (caller should return from the
+/// handler, letting IRETQ jump to the signal handler).  Returns `false` if
+/// no user handler is installed (caller should kill the process).
+///
+/// # Safety
+/// Must only be called from a ring-3 exception handler with the faulting
+/// process's page tables still active.  The CPU entered from ring 3 without
+/// swapgs, so GS is still user polarity — this function does not use GS.
+pub fn deliver_signal_from_interrupt(
+    pid: crate::process::ProcessId,
+    signum: u8,
+    stack_frame: &mut x86_64::structures::idt::InterruptStackFrame,
+    fault_addr: u64,
+) -> bool {
+    use crate::signal::*;
+
+    let action = match crate::process::with_process(pid, |p| {
+        let idx = (signum - 1) as usize;
+        let act = p.signal.actions[idx];
+        // Clear pending bit for this signal since we're delivering it.
+        p.signal.pending &= !(1u64 << (signum - 1));
+        act
+    }) {
+        Some(a) => a,
+        None => return false,
+    };
+
+    // SIG_DFL or SIG_IGN → caller does default action (kill).
+    if action.handler == SIG_DFL || action.handler == SIG_IGN {
+        return false;
+    }
+
+    let user_rsp = stack_frame.stack_pointer.as_u64();
+    let user_rip = stack_frame.instruction_pointer.as_u64();
+    let user_rflags = stack_frame.cpu_flags.bits();
+
+    let old_blocked = crate::process::with_process_ref(pid, |p| p.signal.blocked)
+        .unwrap_or(0);
+
+    // Block sa_mask + the delivered signal during handler execution.
+    crate::process::with_process(pid, |p| {
+        p.signal.blocked |= action.mask | (1u64 << (signum - 1));
+        let unblockable = (1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1));
+        p.signal.blocked &= !unblockable;
+    });
+
+    // Same frame layout as deliver_signal (must match rt_sigreturn).
+    const PRETCODE_SIZE: u64 = 8;
+    const UC_HEADER: u64 = 8 + 8 + 24;
+    const SIGCONTEXT_SIZE: u64 = 32 * 8;
+    const UC_TAIL: u64 = 8;
+    const UCONTEXT_SIZE: u64 = UC_HEADER + SIGCONTEXT_SIZE + UC_TAIL;
+    const SIGINFO_SIZE: u64 = 128;
+    const FRAME_SIZE: u64 = PRETCODE_SIZE + UCONTEXT_SIZE + SIGINFO_SIZE;
+
+    let sp = user_rsp - FRAME_SIZE;
+    let frame_base = ((sp - 8) & !0xF) + 8;
+
+    // Validate frame_base is in user space.
+    if !(0x1000..0x0000_8000_0000_0000).contains(&frame_base) {
+        return false;
+    }
+
+    unsafe { core::ptr::write_bytes(frame_base as *mut u8, 0, FRAME_SIZE as usize); }
+
+    // pretcode
+    unsafe { *(frame_base as *mut u64) = action.restorer; }
+
+    // sigcontext registers
+    let uc_base = frame_base + PRETCODE_SIZE;
+    let sc_base = uc_base + UC_HEADER;
+
+    unsafe {
+        let sc = sc_base as *mut u64;
+        // GPRs: zero for most (not available from interrupt frame).
+        // Key registers we do have:
+        sc.add(14).write(0);              // rcx (was user rip on SYSCALL, 0 here)
+        sc.add(15).write(user_rsp);       // rsp
+        sc.add(16).write(user_rip);       // rip
+        sc.add(17).write(user_rflags);    // eflags
+        sc.add(26).write(fault_addr);     // cr2
+    }
+
+    // uc_sigmask
+    unsafe {
+        *((sc_base + SIGCONTEXT_SIZE) as *mut u64) = old_blocked;
+    }
+
+    // siginfo_t
+    let siginfo_base = uc_base + UCONTEXT_SIZE;
+    unsafe {
+        *(siginfo_base as *mut i32) = signum as i32;
+        // si_addr at offset 16 in siginfo_t (for SIGSEGV/SIGBUS).
+        *((siginfo_base + 16) as *mut u64) = fault_addr;
+    }
+
+    // Rewrite interrupt stack frame so IRETQ enters the handler.
+    unsafe {
+        stack_frame.as_mut().update(|f| {
+            f.instruction_pointer = x86_64::VirtAddr::new(action.handler);
+            f.stack_pointer = x86_64::VirtAddr::new(frame_base);
+        });
+    }
+
+    crate::serial_println!(
+        "[signal] pid={} delivering sig={} (interrupt) handler={:#x} frame={:#x}",
+        pid.as_u64(), signum, action.handler, frame_base
+    );
+
+    true
 }

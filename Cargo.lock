@@ -102,6 +102,7 @@ version = "0.1.0"
 dependencies = [
  "bootloader",
  "devices-macros",
+ "futures-util",
  "lazy_static",
  "libkernel",
  "log",

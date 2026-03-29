@@ -102,9 +102,10 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
         });
     }
 
-    // 9. If vfork child, unblock parent.
+    // 9. If vfork child, unblock parent and become the foreground process.
     if let Some(Some(thread_idx)) = vfork_parent_thread {
         scheduler::unblock(thread_idx);
+        libkernel::console::set_foreground(pid);
     }
 
     libkernel::serial_println!("[execve] pid={} path={} entry={:#x} rsp={:#x} pml4={:#x}",

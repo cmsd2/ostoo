@@ -37,7 +37,6 @@ pub const SYS_PIPE2: u64 = 293;
 pub const SYS_GETRANDOM: u64 = 318;
 pub const SYS_RT_SIGRETURN: u64 = 15;
 pub const SYS_KILL: u64 = 62;
-pub const SYS_SPAWN: u64 = 500;
 pub const SYS_IO_CREATE: u64 = 501;
 pub const SYS_IO_SUBMIT: u64 = 502;
 pub const SYS_IO_WAIT: u64 = 503;

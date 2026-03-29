@@ -290,6 +290,14 @@ fn init_virtio_blk() {
         None => { warn!("[kernel] virtio-blk transport init failed"); return; }
     };
 
+    // Set up IRQ-driven I/O if a valid GSI is available.
+    let gsi = pci_dev.interrupt_line;
+    if gsi > 0 && gsi < 24 {
+        devices::virtio::blk::init_irq(gsi as u32);
+    } else {
+        info!("[kernel] virtio-blk: no valid IRQ line ({}), using polling", gsi);
+    }
+
     let actor = devices::virtio::blk::VirtioBlkActor::new(transport);
     let (drv, inbox) = devices::virtio::blk::VirtioBlkActorDriver::new(actor);
     devices::driver::register(Box::new(drv));

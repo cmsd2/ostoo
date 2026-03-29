@@ -1,9 +1,10 @@
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
+use futures_util::task::AtomicWaker;
 use virtio_drivers::device::blk::{BlkReq, BlkResp, VirtIOBlk};
 use virtio_drivers::transport::pci::PciTransport;
 
@@ -16,18 +17,40 @@ use super::KernelHal;
 // IRQ state (one static for the single virtio-blk device)
 
 static IRQ_PENDING: AtomicBool = AtomicBool::new(false);
+static IRQ_WAKER: AtomicWaker = AtomicWaker::new();
+static BLK_GSI: AtomicU32 = AtomicU32::new(u32::MAX); // MAX = not configured
 
 /// Called from the interrupt handler registered for this device.
 pub fn virtio_blk_irq_handler(_slot: usize) {
     IRQ_PENDING.store(true, Ordering::Release);
-    // No AtomicWaker wake here — we use polling in CompletionFuture for MVP.
+    // Mask the GSI to prevent an interrupt storm while we process.
+    let gsi = BLK_GSI.load(Ordering::Relaxed);
+    if gsi != u32::MAX {
+        libkernel::apic::mask_gsi(gsi);
+    }
+    IRQ_WAKER.wake();
+}
+
+/// Initialise IRQ-driven I/O for the virtio-blk device.
+///
+/// `gsi` is the PCI interrupt line (GSI) read from config space.
+/// Registers a dynamic interrupt vector, routes the GSI to it, and unmasks.
+pub fn init_irq(gsi: u32) {
+    BLK_GSI.store(gsi, Ordering::Relaxed);
+    let vector = match super::register_blk_irq(virtio_blk_irq_handler) {
+        Some(v) => v,
+        None => {
+            log::warn!("[virtio-blk] no free vector for IRQ; falling back to polling");
+            return;
+        }
+    };
+    libkernel::apic::route_gsi(gsi, vector);
+    libkernel::apic::unmask_gsi(gsi);
+    log::info!("[virtio-blk] IRQ: GSI {} -> vector {:#x}", gsi, vector);
 }
 
 // ---------------------------------------------------------------------------
-// CompletionFuture — polls peek_used() until a request completes.
-//
-// For MVP this is a busy-poll future (re-schedules itself immediately).
-// It will be replaced by an IRQ-driven AtomicWaker future in a future patch.
+// CompletionFuture — woken by IRQ via AtomicWaker.
 
 struct CompletionFuture<'a> {
     device: &'a spin::Mutex<VirtIOBlk<KernelHal, PciTransport>>,
@@ -37,11 +60,27 @@ impl<'a> Future for CompletionFuture<'a> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // Fast path: check if already complete.
         if self.device.lock().peek_used().is_some() {
+            // Unmask GSI so the next request can be IRQ-driven.
+            let gsi = BLK_GSI.load(Ordering::Relaxed);
+            if gsi != u32::MAX {
+                libkernel::apic::unmask_gsi(gsi);
+            }
+            return Poll::Ready(());
+        }
+
+        // Register waker before re-checking (standard check-register-recheck).
+        IRQ_WAKER.register(cx.waker());
+
+        // Re-check after registration to avoid missed wake.
+        if self.device.lock().peek_used().is_some() {
+            let gsi = BLK_GSI.load(Ordering::Relaxed);
+            if gsi != u32::MAX {
+                libkernel::apic::unmask_gsi(gsi);
+            }
             Poll::Ready(())
         } else {
-            // Re-schedule for the next executor turn (busy-poll).
-            cx.waker().wake_by_ref();
             Poll::Pending
         }
     }

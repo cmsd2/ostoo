@@ -27,8 +27,19 @@ pub(crate) fn sys_brk(addr: u64) -> i64 {
     }
 
     let new_brk = (addr + PAGE_MASK) & !PAGE_MASK;
-    if new_brk <= brk_current {
+    if new_brk < brk_current {
+        // Shrink: free pages in [new_brk, brk_current).
+        let pages_to_free = ((brk_current - new_brk) / PAGE_SIZE) as usize;
+        with_memory(|mem| {
+            for i in 0..pages_to_free {
+                let vaddr = x86_64::VirtAddr::new(new_brk + (i as u64) * PAGE_SIZE);
+                mem.unmap_and_free_user_page(pml4_phys, vaddr, true);
+            }
+        });
         process::with_process(pid, |p| p.brk_current = new_brk);
+        return new_brk as i64;
+    }
+    if new_brk == brk_current {
         return new_brk as i64;
     }
 

@@ -283,7 +283,17 @@ impl KeyboardActor {
                     libkernel::console::push_input(0x7F); // DEL
                 }
                 Key::Unicode('\x03') => {
-                    libkernel::console::push_input(0x03); // Ctrl+C
+                    // Queue SIGINT on the foreground process.  This works
+                    // even if the process is computing rather than reading.
+                    libkernel::serial_println!(
+                        "[ctrl-c] queuing SIGINT on foreground pid={}",
+                        fg.as_u64()
+                    );
+                    libkernel::process::with_process(fg, |p| {
+                        p.signal.queue(libkernel::signal::SIGINT);
+                    });
+                    // Wake any blocked reader so read() returns EINTR.
+                    libkernel::console::wake_blocked_reader();
                 }
                 Key::Unicode('\x04') => {
                     libkernel::console::push_input(0x04); // Ctrl+D

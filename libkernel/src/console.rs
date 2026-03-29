@@ -13,6 +13,8 @@ struct ConsoleInner {
     buf: VecDeque<u8>,
     /// Thread index of a reader blocked waiting for input.
     blocked_reader: Option<usize>,
+    /// PID of the process whose thread is blocked in `read_input`.
+    blocked_reader_pid: Option<ProcessId>,
     /// Waker for async readers (completion port OP_READ).
     blocked_waker: Option<core::task::Waker>,
 }
@@ -20,6 +22,7 @@ struct ConsoleInner {
 static CONSOLE_INPUT: Mutex<ConsoleInner> = Mutex::new(ConsoleInner {
     buf: VecDeque::new(),
     blocked_reader: None,
+    blocked_reader_pid: None,
     blocked_waker: None,
 });
 
@@ -43,10 +46,18 @@ pub fn push_input(byte: u8) {
     }
 }
 
+/// Result of a console read attempt.
+pub enum ReadResult {
+    /// Successfully read `n` bytes.
+    Data(usize),
+    /// Interrupted by a pending signal before any data was read.
+    Interrupted,
+}
+
 /// Read bytes from the console input buffer into `buf`.
 /// If the buffer is empty, blocks the current thread until input arrives.
-/// Returns the number of bytes read (always >= 1, unless the process should exit).
-pub fn read_input(buf: &mut [u8]) -> usize {
+/// Returns `Data(n)` on success or `Interrupted` if a signal is pending.
+pub fn read_input(buf: &mut [u8]) -> ReadResult {
     loop {
         let mut inner = CONSOLE_INPUT.lock();
         if !inner.buf.is_empty() {
@@ -54,14 +65,41 @@ pub fn read_input(buf: &mut [u8]) -> usize {
             for i in 0..count {
                 buf[i] = inner.buf.pop_front().unwrap();
             }
-            return count;
+            return ReadResult::Data(count);
+        }
+        // Before blocking, check for pending deliverable signals.
+        let pid = crate::process::current_pid();
+        if pid != ProcessId::KERNEL {
+            let has_signal = crate::process::with_process_ref(pid, |p| {
+                let deliverable = p.signal.pending & !p.signal.blocked;
+                deliverable != 0
+            }).unwrap_or(false);
+            if has_signal {
+                return ReadResult::Interrupted;
+            }
         }
         // Buffer empty — register ourselves as blocked reader and sleep.
         let thread_idx = scheduler::current_thread_idx();
         inner.blocked_reader = Some(thread_idx);
+        inner.blocked_reader_pid = Some(pid);
         drop(inner); // release lock before blocking
         scheduler::block_current_thread();
         // Loop back to retry after being woken.
+    }
+}
+
+/// Wake any thread blocked in `read_input` so it can re-check for
+/// pending signals and return `Interrupted`.
+///
+/// Does NOT queue a signal — the caller is responsible for that.
+pub fn wake_blocked_reader() {
+    let mut inner = CONSOLE_INPUT.lock();
+    inner.blocked_reader_pid.take();
+    if let Some(thread_idx) = inner.blocked_reader.take() {
+        scheduler::unblock(thread_idx);
+    }
+    if let Some(waker) = inner.blocked_waker.take() {
+        waker.wake();
     }
 }
 

@@ -76,7 +76,6 @@ fn syscall_inner(
         SYS_SET_ROBUST_LIST => 0,
         SYS_PIPE2          => fs::sys_pipe2(a1, a2),
         SYS_GETRANDOM      => misc::sys_getrandom(a1, a2, a3),
-        SYS_SPAWN          => process::sys_spawn(a1, a2, a3, a4, a5),
         SYS_IO_CREATE      => crate::io_port::sys_io_create(a1 as u32),
         SYS_IO_SUBMIT      => crate::io_port::sys_io_submit(a1 as i32, a2, a3 as u32),
         SYS_IO_WAIT        => crate::io_port::sys_io_wait(a1 as i32, a2, a3 as u32, a4 as u32, a5),

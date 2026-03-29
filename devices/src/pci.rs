@@ -5,16 +5,17 @@ use x86_64::instructions::port::Port;
 
 #[derive(Debug, Clone)]
 pub struct PciDevice {
-    pub bus:         u8,
-    pub device:      u8,
-    pub function:    u8,
-    pub vendor_id:   u16,
-    pub device_id:   u16,
-    pub class:       u8,
-    pub subclass:    u8,
-    pub prog_if:     u8,
-    pub revision:    u8,
-    pub header_type: u8,
+    pub bus:            u8,
+    pub device:         u8,
+    pub function:       u8,
+    pub vendor_id:      u16,
+    pub device_id:      u16,
+    pub class:          u8,
+    pub subclass:       u8,
+    pub prog_if:        u8,
+    pub revision:       u8,
+    pub header_type:    u8,
+    pub interrupt_line: u8,
 }
 
 lazy_static! {
@@ -107,8 +108,11 @@ fn scan_function(bus: u8, device: u8, func: u8, out: &mut Vec<PciDevice>) {
         scan_bus(secondary, out);
     }
 
+    let interrupt_line = read_config_u8(bus, device, func, 0x3C);
+
     out.push(PciDevice { bus, device, function: func,
-        vendor_id, device_id, class, subclass, prog_if, revision, header_type });
+        vendor_id, device_id, class, subclass, prog_if, revision, header_type,
+        interrupt_line });
 }
 
 pub fn class_name(class: u8, subclass: u8) -> &'static str {
