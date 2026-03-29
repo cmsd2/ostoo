@@ -28,7 +28,7 @@ Looks up `fd` in the current process's per-process file descriptor table. Iterat
 - Returns the total number of bytes written across all iovec entries on success.
 - Short-circuits on error from any individual write.
 
-**Source:** `osl/src/dispatch.rs` — `sys_writev`
+**Source:** `osl/src/syscalls/io.rs` — `sys_writev`
 
 ## Future Work
 

@@ -19,7 +19,7 @@ Duplicates file descriptor `oldfd` to `newfd`. If `newfd` is already open, it is
 5. If `newfd` was previously open, its old handle is dropped (refcount decremented).
 6. The fd table is extended if `newfd` exceeds the current length.
 
-**Source:** `osl/src/dispatch.rs` — `sys_dup2`
+**Source:** `osl/src/syscalls/fs.rs` — `sys_dup2`
 
 ## Errors
 

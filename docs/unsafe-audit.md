@@ -5,7 +5,7 @@ refactoring payoff.
 
 ---
 
-## 1. `libkernel/src/vga_buffer.rs` — Raw pointer to MMIO buffer ✅ DONE
+## 1. `libkernel/src/vga_buffer/mod.rs` — Raw pointer to MMIO buffer ✅ DONE
 
 ~~`Writer` stores a raw `*mut Buffer` pointer and dereferences it with
 `unsafe { &mut *self.buffer }` in **7 separate places**.  There is also a
@@ -85,7 +85,7 @@ not in each register read/write.~~
   safety invariants.
 - All 15 public methods are now safe; `read_reg_32` / `write_reg_32` trait
   impl uses `core::ptr::read_volatile` / `write_volatile`.
-- Callers in `apic/src/lib.rs` and `devices/src/vfs/proc_vfs.rs` updated —
+- Callers in `apic/src/lib.rs` and `devices/src/vfs/proc_vfs/` updated —
   dozens of `unsafe` blocks removed.
 
 ---
@@ -105,7 +105,7 @@ use raw pointer dereferences without `read_volatile` / `write_volatile`.~~
 - `IoApic` trait impl (`read_reg_32` / `write_reg_32` / `read_reg_64` /
   `write_reg_64`) now uses `core::ptr::read_volatile` / `write_volatile`
   instead of raw dereferences — correct for MMIO.
-- Callers in `apic/src/lib.rs` and `devices/src/vfs/proc_vfs.rs` updated.
+- Callers in `apic/src/lib.rs` and `devices/src/vfs/proc_vfs/` updated.
 
 ---
 
@@ -173,7 +173,7 @@ inline-asm MSR reads are duplicated across fault handlers.
 
 ---
 
-## 10. `devices/src/vfs/proc_vfs.rs` — Manual page-table walking
+## 10. `devices/src/vfs/proc_vfs/` — Manual page-table walking
 
 `gen_pmap()` manually walks PML4 / PDPT / PD / PT levels using raw pointer
 casts like `unsafe { &*((phys_off + addr) as *const PageTable) }`.
@@ -194,9 +194,9 @@ casts like `unsafe { &*((phys_off + addr) as *const PageTable) }`.
 | **High**   | `syscall.rs`              | ~~8~~        | ✅ Done — `UnsafeCell`, user pointer validation  |
 | **High**   | `local_apic/mapped.rs`    | ~~18~~       | ✅ Done — safe methods, unsafe-only construction |
 | **High**   | `io_apic/mapped.rs`       | ~~12~~       | ✅ Done — same + `read_volatile` / `write_volatile` |
-| **Medium** | `vga_buffer.rs`           | ~~14~~       | ✅ Done — `VgaBuffer` wrapper                   |
+| **Medium** | `vga_buffer/mod.rs`       | ~~14~~       | ✅ Done — `VgaBuffer` wrapper                   |
 | **Medium** | `kernel_acpi.rs`          | ~16          | Generic volatile MMIO helpers                    |
 | **Medium** | `ring3.rs`                | ~8           | `zero_frame` / `copy_to_frame` on MemoryServices |
 | **Medium** | `gdt.rs`                  | 2            | `UnsafeCell` for TSS mutation                    |
 | **Low**    | `interrupts.rs`           | ~10          | `dump_cpu_state` + `dump_bytes_at` helpers       |
-| **Low**    | `proc_vfs.rs`             | ~5           | Page-table walk iterator                         |
+| **Low**    | `proc_vfs/`               | ~5           | Page-table walk iterator                         |

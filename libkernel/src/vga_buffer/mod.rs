@@ -1,16 +1,19 @@
 use volatile::Volatile;
 use core::fmt;
-use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
-use core::task::{Context, Poll};
-use conquer_once::spin::OnceCell;
-use crossbeam_queue::ArrayQueue;
-use futures_util::stream::Stream;
-use futures_util::task::AtomicWaker;
+use core::sync::atomic::Ordering;
 use lazy_static::lazy_static;
 use crate::irq_mutex::IrqMutex;
 use crate::framebuffer::Framebuffer;
 use crate::font;
+
+pub mod capture;
+pub mod timeline;
+
+// Re-export public items from submodules at the old paths.
+pub use capture::{
+    MAX_CAPTURE_LINES, capture_start, capture_end, capture_print_line, clear_current_line,
+};
+pub use timeline::{TimelineStream, timeline_append, timeline_flush_one};
 
 // ---------------------------------------------------------------------------
 // Text-mode constants (used during early boot and as defaults)
@@ -151,118 +154,11 @@ macro_rules! status_bar {
     ($($arg:tt)*) => ($crate::vga_buffer::print_status_bar(format_args!($($arg)*)));
 }
 
-// ---------------------------------------------------------------------------
-// Output capture (used by the shell pager)
-
-/// Maximum number of lines the capture buffer can hold.
-pub const MAX_CAPTURE_LINES: usize = 256;
-
-struct CaptureBuffer {
-    data:    [[u8; BUFFER_WIDTH]; MAX_CAPTURE_LINES],
-    lens:    [usize; MAX_CAPTURE_LINES],
-    count:   usize,          // completed lines
-    cur:     [u8; BUFFER_WIDTH],
-    cur_len: usize,          // bytes in the current partial line
-}
-
-impl CaptureBuffer {
-    const fn new() -> Self {
-        CaptureBuffer {
-            data:    [[0u8; BUFFER_WIDTH]; MAX_CAPTURE_LINES],
-            lens:    [0usize; MAX_CAPTURE_LINES],
-            count:   0,
-            cur:     [0u8; BUFFER_WIDTH],
-            cur_len: 0,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.count   = 0;
-        self.cur_len = 0;
-    }
-
-    fn push_byte(&mut self, b: u8) {
-        if b == b'\n' {
-            self.commit_line();
-        } else if self.cur_len < BUFFER_WIDTH {
-            self.cur[self.cur_len] = if (0x20..=0x7e).contains(&b) { b } else { b'?' };
-            self.cur_len += 1;
-        }
-    }
-
-    fn commit_line(&mut self) {
-        if self.count < MAX_CAPTURE_LINES {
-            let l = self.cur_len;
-            self.data[self.count][..l].copy_from_slice(&self.cur[..l]);
-            self.lens[self.count] = l;
-            self.count += 1;
-        }
-        self.cur_len = 0;
-    }
-
-    fn flush_partial(&mut self) {
-        if self.cur_len > 0 {
-            self.commit_line();
-        }
-    }
-}
-
-impl fmt::Write for CaptureBuffer {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        for b in s.bytes() { self.push_byte(b); }
-        Ok(())
-    }
-}
-
-static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
-static CAPTURE: IrqMutex<CaptureBuffer> = IrqMutex::new(CaptureBuffer::new());
-
-/// Begin capturing all `print!`/`println!` output into an internal buffer
-/// instead of writing directly to the VGA screen.
-/// Call [`capture_end`] to stop and retrieve the line count.
-pub fn capture_start() {
-    CAPTURE.lock().reset();
-    CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
-}
-
-/// Stop capturing and return the number of captured lines.
-pub fn capture_end() -> usize {
-    CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
-    let mut c = CAPTURE.lock();
-    c.flush_partial();
-    c.count
-}
-
-/// Write captured line `i` to the VGA display followed by a newline.
-/// No-op if `i` is out of range.
-pub fn capture_print_line(i: usize) {
-    let (data, len) = {
-        let c = CAPTURE.lock();
-        if i >= c.count { return; }
-        let l = c.lens[i];
-        let mut buf = [0u8; BUFFER_WIDTH];
-        buf[..l].copy_from_slice(&c.data[i][..l]);
-        (buf, l)
-    };
-    let mut w = WRITER.lock();
-    for &b in &data[..len] { w.write_byte(b); }
-    w.write_byte(b'\n');
-}
-
-/// Clear the bottom VGA row (the current writing line) and reset the column
-/// to 0.  Used by the pager to erase the `-- More --` prompt after a keypress.
-pub fn clear_current_line() {
-    let mut w = WRITER.lock();
-    let last = w.rows - 1;
-    w.clear_row(last);
-    w.column_position = 0;
-}
-
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
-    if CAPTURE_ACTIVE.load(Ordering::Relaxed) {
-        CAPTURE.lock().write_fmt(args).unwrap();
+    if capture::CAPTURE_ACTIVE.load(Ordering::Relaxed) {
+        capture::CAPTURE.lock().write_fmt(args).unwrap();
     } else {
         WRITER.lock().write_fmt(args).unwrap();
     }
@@ -317,19 +213,19 @@ impl Color {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
-struct ColorCode(u8);
+pub(crate) struct ColorCode(pub(crate) u8);
 
 impl ColorCode {
-    fn new(foreground: Color, background: Color) -> ColorCode {
+    pub(crate) fn new(foreground: Color, background: Color) -> ColorCode {
         ColorCode((background as u8) << 4 | (foreground as u8))
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
-struct ScreenChar {
-    ascii_character: u8,
-    color_code: ColorCode,
+pub(crate) struct ScreenChar {
+    pub(crate) ascii_character: u8,
+    pub(crate) color_code: ColorCode,
 }
 
 #[repr(transparent)]
@@ -394,25 +290,25 @@ impl VgaBuffer {
 unsafe impl Send for VgaBuffer {}
 
 pub struct Writer {
-    column_position: usize,
-    color_code: ColorCode,
+    pub(crate) column_position: usize,
+    pub(crate) color_code: ColorCode,
     backend: DisplayBackend,
-    cols: usize,
-    rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) rows: usize,
 }
 
 impl Writer {
     // -----------------------------------------------------------------------
     // Backend-dispatch helpers
 
-    fn read_cell(&self, row: usize, col: usize) -> ScreenChar {
+    pub(crate) fn read_cell(&self, row: usize, col: usize) -> ScreenChar {
         match &self.backend {
             DisplayBackend::TextMode(buf) => buf.read_cell(row, col),
             DisplayBackend::Graphical { cells, .. } => cells[row][col],
         }
     }
 
-    fn write_cell(&mut self, row: usize, col: usize, ch: ScreenChar) {
+    pub(crate) fn write_cell(&mut self, row: usize, col: usize, ch: ScreenChar) {
         match &mut self.backend {
             DisplayBackend::TextMode(buf) => buf.write_cell(row, col, ch),
             DisplayBackend::Graphical { fb, cells } => {
@@ -565,7 +461,7 @@ impl Writer {
         }
     }
 
-    fn clear_row(&mut self, row: usize) {
+    pub(crate) fn clear_row(&mut self, row: usize) {
         let blank = ScreenChar {
             ascii_character: b' ',
             color_code: self.color_code,
@@ -738,85 +634,6 @@ pub fn boot_progress_done() {
     for col in 0..cols {
         w.write_cell(PROGRESS_ROW, col, blank);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Timeline event queue — ISR producer, async actor consumer
-
-static TIMELINE_QUEUE: OnceCell<ArrayQueue<usize>> = OnceCell::uninit();
-static TIMELINE_WAKER: AtomicWaker = AtomicWaker::new();
-
-/// A stream of thread indices pushed by the scheduler ISR.
-pub struct TimelineStream {
-    _private: (),
-}
-
-impl TimelineStream {
-    pub fn new() -> Self {
-        let _ = TIMELINE_QUEUE.try_init_once(|| ArrayQueue::new(256));
-        TimelineStream { _private: () }
-    }
-}
-
-impl Stream for TimelineStream {
-    type Item = usize;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<usize>> {
-        let queue = TIMELINE_QUEUE.try_get().expect("timeline queue not initialized");
-
-        if let Some(idx) = queue.pop() {
-            return Poll::Ready(Some(idx));
-        }
-
-        TIMELINE_WAKER.register(cx.waker());
-
-        match queue.pop() {
-            Some(idx) => {
-                TIMELINE_WAKER.take();
-                Poll::Ready(Some(idx))
-            }
-            None => Poll::Pending,
-        }
-    }
-}
-
-/// Push a context-switch event into the timeline queue.
-///
-/// Called from the scheduler ISR (`preempt_tick`).  Lock-free and
-/// allocation-free; safe to call with interrupts disabled.
-pub fn timeline_append(thread_idx: usize) {
-    if let Ok(queue) = TIMELINE_QUEUE.try_get() {
-        // Drop the event if the queue is full — a few missed visual ticks
-        // are invisible at screen refresh rates.
-        let _ = queue.push(thread_idx);
-        TIMELINE_WAKER.wake();
-    }
-}
-
-/// Write one context-switch tick to VGA row 1, shifting old blocks left.
-///
-/// Called by the timeline actor from normal (non-ISR) context while holding
-/// the `WRITER` lock.
-pub fn timeline_flush_one(thread_idx: usize) {
-    const THREAD_BG: [Color; 6] = [
-        Color::LightGreen, Color::LightCyan, Color::LightRed,
-        Color::Pink,       Color::Yellow,    Color::LightGray,
-    ];
-    let bg = THREAD_BG[thread_idx % THREAD_BG.len()];
-    let color = ColorCode::new(Color::Black, bg);
-
-    let mut w = WRITER.lock();
-    let cols = w.cols;
-    // Shift row 1 left by one column.
-    for col in 0..cols - 1 {
-        let ch = w.read_cell(1, col + 1);
-        w.write_cell(1, col, ch);
-    }
-    // Append a space with the thread's background colour.
-    w.write_cell(1, cols - 1, ScreenChar {
-        ascii_character: b' ',
-        color_code: color,
-    });
 }
 
 #[cfg(test)]

@@ -53,7 +53,7 @@ registers and signal mask.
 | `libkernel/src/syscall.rs` | PerCpuData.saved_frame_ptr, SyscallSavedFrame, check_pending_signals, deliver_signal |
 | `libkernel/src/process.rs` | Process.signal field |
 | `osl/src/signal.rs` | sys_rt_sigreturn, sys_kill |
-| `osl/src/dispatch.rs` | sys_rt_sigaction, sys_rt_sigprocmask |
+| `osl/src/signal.rs` | sys_rt_sigaction, sys_rt_sigprocmask |
 
 ### PerCpuData layout
 

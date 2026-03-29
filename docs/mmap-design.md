@@ -90,7 +90,7 @@ hardcoded `USER_DATA_FLAGS`.
 | File | Change |
 |---|---|
 | `libkernel/src/process.rs` | Add `Vma` struct, replace `mmap_regions` with `BTreeMap<u64, Vma>` |
-| `osl/src/dispatch.rs` (`sys_mmap`) | Parse `prot`, compute PTF, store VMA |
+| `osl/src/syscalls/mem.rs` (`sys_mmap`) | Parse `prot`, compute PTF, store VMA |
 | `osl/src/clone.rs` | Clone the VMA map instead of `Vec<(u64, u64)>` |
 | `osl/src/exec.rs` | Clear VMA map on execve |
 
@@ -147,7 +147,7 @@ fn sys_munmap(addr: u64, length: u64) -> i64
 | File | Change |
 |---|---|
 | `libkernel/src/memory/` | Add `unmap_user_page`, frame free list |
-| `osl/src/dispatch.rs` | Implement `sys_munmap` |
+| `osl/src/syscalls/mem.rs` | Implement `sys_munmap` |
 | `libkernel/src/process.rs` | VMA split/remove helpers |
 
 ### Contiguous DMA allocations
@@ -212,7 +212,7 @@ logic as exit, but targeting the old PML4).
 
 | File | Change |
 |---|---|
-| `osl/src/dispatch.rs` | Implement `sys_mprotect`, call cleanup in `sys_exit` |
+| `osl/src/syscalls/mem.rs` | Implement `sys_mprotect`; `osl/src/syscalls/process.rs` calls cleanup in `sys_exit` |
 | `osl/src/exec.rs` | Call cleanup for old address space before jump |
 | `libkernel/src/memory/` | PTE flag update helper, page table walker for cleanup |
 | `libkernel/src/process.rs` | VMA split for partial mprotect |
@@ -252,7 +252,7 @@ The VMA `BTreeMap` is the sole source of truth — no bump pointer.
 | `libkernel/src/gap.rs` | **New** — `OccupiedRanges` trait, `find_gap_topdown` |
 | `libkernel/src/lib.rs` | Add `pub mod gap` |
 | `libkernel/src/process.rs` | Remove `mmap_next`, add `MMAP_FLOOR`/`MMAP_CEILING`, `find_mmap_gap` |
-| `osl/src/dispatch.rs` | Rewrite `sys_mmap` with gap finder + MAP_FIXED |
+| `osl/src/syscalls/mem.rs` | Rewrite `sys_mmap` with gap finder + MAP_FIXED |
 | `osl/src/clone.rs` | Remove `mmap_next` from clone state |
 | `osl/src/exec.rs` | Remove `mmap_next` reset and local `MMAP_BASE` constant |
 
@@ -306,7 +306,7 @@ inode-keyed page cache.  The mmap code doesn't need to change.
 | `libkernel/src/file.rs` | Added `content_bytes()` default method to `FileHandle` |
 | `osl/src/file.rs` | Implemented `content_bytes()` on `VfsHandle` |
 | `osl/src/errno.rs` | Added `ENODEV` for non-mmap-able handles |
-| `osl/src/dispatch.rs` | Extended `sys_mmap` with file-backed MAP_PRIVATE, added `mmap_alloc_pages` helper |
+| `osl/src/syscalls/mem.rs` | Extended `sys_mmap` with file-backed MAP_PRIVATE, added `mmap_alloc_pages` helper |
 | `user/mmap_file.c` | New demo: open file, mmap, compare with read(), munmap |
 
 ### Test
@@ -357,7 +357,7 @@ after open.  The fd (inode reference) is the correct identity.
 |---|---|
 | `libkernel/src/memory/` | Frame refcount table |
 | VFS layer | Inode identifiers for shared page cache |
-| `osl/src/dispatch.rs` | MAP_SHARED path in `sys_mmap` |
+| `osl/src/syscalls/mem.rs` | MAP_SHARED path in `sys_mmap` |
 
 ### Test
 

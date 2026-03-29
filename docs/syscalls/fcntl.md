@@ -19,7 +19,7 @@ Performs operations on file descriptors. Only fd-level flag operations are suppo
 | `F_GETFL` | 3 | Returns 0 (no file status flags tracked) |
 | Other | — | Returns `-EINVAL` |
 
-**Source:** `osl/src/dispatch.rs` — `sys_fcntl`
+**Source:** `osl/src/syscalls/fs.rs` — `sys_fcntl`
 
 ## Errors
 

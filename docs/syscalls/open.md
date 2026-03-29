@@ -22,7 +22,7 @@ The VFS operations use `osl::blocking::blocking()` which spawns the async VFS ca
 
 **Flags supported:** `O_DIRECTORY` (to explicitly request directory). `O_RDONLY` is implied for all opens. Other flags are accepted but ignored.
 
-**Source:** `osl/src/dispatch.rs` — `sys_open`
+**Source:** `osl/src/syscalls/fs.rs` — `sys_open`
 
 ## Errors
 

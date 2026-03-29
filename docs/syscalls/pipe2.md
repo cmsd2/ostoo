@@ -23,7 +23,7 @@ Creates a unidirectional data channel (pipe). Returns two file descriptors: `pip
 - **Write:** Appends data to the shared buffer and wakes any blocked reader. Currently unbounded (no backpressure).
 - **Close:** Closing the write end sets `write_closed = true` and wakes any blocked reader (so it gets EOF). Closing the read end drops the reader's Arc reference.
 
-**Source:** `osl/src/dispatch.rs` — `sys_pipe2`, `libkernel/src/file.rs` — `PipeReader`, `PipeWriter`, `make_pipe`
+**Source:** `osl/src/syscalls/fs.rs` — `sys_pipe2`, `libkernel/src/file.rs` — `PipeReader`, `PipeWriter`, `make_pipe`
 
 ## Usage from C (musl)
 

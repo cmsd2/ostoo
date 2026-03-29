@@ -14,10 +14,10 @@ use libkernel::completion_port::{
 };
 use libkernel::irq_mutex::IrqMutex;
 use libkernel::file::{FileHandle, FileError, FdObject};
-use libkernel::process;
 use libkernel::task::{executor, scheduler, timer, Task};
 
-use crate::dispatch::validate_user_buf;
+use crate::fd_helpers;
+use crate::user_mem::validate_user_buf;
 use crate::errno;
 
 // ---------------------------------------------------------------------------
@@ -107,44 +107,7 @@ struct IoCompletion {
     opcode: u32,
 }
 
-// ---------------------------------------------------------------------------
-// Helper: extract the Arc<IrqMutex<CompletionPort>> from an fd
-
-fn get_port(port_fd: i32) -> Result<Arc<IrqMutex<CompletionPort>>, i64> {
-    let pid = process::current_pid();
-    match process::with_process_ref(pid, |p| p.get_fd(port_fd as usize)) {
-        Some(Ok(obj)) => match obj.as_port() {
-            Some(p) => Ok(p.clone()),
-            None => Err(-errno::EBADF),
-        },
-        _ => Err(-errno::EBADF),
-    }
-}
-
-/// Get a file handle from the current process's fd table.
-/// Returns EBADF if the fd refers to a non-file object (e.g. a completion port).
-fn get_file_handle(fd: i32) -> Result<Arc<dyn FileHandle>, i64> {
-    let pid = process::current_pid();
-    match process::with_process_ref(pid, |p| p.get_fd(fd as usize)) {
-        Some(Ok(obj)) => match obj.as_file() {
-            Some(h) => Ok(h.clone()),
-            None => Err(-errno::EBADF),
-        },
-        _ => Err(-errno::EBADF),
-    }
-}
-
-/// Get an IRQ handle from the current process's fd table.
-fn get_irq_handle(fd: i32) -> Result<Arc<libkernel::irq_mutex::IrqMutex<libkernel::irq_handle::IrqInner>>, i64> {
-    let pid = process::current_pid();
-    match process::with_process_ref(pid, |p| p.get_fd(fd as usize)) {
-        Some(Ok(obj)) => match obj.as_irq() {
-            Some(i) => Ok(i.clone()),
-            None => Err(-errno::EBADF),
-        },
-        _ => Err(-errno::EBADF),
-    }
-}
+// FD helpers are in crate::fd_helpers (get_fd_file, get_fd_port, get_fd_irq).
 
 // ---------------------------------------------------------------------------
 // sys_io_create(flags) → fd
@@ -156,11 +119,9 @@ pub fn sys_io_create(flags: u32) -> i64 {
 
     let port = Arc::new(IrqMutex::new(CompletionPort::new()));
 
-    let pid = process::current_pid();
-    match process::with_process(pid, |p| p.alloc_fd(FdObject::Port(port))) {
-        Some(Ok(fd)) => fd as i64,
-        Some(Err(e)) => crate::errno::file_errno(e),
-        None => -errno::EBADF,
+    match fd_helpers::alloc_fd(FdObject::Port(port)) {
+        Ok(fd) => fd as i64,
+        Err(e) => e,
     }
 }
 
@@ -178,7 +139,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
         return -errno::EFAULT;
     }
 
-    let port = match get_port(port_fd) {
+    let port = match fd_helpers::get_fd_port(port_fd as usize) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -225,7 +186,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
 
             OP_READ => {
                 // Resolve handle eagerly; post EBADF immediately on bad fd.
-                let handle = match get_file_handle(sub.fd) {
+                let handle = match fd_helpers::get_fd_file(sub.fd as usize) {
                     Ok(h) => h,
                     Err(_) => {
                         port.lock().post(Completion {
@@ -289,7 +250,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
             }
 
             OP_WRITE => {
-                let handle = match get_file_handle(sub.fd) {
+                let handle = match fd_helpers::get_fd_file(sub.fd as usize) {
                     Ok(h) => h,
                     Err(_) => {
                         port.lock().post(Completion {
@@ -355,7 +316,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
             }
 
             OP_IRQ_WAIT => {
-                let irq = match get_irq_handle(sub.fd) {
+                let irq = match fd_helpers::get_fd_irq(sub.fd as usize) {
                     Ok(i) => i,
                     Err(_) => {
                         port.lock().post(Completion {
@@ -406,7 +367,7 @@ pub fn sys_io_wait(port_fd: i32, completions_ptr: u64, max: u32, min: u32, timeo
         return -errno::EFAULT;
     }
 
-    let port = match get_port(port_fd) {
+    let port = match fd_helpers::get_fd_port(port_fd as usize) {
         Ok(p) => p,
         Err(e) => return e,
     };

@@ -462,7 +462,7 @@ The CompletionPort is stored in the process `fd_table` as a
 
 ### Syscall dispatch wiring
 
-Add to `osl/src/dispatch.rs`:
+Add to `osl/src/syscalls/mod.rs`:
 
 ```rust
 501 => sys_io_create(a1 as u32),
@@ -577,7 +577,7 @@ basic operations.
 
 | Item | Detail |
 |---|---|
-| **Files** | `libkernel/src/file.rs` (CompletionPortHandle), `osl/src/io_port.rs` (new: structs + sys_io_*), `osl/src/dispatch.rs` (wire 501-503) |
+| **Files** | `libkernel/src/file.rs` (CompletionPortHandle), `osl/src/io_port.rs` (new: structs + sys_io_*), `osl/src/syscalls/mod.rs` (wire 501-503) |
 | **Dependencies** | None — uses existing scheduler, timer, fd_table |
 | **Delivers** | `io_create`, `io_submit`, `io_wait`; OP_NOP and OP_TIMEOUT |
 | **Test** | Userspace program: create port, submit OP_NOP, io_wait returns immediately.  Submit OP_TIMEOUT(100ms), io_wait blocks ~100ms then returns. |

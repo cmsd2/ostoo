@@ -182,7 +182,7 @@ at 10.0.2.2 with default subnet 10.0.2.0/24.
 
 ## Syscalls
 
-New Linux-compatible syscall numbers to add in `osl/src/dispatch.rs`:
+New Linux-compatible syscall numbers to add in `osl/src/syscalls/mod.rs`:
 
 | Nr | Name | Purpose |
 |---|---|---|

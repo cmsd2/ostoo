@@ -14,4 +14,4 @@ Set and/or get the alternate signal stack.
 
 **Stub:** Returns 0 (success) unconditionally. No signal support is implemented. Rust's standard library calls `sigaltstack` during runtime init to set up an alternate stack for signal handlers.
 
-**Source:** `osl/src/dispatch.rs` — match arm returns `0`
+**Source:** `osl/src/syscalls/mod.rs` — inline stub in `syscall_dispatch`

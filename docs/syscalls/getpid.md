@@ -14,4 +14,4 @@ Returns the process ID of the calling process.
 
 Returns `current_pid().as_u64()`. Always succeeds (no error return).
 
-**Source:** `osl/src/dispatch.rs` — `sys_getpid`
+**Source:** `osl/src/syscalls/process.rs` — `sys_getpid`

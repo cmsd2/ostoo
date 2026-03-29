@@ -16,7 +16,7 @@ Retrieves the time of the specified clock.
 
 This satisfies Rust std's runtime init which calls `clock_gettime(CLOCK_MONOTONIC, ...)` but doesn't depend on the actual time value.
 
-**Source:** `osl/src/dispatch.rs` — `sys_clock_gettime`
+**Source:** `osl/src/syscalls/misc.rs` — `sys_clock_gettime`
 
 ## Errors
 

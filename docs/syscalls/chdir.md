@@ -18,7 +18,7 @@ Changes the current working directory to `path`.
 4. On success, updates the process's `cwd` field to the resolved path and returns 0.
 5. On failure, returns the error from the VFS (typically `-ENOENT` or `-ENOTDIR`).
 
-**Source:** `osl/src/dispatch.rs` — `sys_chdir`
+**Source:** `osl/src/syscalls/fs.rs` — `sys_chdir`
 
 ## Usage from C (musl)
 

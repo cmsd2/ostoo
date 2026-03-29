@@ -10,7 +10,7 @@ Date: 2026-03-19
 
 ## 1. Magic Numbers
 
-### ~~1.1 Syscall numbers — `osl/src/dispatch.rs`~~ ✅ DONE
+### ~~1.1 Syscall numbers — `osl/src/syscalls/mod.rs`~~ ✅ DONE
 
 **Fixed in** `95da4c0`.  Named constants in `osl/src/syscall_nr.rs`;
 dispatch match now uses `SYS_READ`, `SYS_WRITE`, etc.
@@ -75,11 +75,11 @@ const VIRTIO_9P_LEGACY_DEVICE_ID: u16 = 0x1009;
 |---|---|---|
 | `scheduler.rs:138` | `0x202` | `RFLAGS_IF_RESERVED` |
 | `scheduler.rs:283,337` | `0x1F80` | `MXCSR_DEFAULT` |
-| `vga_buffer.rs:85,306` | `0x20..=0x7e` | `PRINTABLE_ASCII` |
-| `vga_buffer.rs:308` | `0xfe` | `NONPRINTABLE_PLACEHOLDER` |
+| `vga_buffer/mod.rs:85,306` | `0x20..=0x7e` | `PRINTABLE_ASCII` |
+| `vga_buffer/mod.rs:308` | `0xfe` | `NONPRINTABLE_PLACEHOLDER` |
 | `memory/mod.rs:333,335` | `0x1FF` | `PAGE_TABLE_INDEX_MASK` |
-| `dispatch.rs:298` | `16` | `IOVEC_SIZE` |
-| `dispatch.rs:398,480,547` | `4096` | `MAX_PATH_LEN` |
+| `syscalls/io.rs` | `16` | `IOVEC_SIZE` |
+| `syscalls/fs.rs` | `4096` | `MAX_PATH_LEN` |
 | `gdt.rs:33` | `4096 * 5` | `DOUBLE_FAULT_STACK_SIZE` |
 
 ---
@@ -88,7 +88,7 @@ const VIRTIO_9P_LEGACY_DEVICE_ID: u16 = 0x1009;
 
 ### ~~2.1 FD table retrieval~~ ✅ DONE
 
-**Fixed in** `95da4c0`.  `get_fd_handle()` helper in `osl/src/dispatch.rs`
+**Fixed in** `95da4c0`.  `get_fd_handle()` helper (now in `osl/src/fd_helpers.rs`)
 eliminates 4 identical fd-lookup blocks.
 
 ### ~~2.2 Page alloc + zero + map loop~~ ✅ DONE
@@ -107,12 +107,12 @@ write non-zero data were not replaced.)
 ### ~~2.4 PageTableFlags construction~~ ✅ DONE
 
 **Fixed in** `95da4c0`.  `USER_DATA_FLAGS` constant in
-`osl/src/dispatch.rs` replaces 3 identical flag expressions.
+`osl/src/syscalls/mem.rs` replaces 3 identical flag expressions.
 
 ### ~~2.5 Path normalization — duplicated between crates~~ ✅ DONE
 
 **Fixed in** `libkernel/src/path.rs`.  `normalize()` and `resolve()` are
-now shared; `kernel/src/shell.rs` and `osl/src/dispatch.rs` both delegate
+now shared; `kernel/src/shell.rs` and `osl/src/syscalls/` both delegate
 to `libkernel::path`.
 
 ### ~~2.6 History entry restoration — `keyboard_actor.rs`~~ ✅ DONE
@@ -250,14 +250,14 @@ dispatch table.
 `debug_check_initial_alignment()`.  `preempt_tick` itself has zero direct
 `unsafe` blocks.
 
-### 4.3 `dispatch.rs:sys_mmap` — 68 lines
+### 4.3 `syscalls/mem.rs:sys_mmap` — 68 lines
 
 Validation, allocation, and mapping all in one function.
 
 **Fix:** Break into `validate_mmap_request()` and the shared
 `alloc_and_map_user_pages()` from section 2.2.
 
-### 4.4 `dispatch.rs:sys_brk` — 60 lines
+### 4.4 `syscalls/mem.rs:sys_brk` — 60 lines
 
 Same issue as `sys_mmap` — does too many things.
 
@@ -278,7 +278,7 @@ the two identical `!= Dead && != Blocked` checks.
 
 ### 5.2 VFS blocking wrappers
 
-`osl/src/dispatch.rs:129-141` has `vfs_read_file` and `vfs_list_dir`
+`osl/src/syscalls/fs.rs` has `vfs_read_file` and `vfs_list_dir`
 with identical structure (allocate String, call `blocking()` with async
 VFS call).
 
@@ -286,7 +286,7 @@ VFS call).
 
 ### 5.3 Process exit + parent wake pattern
 
-`sys_exit` (dispatch.rs:168-176) does get-parent → mark_zombie →
+`sys_exit` (`osl/src/syscalls/process.rs`) does get-parent → mark_zombie →
 unblock-parent as separate steps.  This should be a single
 `ProcessManager::exit_and_notify(pid, code)` method.
 

@@ -33,7 +33,7 @@ Spawns a new process from an ELF binary on the VFS. The child process inherits n
 6. **Set foreground:** Calls `console::set_foreground(child_pid)` so keyboard input goes to the child.
 7. **Returns** the child's PID on success.
 
-**Source:** `osl/src/dispatch.rs` — `sys_spawn`, `osl/src/spawn.rs` — `spawn_process_full`
+**Source:** `osl/src/syscalls/process.rs` — `sys_spawn`, `osl/src/spawn.rs` — `spawn_process_full`
 
 ## Usage from C (musl)
 

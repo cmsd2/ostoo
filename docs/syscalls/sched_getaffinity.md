@@ -16,7 +16,7 @@ Zeroes the user-provided mask buffer, then sets bit 0 (CPU 0 only). Returns `cpu
 
 Rust's standard library calls `sched_getaffinity` during runtime init to determine available parallelism.
 
-**Source:** `osl/src/dispatch.rs` — `sys_sched_getaffinity`
+**Source:** `osl/src/syscalls/misc.rs` — `sys_sched_getaffinity`
 
 ## Errors
 

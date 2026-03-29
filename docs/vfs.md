@@ -25,7 +25,7 @@ devices/src/
     mod.rs          — public API, mount table, path resolution
     exfat_vfs.rs    — ExfatVfs: wraps virtio-blk + exFAT driver
     plan9_vfs.rs    — Plan9Vfs: wraps virtio-9p P9Client
-    proc_vfs.rs     — ProcVfs: synthetic kernel-info filesystem
+    proc_vfs/       — ProcVfs: synthetic kernel-info filesystem (mod.rs + generator submodules)
 ```
 
 ---

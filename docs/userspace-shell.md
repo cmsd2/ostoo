@@ -63,11 +63,11 @@ file I/O and process management.
 
 ### 2c: Refactor syscalls to use FD table
 
-**File:** `osl/src/dispatch.rs`
+**File:** `osl/src/syscalls/io.rs` and `osl/src/syscalls/fs.rs`
 
-- `sys_write` / `sys_writev`: look up fd in process fd_table, call `handle.write()`
-- `sys_read`: look up fd, call `handle.read()`
-- `sys_close`: call `process.close_fd(fd)`
+- `sys_write` / `sys_writev`: look up fd in process fd_table, call `handle.write()` (`osl/src/syscalls/io.rs`)
+- `sys_read`: look up fd, call `handle.read()` (`osl/src/syscalls/io.rs`)
+- `sys_close`: call `process.close_fd(fd)` (`osl/src/syscalls/fs.rs`)
 
 ---
 
@@ -141,7 +141,7 @@ Spawns the async VFS operation as a kernel task, blocks the user thread, unblock
 
 ### 4c: sys_open (syscall 2)
 
-**File:** `osl/src/dispatch.rs`
+**File:** `osl/src/syscalls/fs.rs`
 
 - Read null-terminated path from userspace, validate pointer
 - Resolve path relative to process `cwd` (see Phase 5a)
@@ -151,7 +151,7 @@ Spawns the async VFS operation as a kernel task, blocks the user thread, unblock
 
 ### 4d: sys_getdents64 (syscall 217)
 
-**File:** `osl/src/dispatch.rs`
+**File:** `osl/src/syscalls/io.rs`
 
 - Look up fd → must be `DirHandle`
 - Serialize entries as `linux_dirent64` structs into user buffer (d_ino, d_off, d_reclen, d_type, d_name)
@@ -169,13 +169,13 @@ Spawns the async VFS operation as a kernel task, blocks the user thread, unblock
 
 **File:** `libkernel/src/process.rs` — add `cwd: String` to `Process`, default `"/"`
 
-**File:** `osl/src/dispatch.rs`
+**File:** `osl/src/syscalls/fs.rs`
 - `sys_chdir` (nr 80): validate path exists via `osl::blocking::blocking(devices::vfs::list_dir(path))`, update `process.cwd`
 - `sys_getcwd` (nr 79): copy `process.cwd` to user buffer
 
 ### 5b: spawn syscall (custom nr 500)
 
-**File:** `osl/src/dispatch.rs`
+**File:** `osl/src/syscalls/process.rs`
 
 Signature: `spawn(path_ptr, path_len, argv_ptr, argv_count) -> pid`
 
@@ -200,7 +200,7 @@ Signature: `spawn(path_ptr, path_len, argv_ptr, argv_count) -> pid`
 
 ### 5d: waitpid (syscall 61 / wait4)
 
-**File:** `osl/src/dispatch.rs`
+**File:** `osl/src/syscalls/process.rs`
 
 - `sys_waitpid(pid, status_ptr, options) -> pid`
 - Find zombie child matching requested pid (or any child if pid == -1)
@@ -268,7 +268,7 @@ Automatic via the keyboard routing in Phase 3c: when foreground PID is 0 (kernel
 | `osl/src/errno.rs` | Linux errno constants, `file_errno()` / `vfs_errno()` converters |
 | `osl/src/blocking.rs` | `blocking()` async-to-sync bridge |
 | `osl/src/file.rs` | `VfsHandle`, `DirHandle` (VFS-backed file handles) |
-| `osl/src/dispatch.rs` | Syscall dispatch: read/write/close/open/getdents64/getcwd/chdir/spawn/waitpid |
+| `osl/src/syscalls/` | Syscall dispatch and implementations: read/write/close/open/getdents64/getcwd/chdir/spawn/waitpid |
 | `osl/src/spawn.rs` | `spawn_process_full` with argv + parent PID |
 | `libkernel/src/syscall.rs` | SYSCALL assembly entry stub, PER_CPU data, init |
 | `kernel/src/ring3.rs` | Legacy `spawn_process` wrapper, blob spawning tests |

@@ -18,7 +18,7 @@ Always returns 0 (success). Each process is single-threaded, so musl's internal 
 (used by stdio, malloc, etc.) are never contended. The `FUTEX_WAIT` path is never
 reached in practice, and `FUTEX_WAKE` returning 0 (no waiters woken) is correct.
 
-**Source:** `osl/src/dispatch.rs` — inline in `syscall_dispatch`
+**Source:** `osl/src/syscalls/mod.rs` — inline stub in `syscall_dispatch`
 
 ## Future Work
 

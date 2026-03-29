@@ -28,7 +28,7 @@ Both are handled identically in ostoo since each process currently has exactly o
 
 Zombie processes are reaped by `waitpid` (when a parent collects exit status) or lazily by `reap_zombies()` at the start of `spawn_process`.
 
-**Source:** `osl/src/dispatch.rs` — `sys_exit`
+**Source:** `osl/src/syscalls/process.rs` — `sys_exit`
 
 ## Future Work
 

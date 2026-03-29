@@ -29,4 +29,4 @@ Lock ordering: PROCESS_TABLE first (VMA split), then MEMORY (page table update).
 
 Returns 0 (no-op) if no VMAs overlap the requested range (Linux semantics).
 
-**Source:** `osl/src/dispatch.rs` (`sys_mprotect`), `libkernel/src/process.rs` (`mprotect_vmas`), `libkernel/src/memory/mod.rs` (`update_user_page_flags`)
+**Source:** `osl/src/syscalls/mem.rs` (`sys_mprotect`), `libkernel/src/process.rs` (`mprotect_vmas`), `libkernel/src/memory/mod.rs` (`update_user_page_flags`)

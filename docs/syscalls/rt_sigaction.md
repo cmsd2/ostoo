@@ -15,4 +15,4 @@ Examine and change a signal action.
 
 **Stub:** Returns 0 (success) unconditionally. No signal support is implemented. musl's runtime init calls `rt_sigaction` to install default signal handlers; the stub allows this to succeed silently.
 
-**Source:** `osl/src/dispatch.rs` — match arm returns `0`
+**Source:** `osl/src/signal.rs` — `sys_rt_sigaction`

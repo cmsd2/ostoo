@@ -37,7 +37,7 @@ Reads directory entries from a directory file descriptor into a buffer. Returns 
 
 The directory listing is loaded entirely at `open()` time and cached in the `DirHandle`.
 
-**Source:** `osl/src/dispatch.rs` — `sys_getdents64`, `osl/src/file.rs` — `DirHandle::getdents64`
+**Source:** `osl/src/syscalls/io.rs` — `sys_getdents64`, `osl/src/file.rs` — `DirHandle::getdents64`
 
 ## Usage from C (musl)
 

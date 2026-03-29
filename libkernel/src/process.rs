@@ -34,21 +34,26 @@ pub struct Vma {
     pub offset: u64,       // file offset (Phase 5)
 }
 
+/// Convert Linux `PROT_*` flags to x86-64 page table flags.
+pub fn prot_to_page_flags(prot: u32) -> PageTableFlags {
+    if prot == PROT_NONE {
+        // No PRESENT bit — any access will fault.
+        return PageTableFlags::USER_ACCESSIBLE;
+    }
+    let mut f = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if prot & PROT_WRITE != 0 {
+        f |= PageTableFlags::WRITABLE;
+    }
+    if prot & PROT_EXEC == 0 {
+        f |= PageTableFlags::NO_EXECUTE;
+    }
+    f
+}
+
 impl Vma {
     /// Translate VMA protection flags to x86-64 page table flags.
     pub fn page_table_flags(&self) -> PageTableFlags {
-        if self.prot == PROT_NONE {
-            // No PRESENT bit — any access will fault.
-            return PageTableFlags::USER_ACCESSIBLE;
-        }
-        let mut f = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-        if self.prot & PROT_WRITE != 0 {
-            f |= PageTableFlags::WRITABLE;
-        }
-        if self.prot & PROT_EXEC == 0 {
-            f |= PageTableFlags::NO_EXECUTE;
-        }
-        f
+        prot_to_page_flags(self.prot)
     }
 }
 

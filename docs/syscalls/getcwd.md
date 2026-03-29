@@ -20,7 +20,7 @@ Copies the absolute pathname of the current working directory into `buf`. On suc
 
 Each process has its own `cwd` field (default `"/"`), updated by `chdir`.
 
-**Source:** `osl/src/dispatch.rs` — `sys_getcwd`
+**Source:** `osl/src/syscalls/fs.rs` — `sys_getcwd`
 
 ## Usage from C (musl)
 

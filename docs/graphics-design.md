@@ -197,7 +197,7 @@ protocol over virtqueues:
 |------|-------------|
 | `libkernel/src/framebuffer.rs` | BGA register access, Framebuffer struct |
 | `libkernel/src/font.rs` | Embedded 8x16 bitmap font + draw_char() |
-| `libkernel/src/vga_buffer.rs` | DisplayBackend abstraction, Writer refactoring |
+| `libkernel/src/vga_buffer/` | DisplayBackend abstraction, Writer refactoring (mod.rs, capture.rs, timeline.rs) |
 | `kernel/src/main.rs` | init_bga_framebuffer() boot integration |
 
 ## Status

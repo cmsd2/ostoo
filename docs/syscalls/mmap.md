@@ -23,7 +23,7 @@ Maps pages of memory into the calling process's address space.
 
 **Lock ordering:** Process table lock is acquired and released first (to read `mmap_next` and `pml4_phys`), then the memory lock is held for allocation/mapping, then the process table lock is re-acquired to update state. This avoids nested lock deadlocks.
 
-**Source:** `osl/src/dispatch.rs` — `sys_mmap`
+**Source:** `osl/src/syscalls/mem.rs` — `sys_mmap`
 
 ## Future Work
 

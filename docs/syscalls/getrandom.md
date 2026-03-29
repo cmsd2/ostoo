@@ -16,7 +16,7 @@ Uses a simple xorshift64\* PRNG seeded from the x86 TSC (Time Stamp Counter via 
 
 **Note:** This is not cryptographically secure. It provides enough entropy for `HashMap` seeds and similar non-security use cases.
 
-**Source:** `osl/src/dispatch.rs` — `sys_getrandom`
+**Source:** `osl/src/syscalls/misc.rs` — `sys_getrandom`
 
 ## Errors
 

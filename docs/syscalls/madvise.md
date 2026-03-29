@@ -14,4 +14,4 @@ Give advice about use of memory.
 
 **Stub:** Returns 0 (success) unconditionally. All advice is ignored. musl and Rust std may call `madvise(MADV_DONTNEED)` on freed memory regions.
 
-**Source:** `osl/src/dispatch.rs` — match arm returns `0`
+**Source:** `osl/src/syscalls/mod.rs` — inline stub in `syscall_dispatch`

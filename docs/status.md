@@ -29,7 +29,7 @@ Toolchain: current nightly (floating, `rust-toolchain.toml`).
 - Entry point via `entry_point!` macro (`libkernel_main` in `kernel/src/main.rs`).
 
 ### 3. VGA Text Mode
-- `libkernel/src/vga_buffer.rs` — a `Writer` behind a `spin::Mutex`.
+- `libkernel/src/vga_buffer/mod.rs` — a `Writer` behind a `spin::Mutex`.
 - `print!` / `println!` macros available globally.
 - Volatile writes to avoid compiler optimisation of MMIO.
 - Hardware cursor (CRTC registers 0x3D4/0x3D5) kept in sync on every write.
@@ -146,7 +146,7 @@ are present, racing all event sources in a single future.
 ### User Space and Process Isolation
 - Full ring-3 process support with per-process page tables, SYSCALL/SYSRET,
   and preemptive scheduling.
-- 30+ Linux-compatible syscalls in `osl/src/dispatch.rs`.
+- 30+ Linux-compatible syscalls in `osl/src/syscalls/`.
 - Per-process FD table, CWD tracking, parent/child relationships, zombie
   lifecycle with `wait4`/`reap`.
 - ELF loader for static x86-64 binaries; initial stack with `argc/argv/auxv`.

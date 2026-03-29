@@ -21,7 +21,7 @@ Looks up `fd` in the current process's per-process file descriptor table and cal
 
 Validates that `buf` falls within user address space (`< 0x0000_8000_0000_0000`). Returns `-EFAULT` (-14) on invalid pointers. Returns 0 immediately if `count` is 0.
 
-**Source:** `osl/src/dispatch.rs` — `sys_read`
+**Source:** `osl/src/syscalls/io.rs` — `sys_read`
 
 ## Future Work
 

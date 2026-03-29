@@ -110,7 +110,7 @@ All unit tests live in libkernel and run via
 | File | Tests | What they cover |
 |------|-------|-----------------|
 | `libkernel/src/path.rs` | 13 | normalize and resolve: dots, dotdot, root, relative, absolute |
-| `libkernel/src/vga_buffer.rs` | 8 | println output, color encoding, FixedBuf formatting |
+| `libkernel/src/vga_buffer/mod.rs` | 8 | println output, color encoding, FixedBuf formatting |
 | `libkernel/src/md5.rs` | 7 | MD5 hash (RFC 1321 test vectors) |
 | `libkernel/src/allocator/mod.rs` | 3 | align_up correctness and boundary conditions |
 | `libkernel/src/memory/vmem_allocator.rs` | 3 | Virtual memory allocator state and page tracking |

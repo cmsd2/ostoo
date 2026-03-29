@@ -16,7 +16,7 @@ Always returns 0 (success) without recording anything. Both arguments are ignore
 
 This is sufficient for musl's startup, which registers a robust list as part of thread initialisation.
 
-**Source:** `osl/src/dispatch.rs` — inline in `syscall_dispatch`
+**Source:** `osl/src/syscalls/mod.rs` — inline stub in `syscall_dispatch`
 
 ## Future Work
 

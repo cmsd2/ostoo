@@ -27,7 +27,7 @@ Sets the end of the process's data segment (the "program break"). Increasing the
 
 **Lock ordering:** Process table lock is acquired/released to read state, then memory lock for allocation, then process table lock again to write the update.
 
-**Source:** `osl/src/dispatch.rs` — `sys_brk`
+**Source:** `osl/src/syscalls/mem.rs` — `sys_brk`
 
 ## Future Work
 

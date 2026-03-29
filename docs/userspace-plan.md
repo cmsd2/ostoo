@@ -91,7 +91,7 @@ including `pipe2`, `dup2`, `fcntl`, `getpid`, `getrandom`, and `clone`/`execve`.
 | `libkernel/src/memory/mod.rs` | `create_user_page_table`, `map_user_page`, `switch_address_space` |
 | `libkernel/src/task/scheduler.rs` | `spawn_user_thread`, `process_trampoline`, CR3 switching in `preempt_tick`, block/unblock |
 | `libkernel/src/interrupts.rs` | Ring-3-aware page fault, GPF, and invalid opcode handlers |
-| `osl/src/dispatch.rs` | `syscall_dispatch` (all 21 syscall implementations) |
+| `osl/src/syscalls/` | `syscall_dispatch` + syscall implementations (io.rs, fs.rs, mem.rs, process.rs, misc.rs) |
 | `osl/src/errno.rs` | Linux errno constants, `file_errno()` / `vfs_errno()` converters |
 | `osl/src/file.rs` | `VfsHandle`, `DirHandle` (VFS-backed file handles) |
 | `osl/src/blocking.rs` | Async-to-sync bridge for VFS calls |
@@ -99,7 +99,7 @@ including `pipe2`, `dup2`, `fcntl`, `getpid`, `getrandom`, and `clone`/`execve`.
 | `kernel/src/ring3.rs` | Legacy `spawn_process` wrapper, `spawn_blob` (raw code), test helpers |
 | `kernel/src/keyboard_actor.rs` | Foreground routing: raw bytes to console or kernel line editor |
 | `kernel/src/main.rs` | Auto-launch `/shell` on boot |
-| `devices/src/vfs/proc_vfs.rs` | ProcVfs with 12 virtual files |
+| `devices/src/vfs/proc_vfs/mod.rs` | ProcVfs with 12+ virtual files (generator submodules) |
 | `user/shell.c` | Userspace shell (musl, static) |
 | `docs/syscalls/*.md` | Per-syscall documentation |
 
@@ -547,7 +547,7 @@ kernel's phys_mem_offset window.  `build_initial_stack()` writes:
 [RSP points here, 16-byte aligned]
 ```
 
-### 4d. Syscall table (`osl/src/dispatch.rs`)
+### 4d. Syscall table (`osl/src/syscalls/mod.rs`)
 
 All syscalls use Linux x86-64 numbers for musl compatibility.  Unhandled
 numbers log a warning and return `-ENOSYS`.  Errno constants are defined

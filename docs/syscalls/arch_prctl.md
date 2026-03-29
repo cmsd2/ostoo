@@ -15,7 +15,7 @@ Sets or gets architecture-specific thread state. On x86-64, primarily used to se
 - **`ARCH_SET_FS` (0x1002):** Writes `addr` to the `IA32_FS_BASE` MSR (0xC000_0100). This is how musl sets up its TLS pointer during C runtime initialisation. Returns 0 on success.
 - **All other codes:** Returns `-EINVAL` (-22).
 
-**Source:** `osl/src/dispatch.rs` — `sys_arch_prctl`
+**Source:** `osl/src/syscalls/misc.rs` — `sys_arch_prctl`
 
 ## Future Work
 

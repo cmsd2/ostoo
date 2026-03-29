@@ -1,15 +1,9 @@
 //! ELF process spawning with argv and parent PID support.
 
-use libkernel::consts::{PAGE_SIZE, PAGE_MASK};
-use libkernel::memory::with_memory;
+use libkernel::consts::PAGE_SIZE;
 use libkernel::process::{Process, ProcessId};
-use x86_64::structures::paging::PageTableFlags;
-use x86_64::VirtAddr;
 
-/// 8-page (32 KiB) user stack for ELF processes, placed at a high user address.
-const ELF_STACK_PAGES: usize = 8;
-const ELF_STACK_SIZE: u64 = (ELF_STACK_PAGES as u64) * PAGE_SIZE;
-const ELF_STACK_VIRT: u64 = 0x0000_7FFF_F000_0000;
+use crate::elf_loader;
 
 /// Spawn with argv and explicit parent.
 /// Used by the spawn syscall.
@@ -19,12 +13,10 @@ pub fn spawn_process_full(
     envp: &[&[u8]],
     parent_pid: ProcessId,
 ) -> Result<ProcessId, &'static str> {
-    use libkernel::elf::{self, PF_W, PF_X};
-
     // Free kernel stacks of previously exited processes so the heap doesn't run out.
     libkernel::process::reap_zombies();
 
-    let info = elf::parse(elf_data).map_err(|e| {
+    let info = libkernel::elf::parse(elf_data).map_err(|e| {
         log::error!("ELF parse error: {:?} (data len={}, first 4 bytes={:02x?})",
             e, elf_data.len(), &elf_data[..elf_data.len().min(4)]);
         "invalid ELF binary"
@@ -34,102 +26,15 @@ pub fn spawn_process_full(
         return Err("ELF has no loadable segments");
     }
 
-    let (pml4_phys, stack_kernel_base) = with_memory(|mem| {
-        let pml4_phys = mem.create_user_page_table();
-        let phys_off = mem.phys_mem_offset();
+    let (pml4_phys, stack_kernel_base) = elf_loader::load_elf_address_space(elf_data, &info)?;
 
-        // Map each PT_LOAD segment.
-        for seg in &info.segments {
-            let page_start = seg.vaddr & !PAGE_MASK;
-            let page_end = (seg.vaddr + seg.memsz + PAGE_MASK) & !PAGE_MASK;
-            let num_pages = ((page_end - page_start) / PAGE_SIZE) as usize;
-
-            for p in 0..num_pages {
-                let page_vaddr = page_start + (p as u64) * PAGE_SIZE;
-                let frame_phys = mem.alloc_dma_pages(1)
-                    .expect("spawn_process: out of frames");
-
-                let dst_base = phys_off + frame_phys.as_u64();
-                unsafe {
-                    libkernel::consts::clear_page(dst_base.as_mut_ptr::<u8>());
-                }
-
-                let page_off_in_seg = page_vaddr.wrapping_sub(seg.vaddr);
-                let copy_start_in_page = if page_vaddr < seg.vaddr {
-                    (seg.vaddr - page_vaddr) as usize
-                } else {
-                    0
-                };
-                let seg_offset_for_page = if page_vaddr >= seg.vaddr {
-                    page_off_in_seg
-                } else {
-                    0
-                };
-
-                if seg_offset_for_page < seg.filesz {
-                    let avail = (seg.filesz - seg_offset_for_page) as usize;
-                    let room = PAGE_SIZE as usize - copy_start_in_page;
-                    let count = avail.min(room);
-                    let src = &elf_data[(seg.offset + seg_offset_for_page) as usize..][..count];
-                    unsafe {
-                        let dst = (dst_base + copy_start_in_page as u64).as_mut_ptr::<u8>();
-                        core::ptr::copy_nonoverlapping(src.as_ptr(), dst, count);
-                    }
-                }
-
-                let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-                if seg.flags & PF_W != 0 {
-                    flags |= PageTableFlags::WRITABLE;
-                }
-                if seg.flags & PF_X == 0 {
-                    flags |= PageTableFlags::NO_EXECUTE;
-                }
-
-                mem.map_user_page(
-                    pml4_phys,
-                    VirtAddr::new(page_vaddr),
-                    frame_phys,
-                    flags,
-                ).expect("spawn_process: failed to map segment page");
-            }
-        }
-
-        // Map 8-page user stack (RW, NX) using contiguous physical pages.
-        let stack_phys = mem.alloc_dma_pages(ELF_STACK_PAGES)
-            .expect("spawn_process: out of frames (stack)");
-        let stack_kernel_base = phys_off + stack_phys.as_u64();
-        unsafe {
-            core::ptr::write_bytes(
-                stack_kernel_base.as_mut_ptr::<u8>(), 0,
-                ELF_STACK_SIZE as usize,
-            );
-        }
-
-        let stack_flags = crate::dispatch::USER_DATA_FLAGS;
-        for i in 0..ELF_STACK_PAGES {
-            let page_phys = x86_64::PhysAddr::new(stack_phys.as_u64() + (i as u64) * PAGE_SIZE);
-            let page_virt = VirtAddr::new(ELF_STACK_VIRT + (i as u64) * PAGE_SIZE);
-            mem.map_user_page(pml4_phys, page_virt, page_phys, stack_flags)
-                .expect("spawn_process: failed to map stack page");
-        }
-
-        (pml4_phys, stack_kernel_base)
-    });
-
-    // Compute brk_base: page-aligned end of highest PT_LOAD segment.
-    let brk_base = {
-        let max_end = info.segments.iter()
-            .map(|s| s.vaddr + s.memsz)
-            .max()
-            .unwrap_or(0);
-        (max_end + PAGE_MASK) & !PAGE_MASK
-    };
+    let brk_base = elf_loader::compute_brk_base(&info);
 
     // Build the initial user stack: argc/argv/envp/auxv.
     let user_rsp = build_initial_stack(
         stack_kernel_base,
-        ELF_STACK_VIRT,
-        ELF_STACK_SIZE,
+        elf_loader::ELF_STACK_VIRT,
+        elf_loader::ELF_STACK_SIZE,
         &info,
         argv,
         envp,
@@ -173,7 +78,7 @@ pub fn spawn_process_full(
 /// [RSP points here, 16-byte aligned]
 /// ```
 pub fn build_initial_stack(
-    kernel_base: VirtAddr,
+    kernel_base: x86_64::VirtAddr,
     user_virt_base: u64,
     stack_size: u64,
     info: &libkernel::elf::ElfInfo,

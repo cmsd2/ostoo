@@ -17,7 +17,7 @@ Looks up `fd` in the current process's file descriptor table. If found, calls `F
 - Returns 0 on success.
 - Returns `-EBADF` (-9) if the fd is not open or out of range.
 
-**Source:** `osl/src/dispatch.rs` — `sys_close`
+**Source:** `osl/src/syscalls/fs.rs` — `sys_close`
 
 ## Future Work
 

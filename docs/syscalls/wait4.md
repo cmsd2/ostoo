@@ -30,7 +30,7 @@ Called as syscall number 61 (`wait4`). The `rusage` parameter is ignored.
    - When woken (by a child calling `sys_exit`), loops back to step 3.
 6. **If no children exist at all:** Returns `-ECHILD` (-10).
 
-**Source:** `osl/src/dispatch.rs` — `sys_wait4`
+**Source:** `osl/src/syscalls/process.rs` — `sys_wait4`
 
 ## Usage from C (musl)
 

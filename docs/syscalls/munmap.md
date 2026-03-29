@@ -14,7 +14,7 @@ Removes mappings for the specified address range, causing further references to 
 
 Fully implemented. Validates arguments, splits/removes VMAs, unmaps page table entries, frees physical frames to the free list, and flushes the TLB.
 
-**Source:** `osl/src/dispatch.rs` — `sys_munmap`
+**Source:** `osl/src/syscalls/mem.rs` — `sys_munmap`
 
 ### Behaviour
 
