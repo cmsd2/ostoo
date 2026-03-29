@@ -163,8 +163,7 @@ Key properties:
 
 ## Syscall Interface
 
-Three new syscalls using custom numbers (continuing from the existing `spawn`
-at 500):
+Three syscalls using custom numbers in the 500+ range:
 
 | Nr | Name | Signature |
 |---|---|---|
@@ -758,9 +757,8 @@ IOCP, and Fuchsia ports.
 
 ### Custom syscall numbers (501-503)
 
-Continuing the custom numbering from `spawn` (500).  These are not Linux
-syscall numbers — ostoo already uses custom numbers for OS-specific
-functionality.  If Linux compatibility is needed later, a shim layer can map
+The 500+ range is reserved for ostoo-specific syscalls.  These are not Linux
+syscall numbers.  If Linux compatibility is needed later, a shim layer can map
 Linux's `io_uring_setup`/`io_uring_enter` numbers to the ostoo equivalents.
 
 ### Kernel-buffered queue

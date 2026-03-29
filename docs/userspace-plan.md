@@ -15,11 +15,10 @@ through system calls, and eventually linked against a ported musl libc.
 Phases 0–6 are **complete**.  The kernel runs a musl-linked C shell
 (`user/shell.c`) as its primary user interface.  The shell auto-launches on
 boot, supports line editing, built-in commands (`echo`, `pwd`, `cd`, `ls`,
-`cat`, `exit`, `help`), and spawning external programs.  Process creation
-supports both the custom `spawn` syscall (nr 500) and standard Linux
-`clone(CLONE_VM|CLONE_VFORK)` + `execve`, enabling unpatched musl
-`posix_spawn` and Rust `std::process::Command`.  30+ syscalls are implemented
-including `pipe2`, `dup2`, `fcntl`, `getpid`, `getrandom`, and `clone`/`execve`.
+`cat`, `exit`, `help`), and spawning external programs.  Process creation uses standard Linux `clone(CLONE_VM|CLONE_VFORK)` + `execve`,
+enabling unpatched musl `posix_spawn` and Rust `std::process::Command`.
+35+ syscalls are implemented including `pipe2`, `dup2`, `fcntl`, `getpid`,
+`getrandom`, `clone`/`execve`, and custom completion port / IPC syscalls.
 
 | Phase | Status | Milestone |
 |-------|--------|-----------|
@@ -29,7 +28,7 @@ including `pipe2`, `dup2`, `fcntl`, `getpid`, `getrandom`, and `clone`/`execve`.
 | 3 — Process abstraction | **Done** | `Process` struct, process table, ELF loader, `exec` shell command, zombie reaping |
 | 4 — System call layer | **Done** | 14 syscalls implemented; initial stack with auxv; `brk`/`mmap` for heap; `writev` for musl printf |
 | 5 — Cross-compiler + musl | **Done** | Docker-based musl cross-compiler (`scripts/user-build.sh`); static musl binaries run on ostoo |
-| 6 — Spawn / wait / user shell | **Done** | Custom `spawn` syscall (nr 500) + `wait4`; `clone(CLONE_VM\|CLONE_VFORK)` + `execve` for standard process creation; `pipe2`, `dup2`, `fcntl`, `getpid`, `getrandom`; userspace C shell with line editing, auto-launched on boot |
+| 6 — Spawn / wait / user shell | **Done** | `clone(CLONE_VM\|CLONE_VFORK)` + `execve` for process creation; `wait4`; `pipe2`, `dup2`, `fcntl`, `getpid`, `getrandom`; userspace C shell with line editing, auto-launched on boot |
 | 7 — Signals | **Not started** | Requires signal frame push/pop, `rt_sigaction`, `rt_sigreturn` |
 
 ### What works today
@@ -40,21 +39,26 @@ including `pipe2`, `dup2`, `fcntl`, `getpid`, `getrandom`, and `clone`/`execve`.
 - Line editing in the shell: read char-by-char, echo, backspace, Ctrl+C
   (cancel line), Ctrl+D (exit on empty line).
 - Built-in commands: `echo`, `pwd`, `cd`, `ls`, `cat`, `exit`, `help`.
-- External programs: `spawn(path)` + `waitpid` from the shell.
+- External programs: `posix_spawn(path)` + `waitpid` from the shell.
 - Raw keypress delivery to userspace via `libkernel/src/console.rs`:
   foreground PID routing, blocking `read(0)`, keyboard ISR wakeup.
 - Per-process FD table (fds 0–2 = `ConsoleHandle`); `FileHandle` trait with
   `ConsoleHandle`, `VfsHandle`, and `DirHandle` implementations.
-- **21 syscalls** implemented (see `docs/syscalls/` for per-syscall docs):
+- **35+ syscalls** implemented (see `docs/syscalls/` for per-syscall docs):
   `read`, `write`, `open`, `close`, `fstat`, `lseek`, `mmap`, `mprotect`,
   `munmap`, `brk`, `ioctl`, `writev`, `exit`/`exit_group`, `wait4`,
   `getcwd`, `chdir`, `arch_prctl`, `futex`, `getdents64`,
-  `set_tid_address`, `set_robust_list`, `spawn` (custom nr 500).
+  `set_tid_address`, `set_robust_list`, `clone`, `execve`, `pipe2`,
+  `dup2`, `fcntl`, `getpid`, `getrandom`, `kill`, `rt_sigaction`,
+  `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `madvise`,
+  `sched_getaffinity`, `clock_gettime`, plus custom syscalls for
+  completion ports (501–503), IRQ (504), and IPC channels (505–507).
 - `open` resolves paths relative to process CWD; supports both files
   (`VfsHandle`) and directories (`DirHandle` with `O_DIRECTORY`).
 - `getdents64` returns `linux_dirent64` structs from `DirHandle`.
-- `spawn` reads an ELF from VFS, creates a child process with argv, sets
-  child as foreground.  `wait4` blocks parent until child exits/zombies.
+- `clone(CLONE_VM|CLONE_VFORK)` creates a child sharing the parent's address
+  space; `execve` replaces it with a new ELF binary.  `wait4` blocks parent
+  until child exits/zombies.
 - `writev` (used by musl's `printf`) writes scatter/gather buffers to VGA.
 - `brk` grows the process heap by allocating and mapping zero-filled pages.
 - `mmap` supports anonymous `MAP_PRIVATE` allocations via a bump-down allocator
@@ -577,7 +581,6 @@ in `osl/src/errno.rs`; libkernel uses `FileError` for structured errors.
 | 218 | `set_tid_address` | Returns current PID as TID |
 | 231 | `exit_group` | Same as `exit` (single-threaded) |
 | 273 | `set_robust_list` | No-op, returns 0 |
-| 500 | `spawn` (custom) | Path + argv; read ELF from VFS; `osl::spawn::spawn_process_full` |
 
 Lock ordering for `brk` and `mmap`: process table lock acquired/released to
 read state, then memory lock for frame allocation and page mapping, then process
@@ -680,44 +683,47 @@ pub extern "C" fn main() {
 
 **What was implemented:**
 
-Instead of `fork` + `exec` (which requires CoW page faults), a custom
-`spawn` syscall (nr 500) combines process creation and ELF loading in a
-single kernel call.  This avoids the complexity of CoW while providing the
-same end-user functionality.
+Process creation uses the standard Linux `clone(CLONE_VM|CLONE_VFORK)` +
+`execve` path.  musl's `posix_spawn` and Rust's `std::process::Command`
+work unmodified.
 
-### 6a. `spawn` syscall (nr 500)
+### 6a. `clone` (syscall 56)
 
-`spawn(path_ptr, path_len, argv_ptr, argv_count) -> child_pid`
+`clone(CLONE_VM|CLONE_VFORK|SIGCHLD)` creates a child sharing the parent's
+address space.  The parent blocks until the child calls `execve` or `_exit`.
 
-- Reads path and argv strings from userspace
-- Reads ELF from VFS via `osl::blocking::blocking()`
-- Calls `osl::spawn::spawn_process_full()` with argv and parent PID
-- Sets child as foreground process (`console::set_foreground`)
-- Returns child PID (or negative errno)
+See [clone](syscalls/clone.md).
 
-### 6b. `wait4` (syscall 61)
+### 6b. `execve` (syscall 59)
+
+Replaces the current process image with a new ELF binary.  Reads from VFS,
+creates a fresh PML4, maps segments, builds the initial stack, closes
+CLOEXEC fds, unblocks the vfork parent, and jumps to userspace.
+
+See [execve](syscalls/execve.md).
+
+### 6c. `wait4` (syscall 61)
 
 - `sys_wait4(pid, status_ptr, options)` — find zombie child, write exit
   status, reap, return child PID
 - If no zombie found: register `wait_thread` on parent, block, retry on wake
 - `sys_exit` wakes parent's `wait_thread` via `scheduler::unblock()`
 
-### 6c. Userspace shell (`user/shell.c`)
+### 6d. Userspace shell (`user/shell.c`)
 
 - Compiled with musl (static), deployed at `/shell`
 - Line editing: read char-by-char, echo, backspace, Ctrl+C, Ctrl+D
 - Built-in commands: `echo`, `pwd`, `cd`, `ls`, `cat`, `exit`, `help`
-- External programs: `spawn(path)` + `waitpid(child, &status, 0)`
+- External programs: `posix_spawn(path)` + `waitpid(child, &status, 0)`
 - Auto-launched from `kernel/src/main.rs`; falls back to kernel shell if
   `/shell` is not found on the filesystem
 
-### 6d. What's deferred
+### 6e. What's deferred
 
 - **`fork` + CoW page faults** — standard POSIX `fork` is not implemented.
   Adding it would require: marking all user pages read-only in both parent
   and child, a CoW page fault handler that copies on write, and reference
-  counting on physical frames.  The `spawn` syscall covers the primary use
-  case (launching programs) without this complexity.
+  counting on physical frames.
 
 ---
 

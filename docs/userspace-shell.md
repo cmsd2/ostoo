@@ -163,7 +163,7 @@ Spawns the async VFS operation as a kernel task, blocks the user thread, unblock
 
 ## Phase 5: Process Management Syscalls  ✅ COMPLETE
 
-**Goal:** chdir/getcwd, spawn, waitpid.
+**Goal:** chdir/getcwd, process creation (clone+execve), waitpid.
 
 ### 5a: chdir / getcwd
 
@@ -173,30 +173,25 @@ Spawns the async VFS operation as a kernel task, blocks the user thread, unblock
 - `sys_chdir` (nr 80): validate path exists via `osl::blocking::blocking(devices::vfs::list_dir(path))`, update `process.cwd`
 - `sys_getcwd` (nr 79): copy `process.cwd` to user buffer
 
-### 5b: spawn syscall (custom nr 500)
+### 5b: Process spawning (clone + execve)
 
-**File:** `osl/src/syscalls/process.rs`
+Process creation uses standard Linux `clone(CLONE_VM|CLONE_VFORK)` + `execve`.
+musl's `posix_spawn` and Rust's `std::process::Command` work unmodified.
 
-Signature: `spawn(path_ptr, path_len, argv_ptr, argv_count) -> pid`
+See [clone](syscalls/clone.md) and [execve](syscalls/execve.md).
 
-- Read path from userspace
-- Read argv strings from userspace (array of pointers to null-terminated strings)
-- Use `osl::blocking::blocking()` to read ELF from VFS
-- Call `osl::spawn::spawn_process_full()` with argv and parent_pid
-- Set child as foreground process (`console::set_foreground(child_pid)`)
-- Return child PID
-
-### 5c: Extend spawn_process for argv and parent tracking
+### 5c: spawn_process_full (kernel-side ELF spawning)
 
 **File:** `osl/src/spawn.rs`
 
-- `spawn_process_full` takes `elf_data`, `argv: &[&[u8]]`, and `parent_pid: ProcessId` params
+- `spawn_process_full` takes `elf_data`, `argv: &[&[u8]]`, `envp: &[&[u8]]`, and `parent_pid: ProcessId` params
 - `build_initial_stack` writes argv strings + pointer array + argc (Linux x86_64 ABI)
 
 **File:** `libkernel/src/process.rs`
 
-- Add `parent_pid: ProcessId` to `Process`
-- Add `wait_thread: Option<usize>` (thread to wake on child exit)
+- `parent_pid: ProcessId` on `Process`
+- `wait_thread: Option<usize>` (thread to wake on child exit)
+- `vfork_parent_thread: Option<usize>` (thread to unblock after execve)
 
 ### 5d: waitpid (syscall 61 / wait4)
 
@@ -232,8 +227,8 @@ Signature: `spawn(path_ptr, path_len, argv_ptr, argv_count) -> pid`
   - `ls [path]` — `open()` + `getdents64()` loop + `close()`
   - `cat <file>` — `open()` + `read()` loop + `close()`
   - `exit` — `_exit(0)`
-  - Anything else — try `spawn(cmd)` + `waitpid()`, print error if spawn fails
-- **Custom syscall wrappers:** `sys_spawn()` and `sys_waitpid()` via musl's `syscall()` function
+  - Anything else — try `posix_spawn(cmd)` + `waitpid()`, print error if spawn fails
+- **Process spawning:** uses `posix_spawn()` (musl's wrapper around `clone` + `execve`)
 
 ### 6b: Build
 
@@ -268,7 +263,7 @@ Automatic via the keyboard routing in Phase 3c: when foreground PID is 0 (kernel
 | `osl/src/errno.rs` | Linux errno constants, `file_errno()` / `vfs_errno()` converters |
 | `osl/src/blocking.rs` | `blocking()` async-to-sync bridge |
 | `osl/src/file.rs` | `VfsHandle`, `DirHandle` (VFS-backed file handles) |
-| `osl/src/syscalls/` | Syscall dispatch and implementations: read/write/close/open/getdents64/getcwd/chdir/spawn/waitpid |
+| `osl/src/syscalls/` | Syscall dispatch and implementations: read/write/close/open/getdents64/getcwd/chdir/clone/execve/waitpid |
 | `osl/src/spawn.rs` | `spawn_process_full` with argv + parent PID |
 | `libkernel/src/syscall.rs` | SYSCALL assembly entry stub, PER_CPU data, init |
 | `kernel/src/ring3.rs` | Legacy `spawn_process` wrapper, blob spawning tests |

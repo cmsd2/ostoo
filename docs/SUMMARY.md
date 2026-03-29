@@ -50,6 +50,7 @@
 - [brk (12)](syscalls/brk.md)
 - [rt_sigaction (13)](syscalls/rt_sigaction.md)
 - [rt_sigprocmask (14)](syscalls/rt_sigprocmask.md)
+- [rt_sigreturn (15)](syscalls/rt_sigreturn.md)
 - [ioctl (16)](syscalls/ioctl.md)
 - [writev (20)](syscalls/writev.md)
 - [pipe / pipe2 (22, 293)](syscalls/pipe2.md)
@@ -60,6 +61,7 @@
 - [execve (59)](syscalls/execve.md)
 - [exit / exit_group (60, 231)](syscalls/exit.md)
 - [wait4 (61)](syscalls/wait4.md)
+- [kill (62)](syscalls/kill.md)
 - [fcntl (72)](syscalls/fcntl.md)
 - [getcwd (79)](syscalls/getcwd.md)
 - [chdir (80)](syscalls/chdir.md)
@@ -72,7 +74,16 @@
 - [clock_gettime (228)](syscalls/clock_gettime.md)
 - [set_robust_list (273)](syscalls/set_robust_list.md)
 - [getrandom (318)](syscalls/getrandom.md)
-- [spawn (500)](syscalls/spawn.md)
+
+## Custom Syscalls
+
+- [io_create (501)](syscalls/io_create.md)
+- [io_submit (502)](syscalls/io_submit.md)
+- [io_wait (503)](syscalls/io_wait.md)
+- [irq_create (504)](syscalls/irq_create.md)
+- [ipc_create (505)](syscalls/ipc_create.md)
+- [ipc_send (506)](syscalls/ipc_send.md)
+- [ipc_recv (507)](syscalls/ipc_recv.md)
 
 # Userspace
 

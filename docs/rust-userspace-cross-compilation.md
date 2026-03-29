@@ -131,7 +131,7 @@ Depend on `ostoo-rt` with `default-features = false` (disables `no_std` so
 
 - **Syscall wrappers** (always) — `syscall0` through `syscall4` via inline asm
   (SYSCALL instruction). Typed wrappers: `write`, `read`, `open`, `close`,
-  `exit`, `brk`, `getcwd`, `chdir`, `getdents64`, `spawn`, `wait4`.
+  `exit`, `brk`, `getcwd`, `chdir`, `getdents64`, `wait4`.
 
 - **`print!`/`println!`/`eprint!`/`eprintln!` macros** (always) — write to
   fd 1/2 via `core::fmt::Write`. In `std` mode, prefer `std::println!` instead.
