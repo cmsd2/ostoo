@@ -157,14 +157,19 @@ are present, racing all event sources in a single future.
 - See [`docs/userspace-plan.md`](userspace-plan.md) for the full roadmap
   (Phases 0–6 complete; Phase 7 signals not yet started).
 
-### Userspace Shell (`user/shell.c`)
+### Userspace Shell (`user/src/shell.c`)
 - Primary user interface: musl-linked C binary, auto-launched on boot from
-  `/shell` via `kernel/src/main.rs`.
+  `/bin/shell` via `kernel/src/main.rs`.
 - Line editing: read char-by-char, echo, backspace, Ctrl+C (cancel), Ctrl+D
   (exit on empty line).
-- Built-in commands: `echo`, `pwd`, `cd`, `ls`, `cat`, `exit`, `help`.
-- External programs: `spawn(path)` + `waitpid`.
+- Built-in commands: `echo`, `pwd`, `cd`, `ls`, `cat`, `pid`, `export`, `env`,
+  `unset`, `exit`, `help`.
+- Environment variables: shell maintains an env table, passes it to children.
+  Kernel provides defaults: `PATH=/host/bin`, `HOME=/`, `TERM=dumb`,
+  `SHELL=/bin/shell`.
+- External programs: `posix_spawn(path)` + `waitpid`.
 - Built with Docker-based musl cross-compiler (`scripts/user-build.sh`).
+- Sources in `user/src/`, binaries output to `user/bin/`.
 - See [`docs/userspace-shell.md`](userspace-shell.md) for full design.
 
 ### Kernel Shell (`kernel/src/shell.rs`) — fallback
@@ -214,7 +219,7 @@ are present, racing all event sources in a single future.
 - QEMU shares `./user` directory via `-fsdev local,...,security_model=none`
   + `-device virtio-9p-pci,...,mount_tag=hostfs`.
 - Mounted at `/host` (always) and at `/` as fallback when no virtio-blk disk is
-  present, so `/shell` auto-launch works without a disk image.
+  present, so `/bin/shell` auto-launch works without a disk image.
 - PCI device IDs: `0x1AF4:0x1049` (modern), `0x1AF4:0x1009` (legacy).
 - Read-only for MVP; no write/create/delete support.
 - See [`docs/virtio-9p.md`](virtio-9p.md) for full details.

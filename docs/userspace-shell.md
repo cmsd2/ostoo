@@ -15,7 +15,9 @@ file I/O and process management.
 
 **Scope decisions:**
 - Raw keypresses to userspace (no kernel line editing for foreground user processes)
-- Minimal commands: echo, ls, cat, pwd, cd, exit, help, and running programs by name
+- Minimal commands: echo, ls, cat, pwd, cd, export, env, unset, pid, exit, help, and running programs by name
+- Environment variables: shell maintains an env table, passes it to child processes via posix_spawn
+- Kernel provides default environment on boot (PATH=/host/bin, HOME=/, TERM=dumb, SHELL=/bin/shell)
 - Kernel shell kept as fallback (dormant when userspace shell is foreground)
 - No pipes yet
 
@@ -219,7 +221,7 @@ Signature: `spawn(path_ptr, path_len, argv_ptr, argv_count) -> pid`
 
 ### 6a: shell.c
 
-**New file:** `user/shell.c`
+**New file:** `user/src/shell.c`
 
 - **Line editor:** read char by char via `read(0, &c, 1)`, handle backspace (erase `\b \b`), Enter (dispatch), Ctrl+C (cancel line), Ctrl+D (exit on empty line)
 - **Echo input:** shell echoes each typed character with `write(1, &c, 1)` since kernel delivers raw keypresses
@@ -235,11 +237,11 @@ Signature: `spawn(path_ptr, path_len, argv_ptr, argv_count) -> pid`
 
 ### 6b: Build
 
-**File:** `user/Makefile` — already handles `*.c` → static musl binaries. Just add `shell.c`.
+**File:** `user/Makefile` — builds `src/*.c` → `bin/` as static musl binaries.
 
 ### 6c: Deploy to disk image
 
-Copy compiled `shell` binary to the exFAT disk image (`fat.img.dmg`).
+Compiled `shell` binary is output to `user/bin/shell`; available in guest via 9p at `/host/bin/shell` or `/bin/shell` (fallback root mount).
 
 ### 6d: Auto-launch on boot
 

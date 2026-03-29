@@ -142,9 +142,14 @@ pub fn run_pagefault_isolated() -> ProcessId {
 /// Parse an ELF binary, create a user address space with its segments mapped,
 /// and spawn a scheduler thread for it.  Returns the new process's PID.
 ///
-/// Legacy entry point (no argv, kernel as parent).
+/// Legacy entry point (no argv/envp, kernel as parent).
 pub fn spawn_process(elf_data: &[u8]) -> Result<ProcessId, &'static str> {
-    osl::spawn::spawn_process_full(elf_data, &[], libkernel::process::ProcessId::KERNEL)
+    spawn_process_with_env(elf_data, &[])
+}
+
+/// Spawn with initial environment variables (kernel as parent).
+pub fn spawn_process_with_env(elf_data: &[u8], envp: &[&[u8]]) -> Result<ProcessId, &'static str> {
+    osl::spawn::spawn_process_full(elf_data, &[], envp, libkernel::process::ProcessId::KERNEL)
 }
 
 /// Kernel-mode test: verify that two independently-created PML4s have

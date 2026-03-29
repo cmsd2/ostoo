@@ -4,16 +4,19 @@
  * Reads raw keypresses from stdin (fd 0), performs its own line editing,
  * and dispatches built-in commands or spawns programs via posix_spawn.
  *
- * Built-in commands: echo, pwd, cd, ls, cat, exit, pid
+ * Built-in commands: echo, pwd, cd, ls, cat, pid, export, env, unset, exit
  * External programs: spawn by path (e.g. /hello)
  */
 
 #include <unistd.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <spawn.h>
 #include <fcntl.h>
+
+extern char **environ;
 
 /* ── small helpers (no libc printf to avoid buffering issues) ───────── */
 
@@ -142,6 +145,134 @@ static char *next_word(char *s) {
     return skip_ws(s);
 }
 
+/* ── environment variable table ─────────────────────────────────────── */
+
+#define MAX_ENV     64
+#define MAX_ENV_LEN 256
+
+static char  env_table[MAX_ENV][MAX_ENV_LEN];
+static int   env_count = 0;
+static char *env_ptrs[MAX_ENV + 1];
+
+static void rebuild_env_ptrs(void) {
+    for (int i = 0; i < env_count; i++)
+        env_ptrs[i] = env_table[i];
+    env_ptrs[env_count] = (char *)0;
+}
+
+/* Set "KEY=VALUE" in the table. Returns 0 on success, -1 on error. */
+static int env_set(const char *assignment) {
+    const char *eq = assignment;
+    while (*eq && *eq != '=') eq++;
+    if (*eq != '=') return -1;
+
+    int nlen = eq - assignment;
+    int idx = -1;
+    for (int i = 0; i < env_count; i++) {
+        if (memcmp(env_table[i], assignment, nlen) == 0 && env_table[i][nlen] == '=') {
+            idx = i;
+            break;
+        }
+    }
+
+    int len = strlen(assignment);
+    if (len >= MAX_ENV_LEN) return -1;
+
+    if (idx >= 0) {
+        memcpy(env_table[idx], assignment, len + 1);
+    } else {
+        if (env_count >= MAX_ENV) return -1;
+        memcpy(env_table[env_count], assignment, len + 1);
+        env_count++;
+    }
+    rebuild_env_ptrs();
+    return 0;
+}
+
+/* Remove a variable by name (just the name, no '='). */
+static void env_unset(const char *name) {
+    int nlen = strlen(name);
+    int idx = -1;
+    for (int i = 0; i < env_count; i++) {
+        if (memcmp(env_table[i], name, nlen) == 0 && env_table[i][nlen] == '=') {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) return;
+    for (int i = idx; i < env_count - 1; i++)
+        memcpy(env_table[i], env_table[i + 1], MAX_ENV_LEN);
+    env_count--;
+    rebuild_env_ptrs();
+}
+
+/* Import initial environment from the stack (set by kernel via envp). */
+static void env_init(void) {
+    if (!environ) return;
+    for (int i = 0; environ[i] && env_count < MAX_ENV; i++) {
+        int len = strlen(environ[i]);
+        if (len < MAX_ENV_LEN) {
+            memcpy(env_table[env_count], environ[i], len + 1);
+            env_count++;
+        }
+    }
+    rebuild_env_ptrs();
+}
+
+/* Get the value of an environment variable (returns pointer into env_table). */
+static const char *env_get(const char *name) {
+    int nlen = strlen(name);
+    for (int i = 0; i < env_count; i++) {
+        if (memcmp(env_table[i], name, nlen) == 0 && env_table[i][nlen] == '=')
+            return env_table[i] + nlen + 1;
+    }
+    return (const char *)0;
+}
+
+/*
+ * If `cmd` contains '/', use it as-is. Otherwise, search each PATH directory
+ * for an executable. Writes the resolved path into `out` (capacity `outsz`).
+ * Returns 1 on success, 0 if not found.
+ */
+static int resolve_command(const char *cmd, char *out, int outsz) {
+    /* Absolute or relative path — use directly. */
+    for (const char *p = cmd; *p; p++) {
+        if (*p == '/') {
+            int len = strlen(cmd);
+            if (len >= outsz) return 0;
+            memcpy(out, cmd, len + 1);
+            return 1;
+        }
+    }
+
+    const char *path = env_get("PATH");
+    if (!path) return 0;
+
+    /* Walk colon-separated PATH entries. */
+    while (*path) {
+        const char *sep = path;
+        while (*sep && *sep != ':') sep++;
+        int dlen = sep - path;
+        int clen = strlen(cmd);
+
+        if (dlen + 1 + clen < outsz) {
+            memcpy(out, path, dlen);
+            out[dlen] = '/';
+            memcpy(out + dlen + 1, cmd, clen + 1);
+
+            /* Probe: try to open the file. */
+            int fd = open(out, O_RDONLY);
+            if (fd >= 0) {
+                close(fd);
+                return 1;
+            }
+        }
+
+        path = *sep ? sep + 1 : sep;
+    }
+    return 0;
+}
+
 /* ── built-in commands ──────────────────────────────────────────────── */
 
 static void cmd_echo(char *args) {
@@ -236,19 +367,27 @@ static void cmd_cat(char *path) {
 }
 
 static void cmd_run(char *cmdline) {
-    /* First word is the program path. */
-    char *path = cmdline;
-    char *end = path;
+    /* First word is the program name/path. */
+    char *cmd = cmdline;
+    char *end = cmd;
     while (*end && *end != ' ' && *end != '\t') end++;
 
-    /* Null-terminate the path. */
+    /* Null-terminate the command word. */
     int has_args = (*end != '\0');
     if (has_args) *end = '\0';
 
-    /* Build argv: argv[0] = path, then remaining words, NULL-terminated. */
+    /* Resolve command via PATH if it doesn't contain '/'. */
+    char resolved[MAX_LINE];
+    if (!resolve_command(cmd, resolved, sizeof(resolved))) {
+        puts_stdout(cmd);
+        puts_stdout(": not found\n");
+        return;
+    }
+
+    /* Build argv: argv[0] = command name, then remaining words, NULL-terminated. */
     char *argv[16];
     int argc = 0;
-    argv[argc++] = path;
+    argv[argc++] = cmd;
 
     if (has_args) {
         char *rest = skip_ws(end + 1);
@@ -264,10 +403,10 @@ static void cmd_run(char *cmdline) {
 
     /* Use posix_spawn (musl uses clone(CLONE_VM|CLONE_VFORK) + execve). */
     pid_t child_pid;
-    int err = posix_spawn(&child_pid, path, 0, 0, argv, (char **)0);
+    int err = posix_spawn(&child_pid, resolved, 0, 0, argv, env_ptrs);
     if (err != 0) {
-        puts_stdout(path);
-        puts_stdout(": not found\n");
+        puts_stdout(cmd);
+        puts_stdout(": failed to spawn\n");
         return;
     }
 
@@ -279,6 +418,7 @@ static void cmd_run(char *cmdline) {
 /* ── main loop ──────────────────────────────────────────────────────── */
 
 int main(void) {
+    env_init();
     puts_stdout("\nostoo userspace shell\n");
 
     for (;;) {
@@ -312,11 +452,32 @@ int main(void) {
         } else if (strcmp(cmd, "pid") == 0) {
             put_num(getpid());
             put_char('\n');
+        } else if (strcmp(cmd, "export") == 0) {
+            if (!*args) {
+                for (int i = 0; i < env_count; i++) {
+                    puts_stdout("export ");
+                    puts_stdout(env_table[i]);
+                    put_char('\n');
+                }
+            } else {
+                if (env_set(args) < 0)
+                    puts_stdout("export: invalid or table full\n");
+            }
+        } else if (strcmp(cmd, "env") == 0) {
+            for (int i = 0; i < env_count; i++) {
+                puts_stdout(env_table[i]);
+                put_char('\n');
+            }
+        } else if (strcmp(cmd, "unset") == 0) {
+            if (*args)
+                env_unset(args);
+            else
+                puts_stdout("usage: unset VAR\n");
         } else if (strcmp(cmd, "exit") == 0) {
             break;
         } else if (strcmp(cmd, "help") == 0) {
-            puts_stdout("Commands: echo, pwd, cd, ls, cat, pid, exit, help\n");
-            puts_stdout("Or run a program by path (e.g. /hello)\n");
+            puts_stdout("Commands: echo, pwd, cd, ls, cat, pid, export, env, unset, exit, help\n");
+            puts_stdout("Or run a program by name (e.g. env_demo) or path (e.g. /bin/env_demo)\n");
         } else {
             /* Reconstruct full cmdline for spawning (cmd was null-terminated). */
             char fullcmd[MAX_LINE];

@@ -1,14 +1,17 @@
 CC      = x86_64-unknown-linux-musl-gcc
 CFLAGS  = -static -Os -Wall -Wextra
-SOURCES = $(wildcard *.c)
-BINS    = $(SOURCES:.c=)
+SOURCES = $(wildcard src/*.c)
+BINS    = $(patsubst src/%.c,bin/%,$(SOURCES))
 
-all: $(BINS)
+all: bin $(BINS)
 
-%: %.c
+bin:
+	mkdir -p bin
+
+bin/%: src/%.c | bin
 	$(CC) $(CFLAGS) -o $@ $<
 
 clean:
-	rm -f $(BINS)
+	rm -rf bin
 
 .PHONY: all clean

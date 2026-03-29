@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 USER_RS_DIR="$PROJECT_DIR/user-rs"
 TARGET_DIR="$USER_RS_DIR/target/x86_64-ostoo-user/release"
-DEPLOY_DIR="$PROJECT_DIR/user"
+DEPLOY_DIR="$PROJECT_DIR/user/bin"
 
 # Ensure musl sysroot is available
 "$SCRIPT_DIR/extract-musl-sysroot.sh"
@@ -19,6 +19,7 @@ cargo build --release -p hello-rs "$@"
 cargo build --release -p hello-std "$@"
 
 # Deploy binaries (skip the runtime library).
+mkdir -p "$DEPLOY_DIR"
 for bin in "$TARGET_DIR"/hello-rs "$TARGET_DIR"/hello-std; do
     if [ -f "$bin" ] && file "$bin" | grep -q "ELF"; then
         name=$(basename "$bin")

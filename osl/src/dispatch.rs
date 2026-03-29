@@ -78,7 +78,7 @@ fn syscall_inner(
         SYS_SET_ROBUST_LIST => 0, // no-op
         SYS_PIPE2          => sys_pipe2(a1, a2),
         SYS_GETRANDOM      => sys_getrandom(a1, a2, a3),
-        SYS_SPAWN          => sys_spawn(a1, a2, a3, a4),
+        SYS_SPAWN          => sys_spawn(a1, a2, a3, a4, a5),
         SYS_IO_CREATE      => crate::io_port::sys_io_create(a1 as u32),
         SYS_IO_SUBMIT      => crate::io_port::sys_io_submit(a1 as i32, a2, a3 as u32),
         SYS_IO_WAIT        => crate::io_port::sys_io_wait(a1 as i32, a2, a3 as u32, a4 as u32, a5),
@@ -836,7 +836,7 @@ fn sys_wait4(pid_arg: u64, status_ptr: u64, _options: u64) -> i64 {
     }
 }
 
-fn sys_spawn(path_ptr: u64, path_len: u64, argv_ptr: u64, argv_count: u64) -> i64 {
+fn sys_spawn(path_ptr: u64, path_len: u64, argv_ptr: u64, argv_count: u64, envp_ptr: u64) -> i64 {
     if !validate_user_buf(path_ptr, path_len) {
         return -errno::EFAULT;
     }
@@ -862,6 +862,23 @@ fn sys_spawn(path_ptr: u64, path_len: u64, argv_ptr: u64, argv_count: u64) -> i6
         }
     }
 
+    // Read envp from userspace (6th arg = envp_count from r9).
+    let mut envp: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    if envp_ptr != 0 {
+        let envp_count = libkernel::syscall::get_user_r9();
+        for i in 0..envp_count as usize {
+            let ptr_addr = envp_ptr + (i * 8) as u64;
+            if !validate_user_buf(ptr_addr, 8) {
+                return -errno::EFAULT;
+            }
+            let str_ptr = unsafe { *(ptr_addr as *const u64) };
+            match read_user_string(str_ptr, 4096) {
+                Some(s) => envp.push(s.into_bytes()),
+                None => return -errno::EFAULT,
+            }
+        }
+    }
+
     // Read ELF from VFS — direct call, no callback trampolines.
     let parent_pid = libkernel::process::current_pid();
 
@@ -870,9 +887,10 @@ fn sys_spawn(path_ptr: u64, path_len: u64, argv_ptr: u64, argv_count: u64) -> i6
         Err(_) => return -errno::ENOENT,
     };
     let argv_slices: alloc::vec::Vec<&[u8]> = argv.iter().map(|v| v.as_slice()).collect();
+    let envp_slices: alloc::vec::Vec<&[u8]> = envp.iter().map(|v| v.as_slice()).collect();
 
     // Direct call to osl::spawn — no function pointer transmute.
-    match crate::spawn::spawn_process_full(&elf_data, &argv_slices, parent_pid) {
+    match crate::spawn::spawn_process_full(&elf_data, &argv_slices, &envp_slices, parent_pid) {
         Ok(child_pid) => {
             libkernel::console::set_foreground(child_pid);
             child_pid.as_u64() as i64

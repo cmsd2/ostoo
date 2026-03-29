@@ -49,9 +49,9 @@ The `scripts/user-build.sh` wrapper handles the Docker invocation for you.
 Arguments are passed through to `make`:
 
 ```bash
-./scripts/user-build.sh          # build all .c files in user/
+./scripts/user-build.sh          # build all .c files in user/src/ → user/bin/
 ./scripts/user-build.sh clean    # clean build artifacts
-./scripts/user-build.sh hello    # build a single target
+./scripts/user-build.sh bin/hello  # build a single target
 ```
 
 ### Manual Docker invocation
@@ -65,7 +65,7 @@ docker run --rm \
   ctng bash -c '
     export PATH="/home/ctng/x-tools/x86_64-unknown-linux-musl/bin:$PATH"
     cd /home/ctng/user
-    x86_64-unknown-linux-musl-gcc -static -Os -Wall -Wextra -o hello hello.c
+    x86_64-unknown-linux-musl-gcc -static -Os -Wall -Wextra -o bin/hello src/hello.c
   '
 ```
 
@@ -85,7 +85,7 @@ The recommended flags for ostoo user-space binaries:
 You can inspect a compiled binary without Docker using the host `file` command:
 
 ```bash
-file user/hello
+file user/bin/hello
 # hello: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, ...
 ```
 
@@ -97,7 +97,7 @@ docker run --rm \
   -v "$(pwd)/user":/home/ctng/user \
   ctng bash -c '
     export PATH="/home/ctng/x-tools/x86_64-unknown-linux-musl/bin:$PATH"
-    x86_64-unknown-linux-musl-readelf -h /home/ctng/user/hello
+    x86_64-unknown-linux-musl-readelf -h /home/ctng/user/bin/hello
   '
 ```
 

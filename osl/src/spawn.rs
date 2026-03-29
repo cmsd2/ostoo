@@ -16,6 +16,7 @@ const ELF_STACK_VIRT: u64 = 0x0000_7FFF_F000_0000;
 pub fn spawn_process_full(
     elf_data: &[u8],
     argv: &[&[u8]],
+    envp: &[&[u8]],
     parent_pid: ProcessId,
 ) -> Result<ProcessId, &'static str> {
     use libkernel::elf::{self, PF_W, PF_X};
@@ -131,7 +132,7 @@ pub fn spawn_process_full(
         ELF_STACK_SIZE,
         &info,
         argv,
-        &[], // no environment variables
+        envp,
     );
 
     // Create the process and insert it into the process table.

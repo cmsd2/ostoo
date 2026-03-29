@@ -323,17 +323,23 @@ async fn status_task() {
 async fn launch_userspace_shell() {
     Delay::from_millis(100).await; // let VFS settle
 
-    let data = match devices::vfs::read_file("/shell", libkernel::process::ProcessId::KERNEL).await {
+    let data = match devices::vfs::read_file("/bin/shell", libkernel::process::ProcessId::KERNEL).await {
         Ok(d) => d,
         Err(e) => {
-            info!("[kernel] /shell not found ({:?}), using kernel shell", e);
+            info!("[kernel] /bin/shell not found ({:?}), using kernel shell", e);
             return;
         }
     };
 
-    let pid = match ring3::spawn_process(&data) {
+    let default_env: &[&[u8]] = &[
+        b"PATH=/host/bin",
+        b"HOME=/",
+        b"TERM=dumb",
+        b"SHELL=/bin/shell",
+    ];
+    let pid = match ring3::spawn_process_with_env(&data, default_env) {
         Ok(pid) => {
-            info!("[kernel] launched /shell as pid {}", pid.as_u64());
+            info!("[kernel] launched /bin/shell as pid {}", pid.as_u64());
             libkernel::console::set_foreground(pid);
             pid
         }
