@@ -412,48 +412,43 @@ output but functionally harmless.
 
 ### Memory Management
 
-1. **Page deallocation on process exit** — physical frames from `brk`,
-   `mmap`, and ELF segment loading are never freed.  `munmap` is a no-op
-   stub.  Must be addressed before running multiple long-lived processes.
-   See [`docs/mmap-design.md`](mmap-design.md) Phases 2–3.
-
-2. **Larger / growable heap** — demand-paged heap that grows on fault, or a
+1. **Larger / growable heap** — demand-paged heap that grows on fault, or a
    larger static allocation.  1 MiB is tight with concurrent processes.
 
-3. **Reclaiming virtual address space** — replace `DumbVmemAllocator` with a
+2. **Reclaiming virtual address space** — replace `DumbVmemAllocator` with a
    proper free-list allocator so MMIO mappings can be released.
 
-4. **`MAP_SHARED`** — prerequisite for completion port Phases 4–5 and
+3. **`MAP_SHARED`** — prerequisite for completion port Phases 4–5 and
    microkernel Phase B.  See [`docs/mmap-design.md`](mmap-design.md) Phase 5.
 
 ### Process Model
 
-5. **Signals Phase 3+** — Phases 1–2 (basic signal delivery + Ctrl+C/SIGINT)
+4. **Signals Phase 3+** — Phases 1–2 (basic signal delivery + Ctrl+C/SIGINT)
    are complete: `rt_sigaction`, `rt_sigprocmask`, `kill`, signal delivery on
    SYSCALL return, `rt_sigreturn`, Ctrl+C → SIGINT to foreground process.
    Remaining: exception-generated signals (SIGSEGV, SIGILL), SIGCHLD on child
    exit.  See [`docs/signals.md`](signals.md).
 
-6. **`fork` + CoW page faults** — standard POSIX `fork`.  `clone(CLONE_VM|CLONE_VFORK)`
+5. **`fork` + CoW page faults** — standard POSIX `fork`.  `clone(CLONE_VM|CLONE_VFORK)`
    and `execve` are now implemented, enabling unpatched musl `posix_spawn` and
    Rust `std::process::Command`.  Full `fork` with CoW still requires a page
    fault handler and frame reference counting.
 
 ### Drivers & I/O
 
-7. **Multi-sector DMA** — batch multiple sectors per virtio request to reduce
+6. **Multi-sector DMA** — batch multiple sectors per virtio request to reduce
    queue round-trips for directory scans and file reads.
 
-8. **exFAT write support** — directory entry creation, FAT chain allocation,
+7. **exFAT write support** — directory entry creation, FAT chain allocation,
    and sector writes to enable `touch`, `mkdir`, `cp`, `rm`.
 
 ### Microkernel Path
 
-9. **Microkernel Phase B** — kernel primitives for userspace drivers:
-    `MAP_SHARED`, device MMIO mapping, DMA syscalls.  IRQ fd is complete
-    (syscall 504 + OP_IRQ_WAIT).  Remaining items unblock userspace NIC driver.
-    See [`docs/microkernel-design.md`](microkernel-design.md).
+8. **Microkernel Phase B** — kernel primitives for userspace drivers:
+   `MAP_SHARED`, device MMIO mapping, DMA syscalls.  IRQ fd is complete
+   (syscall 504 + OP_IRQ_WAIT).  Remaining items unblock userspace NIC driver.
+   See [`docs/microkernel-design.md`](microkernel-design.md).
 
-10. **Networking** — virtio-net driver + smoltcp TCP/IP stack.  The
-    completion port is ready to back it once the NIC driver lands.
-    See [`docs/networking-design.md`](networking-design.md).
+9. **Networking** — virtio-net driver + smoltcp TCP/IP stack.  The
+   completion port is ready to back it once the NIC driver lands.
+   See [`docs/networking-design.md`](networking-design.md).

@@ -566,8 +566,8 @@ in `osl/src/errno.rs`; libkernel uses `FileError` for structured errors.
 | 5 | `fstat` | `S_IFCHR` for console fds |
 | 8 | `lseek` | Returns `-ESPIPE` (not seekable) |
 | 9 | `mmap` | Anonymous `MAP_PRIVATE` only; bump-down allocator |
-| 10 | `mprotect` | No-op, returns 0 |
-| 11 | `munmap` | No-op stub, returns 0 (frames leaked) |
+| 10 | `mprotect` | Updates page table flags for VMA regions |
+| 11 | `munmap` | Unmaps pages, frees frames, splits/removes VMAs |
 | 12 | `brk` | Query or grow heap; allocates+maps zero-filled pages |
 | 16 | `ioctl` | Returns `-ENOTTY` |
 | 20 | `writev` | Via fd_table; scatter/gather write |
@@ -592,9 +592,11 @@ See `docs/syscalls/` for detailed per-syscall documentation.
 
 - **SMAP enforcement**: User pointers in `writev`, `fstat`, `brk` are accessed
   without `stac`/`clac`.
-- **Page deallocation**: `munmap` and `brk` shrink don't free frames or unmap
-  pages.
-- **`mprotect`**: Doesn't actually update page table flags.
+- ~~**Page deallocation**~~: ✅ Fixed — `munmap` frees frames and splits VMAs;
+  `brk` shrink unmaps and frees pages; process exit cleans up the entire
+  user address space.
+- ~~**`mprotect`**~~: ✅ Fixed — updates page table flags for the target VMA
+  range.
 - ~~**FS_BASE save/restore**~~: ✅ Fixed — FS_BASE is saved/restored per-thread
   in `preempt_tick` via `save_current_context` / `restore_thread_state`.
 
@@ -799,11 +801,11 @@ The kernel heap is 1 MiB.  Process control blocks each consume 64 KiB
 Zombie processes are reaped via `wait4` + `reap()`, but loading multiple
 concurrent processes will still pressure the heap.
 
-### Memory leaks
-Physical frames allocated by `brk`, `mmap`, and ELF segment loading are
-never freed when a process exits.  `munmap` is a no-op stub.  This is
-acceptable for the current one-process-at-a-time shell workflow but must
-be addressed before running multiple concurrent long-lived processes.
+### Memory management
+`munmap` frees frames and splits/removes VMAs.  `brk` shrink frees pages.
+Process exit calls `cleanup_user_address_space` to walk and free all
+user-half page tables and frames.  The kernel heap (1 MiB) is the main
+remaining pressure point for concurrent processes.
 
 ---
 
