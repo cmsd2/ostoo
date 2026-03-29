@@ -190,7 +190,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
 
         match sub.opcode {
             OP_NOP => {
-                port.lock().post(Completion {
+                let woken = port.lock().post(Completion {
                     user_data: sub.user_data,
                     result: 0,
                     flags: 0,
@@ -198,6 +198,10 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                     read_buf: None,
                     read_dest: 0,
                 });
+                if let Some(thread_idx) = woken {
+                    scheduler::set_donate_target(thread_idx);
+                    scheduler::yield_now();
+                }
             }
 
             OP_TIMEOUT => {

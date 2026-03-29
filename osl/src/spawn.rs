@@ -245,6 +245,17 @@ pub fn build_initial_stack(
     const AT_UID: u64 = 11;
     const AT_RANDOM: u64 = 25;
 
+    // Pre-compute alignment: count all items that will be pushed below the
+    // cursor, then check if the resulting RSP is 16-byte aligned.  If not,
+    // add one padding word above AT_NULL (where musl never looks).
+    // Items: 8 auxv pairs (16) + envp NULL + envp ptrs + argv NULL + argv ptrs + argc
+    let total_pushes: u64 = 16 + 1 + envp.len() as u64 + 1 + argv.len() as u64 + 1;
+    let prospective_cursor = cursor - total_pushes * 8;
+    let prospective_rsp = user_top - (kernel_top - prospective_cursor);
+    if prospective_rsp % 16 != 0 {
+        push(&mut cursor, 0); // alignment pad above AT_NULL (harmless dead zone)
+    }
+
     push(&mut cursor, 0); push(&mut cursor, AT_NULL);
     push(&mut cursor, random_user_addr); push(&mut cursor, AT_RANDOM);
     push(&mut cursor, info.entry); push(&mut cursor, AT_ENTRY);
@@ -266,15 +277,7 @@ pub fn build_initial_stack(
         push(&mut cursor, *addr);
     }
 
-    // 6. Alignment padding + argc.
-    // After pushing argc, RSP must be 16-byte aligned. Compute prospective
-    // user_rsp and insert padding BEFORE argc if needed, so the stack is:
-    //   RSP → argc, argv[0], argv[1], …, NULL, envp…, NULL, auxv…
-    let prospective_offset = kernel_top - cursor + 8; // +8 for the argc push
-    let prospective_rsp = user_top - prospective_offset;
-    if prospective_rsp % 16 != 0 {
-        push(&mut cursor, 0); // alignment padding (below argc)
-    }
+    // 6. argc — immediately followed by argv[0] with no padding.
     push(&mut cursor, argv.len() as u64); // argc
 
     let offset_from_top = kernel_top - cursor;

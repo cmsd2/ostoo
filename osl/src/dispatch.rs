@@ -950,6 +950,8 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> i64 {
     let pid = libkernel::process::current_pid();
     match libkernel::process::with_process(pid, |p| {
         let entry = p.get_fd_entry(oldfd)?;
+        // Notify handles of the duplication (e.g. PipeWriter writer_count).
+        entry.object.notify_dup();
         // New entry inherits the object but NOT the CLOEXEC flag (POSIX).
         p.set_fd(newfd, FdEntry::from_object(entry.object, 0));
         Ok(newfd)

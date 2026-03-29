@@ -628,12 +628,20 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) -> ! {
     let parent_pid = with_process_ref(pid, |p| p.parent_pid);
     mark_zombie(pid, exit_code);
 
+    let mut donate_to = None;
     if let Some(parent_pid) = parent_pid {
         let wait_thread = with_process(parent_pid, |pp| pp.wait_thread.take());
         if let Some(Some(thread_idx)) = wait_thread {
             crate::task::scheduler::unblock(thread_idx);
+            donate_to = Some(thread_idx);
         }
     }
 
+    // Yield before dying — donate remaining quantum to the parent so it
+    // returns from wait4 immediately instead of waiting for the next timer tick.
+    if let Some(thread_idx) = donate_to {
+        crate::task::scheduler::set_donate_target(thread_idx);
+    }
+    crate::task::scheduler::yield_now();
     crate::task::scheduler::kill_current_thread();
 }

@@ -196,8 +196,8 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
         scheduler::unblock(thread_idx);
     }
 
-    libkernel::serial_println!("[execve] pid={} path={} entry={:#x} rsp={:#x}",
-        pid.as_u64(), resolved, info.entry, user_rsp);
+    libkernel::serial_println!("[execve] pid={} path={} entry={:#x} rsp={:#x} pml4={:#x}",
+        pid.as_u64(), resolved, info.entry, user_rsp, new_pml4_phys.as_u64());
 
     // 10. Jump to new userspace — never returns.
     let user_cs = libkernel::gdt::user_code_selector().0 as u64;

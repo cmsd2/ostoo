@@ -57,8 +57,8 @@ static void put_dec(unsigned long n) {
 
 /* ── main ────────────────────────────────────────────────────────────── */
 
-/* Use /shell as the test file — it's always present on the VFS. */
-static const char *test_path = "/shell";
+/* Use /bin/shell as the test file — it's always present on the VFS. */
+static const char *test_path = "/bin/shell";
 
 int main(void) {
     /* Step 1: open the file and read the first 64 bytes via read(). */

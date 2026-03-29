@@ -234,6 +234,38 @@ core::arch::global_asm!(
     "iretq",
 );
 
+// ---------------------------------------------------------------------------
+// Voluntary yield stub — identical to the timer stub but calls `yield_tick`
+// instead of `preempt_tick`.  Triggered via `int 0x50` from syscall context.
+core::arch::global_asm!(
+    ".globl ipc_yield_stub",
+    "ipc_yield_stub:",
+    "test qword ptr [rsp+8], 3",
+    "jz .Lyield_from_ring0",
+    "swapgs",
+    ".Lyield_from_ring0:",
+    "push rax", "push rbx", "push rcx", "push rdx",
+    "push rsi", "push rdi", "push rbp",
+    "push r8",  "push r9",  "push r10", "push r11",
+    "push r12", "push r13", "push r14", "push r15",
+    "sub  rsp, 512",
+    "fxsave [rsp]",
+    "mov  rdi, rsp",
+    "call yield_tick",
+    "mov  rsp, rax",
+    "fxrstor [rsp]",
+    "add  rsp, 512",
+    "pop r15", "pop r14", "pop r13", "pop r12",
+    "pop r11", "pop r10", "pop r9",  "pop r8",
+    "pop rbp", "pop rdi", "pop rsi",
+    "pop rdx", "pop rcx", "pop rbx", "pop rax",
+    "test qword ptr [rsp+8], 3",
+    "jz .Lyield_to_ring0",
+    "swapgs",
+    ".Lyield_to_ring0:",
+    "iretq",
+);
+
 /// Allocate a heap stack and switch RSP to it, then call `continuation`.
 ///
 /// This moves the boot thread off the bootloader's lower-half stack onto a
@@ -643,6 +675,44 @@ pub fn unblock(thread_idx: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Voluntary yield / scheduler donate
+
+/// Direct-switch target for `yield_tick`.  `usize::MAX` means "no target".
+static DONATE_TARGET: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Trigger a voluntary context switch via `int 0x50`.
+///
+/// If a donate target has been set via [`set_donate_target`], the current
+/// thread switches directly to that thread.  Otherwise the current thread is
+/// re-queued and the scheduler picks the next ready thread.
+///
+/// Must NOT be called from ISR context (the scheduler lock could deadlock).
+pub fn yield_now() {
+    unsafe { core::arch::asm!("int 0x50"); }
+}
+
+/// Set the direct-switch target for the next [`yield_now`].
+///
+/// The target thread should already be in the Ready state (e.g. via
+/// [`unblock`]).  Cleared atomically by `yield_tick` after use.
+pub fn set_donate_target(thread_idx: usize) {
+    DONATE_TARGET.store(thread_idx, Ordering::Release);
+}
+
+/// Unblock a thread and immediately switch to it.
+///
+/// Combines [`unblock`], [`set_donate_target`], and [`yield_now`] — the waker
+/// thread switches directly to the woken thread without waiting for the
+/// scheduler's round-robin.
+///
+/// Must only be called from syscall/kernel thread context, NOT from ISR.
+pub fn unblock_yield(thread_idx: usize) {
+    unblock(thread_idx);
+    set_donate_target(thread_idx);
+    yield_now();
+}
+
+// ---------------------------------------------------------------------------
 // preempt_tick helpers — extracted to shrink the unsafe surface
 
 /// Save the current thread's RSP, user RSP, and FS_BASE.
@@ -761,6 +831,78 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
             return current_rsp;
         }
     };
+
+    sched.current_idx = next_idx;
+    sched.threads[next_idx].state = ThreadState::Running;
+    sched.threads[next_idx].ticks_remaining = QUANTUM_TICKS;
+
+    let target = SwitchTarget {
+        next_rsp:       sched.threads[next_idx].saved_rsp,
+        next_user_rsp:  sched.threads[next_idx].user_rsp,
+        next_fs_base:   sched.threads[next_idx].fs_base,
+        cur_pml4:       sched.threads[current_idx].pml4_phys,
+        next_pml4:      sched.threads[next_idx].pml4_phys,
+        next_kind:      sched.threads[next_idx].kind,
+        next_kstack_top: sched.threads[next_idx].kernel_stack_top,
+        next_idx,
+    };
+    drop(sched);
+
+    restore_thread_state(&target);
+    debug_check_initial_alignment(target.next_rsp, target.next_idx);
+
+    target.next_rsp
+}
+
+/// Voluntary yield handler — called by `ipc_yield_stub` (vector 0x50).
+///
+/// Like [`preempt_tick`] but without timer bookkeeping (no tick, no EOI, no
+/// quantum check).  If `DONATE_TARGET` is set and the target thread is Ready,
+/// switches directly to it; otherwise picks the next ready thread.
+///
+/// # Safety
+/// Must only be called from `ipc_yield_stub` with interrupts disabled.
+#[no_mangle]
+unsafe extern "C" fn yield_tick(current_rsp: u64) -> u64 {
+    let mut sched = SCHEDULER.lock();
+
+    if !sched.initialized {
+        return current_rsp;
+    }
+
+    let current_idx = sched.current_idx;
+    save_current_context(&mut sched.threads[current_idx], current_rsp);
+
+    // Re-queue the current thread if it's still runnable.
+    if sched.threads[current_idx].state.is_runnable() {
+        sched.threads[current_idx].state = ThreadState::Ready;
+        sched.ready_queue.push_back(current_idx);
+    }
+
+    // Check for a direct-switch (donate) target.
+    let donate = DONATE_TARGET.swap(usize::MAX, Ordering::Acquire);
+    let next_idx = if donate != usize::MAX
+        && donate < sched.threads.len()
+        && sched.threads[donate].state == ThreadState::Ready
+    {
+        // Remove donate target from the ready queue (it was pushed by unblock).
+        if let Some(pos) = sched.ready_queue.iter().position(|&i| i == donate) {
+            sched.ready_queue.remove(pos);
+        }
+        donate
+    } else {
+        match sched.ready_queue.pop_front() {
+            Some(idx) => idx,
+            None => return current_rsp,
+        }
+    };
+
+    // Fast path: if we'd switch back to ourselves, just reset quantum.
+    if next_idx == current_idx {
+        sched.threads[current_idx].state = ThreadState::Running;
+        sched.threads[current_idx].ticks_remaining = QUANTUM_TICKS;
+        return current_rsp;
+    }
 
     sched.current_idx = next_idx;
     sched.threads[next_idx].state = ThreadState::Running;

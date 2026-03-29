@@ -34,6 +34,13 @@ pub fn sys_clone(flags: u64, child_stack: u64, _ptid: u64, _ctid: u64, _tls: u64
     };
     let (pml4_phys, cwd, fd_table, brk_base, brk_current, vma_map) = parent_info;
 
+    // Notify handles that fds were duplicated (e.g. PipeWriter writer_count).
+    for slot in &fd_table {
+        if let Some(entry) = slot {
+            entry.object.notify_dup();
+        }
+    }
+
     // Read user RIP, RFLAGS, R9 and FS_BASE saved by the SYSCALL entry stub.
     let user_rip = libkernel::syscall::get_user_rip();
     let user_rflags = libkernel::syscall::get_user_rflags();

@@ -8,6 +8,7 @@
 
 #include <unistd.h>
 #include <string.h>
+#include <fcntl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <spawn.h>
@@ -126,10 +127,16 @@ int main(void) {
     itoa_buf(to_child[0], rd_str, sizeof(rd_str));
     itoa_buf(from_child[1], wr_str, sizeof(wr_str));
 
+    /* Mark parent-side pipe ends as CLOEXEC so the child doesn't inherit
+     * them.  Without this the child holds the write end of its own input
+     * pipe, preventing EOF when the parent closes its copy. */
+    fcntl(to_child[1], F_SETFD, FD_CLOEXEC);
+    fcntl(from_child[0], F_SETFD, FD_CLOEXEC);
+
     /* Spawn io_pong child */
     pid_t child_pid;
-    char *child_argv[] = { "/io_pong", rd_str, wr_str, (char *)0 };
-    int err = posix_spawn(&child_pid, "/io_pong", 0, 0, child_argv, (char **)0);
+    char *child_argv[] = { "/bin/io_pong", rd_str, wr_str, (char *)0 };
+    int err = posix_spawn(&child_pid, "/bin/io_pong", 0, 0, child_argv, (char **)0);
     if (err != 0) {
         puts_stdout("posix_spawn(io_pong) failed\n");
         _exit(1);

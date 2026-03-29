@@ -50,12 +50,19 @@ impl CompletionPort {
     }
 
     /// Post a completion to the queue. Wakes the waiter if one is registered.
-    pub fn post(&mut self, c: Completion) {
+    ///
+    /// Returns the thread index that was unblocked (if any), so syscall-context
+    /// callers can use it for scheduler donate.  ISR callers can ignore the
+    /// return value.
+    pub fn post(&mut self, c: Completion) -> Option<usize> {
         if self.queue.len() < self.max_queued {
             self.queue.push_back(c);
         }
         if let Some(t) = self.waiter.take() {
             scheduler::unblock(t);
+            Some(t)
+        } else {
+            None
         }
     }
 

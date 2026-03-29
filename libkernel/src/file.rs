@@ -39,6 +39,15 @@ impl Clone for FdObject {
 }
 
 impl FdObject {
+    /// Notify the underlying handle that a new fd reference was created.
+    /// Call this when actually duplicating an fd (dup2, fork/clone), NOT
+    /// for temporary access via get_fd().
+    pub fn notify_dup(&self) {
+        if let FdObject::File(h) = self {
+            h.on_dup();
+        }
+    }
+
     /// Close the underlying object.
     pub fn close(&self) {
         match self {
@@ -138,6 +147,9 @@ pub trait FileHandle: Send + Sync {
     fn read(&self, buf: &mut [u8]) -> Result<usize, FileError>;
     fn write(&self, buf: &[u8]) -> Result<usize, FileError>;
     fn close(&self) {}
+    /// Called when the fd referencing this handle is duplicated (dup2, fork,
+    /// posix_spawn).  Used by PipeWriter to track writer reference count.
+    fn on_dup(&self) {}
     /// Return a name for downcasting purposes.
     fn kind(&self) -> &'static str;
     /// For directory handles: serialize entries as linux_dirent64 into buf.
@@ -217,6 +229,10 @@ use alloc::collections::VecDeque;
 struct PipeInner {
     buffer: VecDeque<u8>,
     write_closed: bool,
+    /// Number of open writer file descriptors.  Decremented by
+    /// `PipeWriter::close()`, incremented by `PipeWriter::on_dup()`.
+    /// When this reaches 0, `write_closed` is set and readers see EOF.
+    writer_count: usize,
     reader_thread: Option<usize>,
     /// Waker for async readers (completion port OP_READ).
     reader_waker: Option<core::task::Waker>,
@@ -233,6 +249,7 @@ pub fn make_pipe() -> (PipeReader, PipeWriter) {
     let inner = Arc::new(Mutex::new(PipeInner {
         buffer: VecDeque::new(),
         write_closed: false,
+        writer_count: 1,
         reader_thread: None,
         reader_waker: None,
     }));
@@ -273,7 +290,7 @@ impl FileHandle for PipeReader {
             return core::task::Poll::Ready(Ok(count));
         }
         if inner.write_closed {
-            return core::task::Poll::Ready(Ok(0));
+            return core::task::Poll::Ready(Ok(0)); // EOF
         }
         inner.reader_waker = Some(cx.waker().clone());
         core::task::Poll::Pending
@@ -287,13 +304,18 @@ impl FileHandle for PipeReader {
 }
 
 /// Helper: wake both the scheduler thread and the async waker on a pipe.
-fn pipe_wake_reader(inner: &mut PipeInner) {
-    if let Some(thread_idx) = inner.reader_thread.take() {
-        crate::task::scheduler::unblock(thread_idx);
+///
+/// Returns the thread index that was unblocked (if any), so the caller can
+/// use it for scheduler donate after dropping the pipe lock.
+fn pipe_wake_reader(inner: &mut PipeInner) -> Option<usize> {
+    let thread_idx = inner.reader_thread.take();
+    if let Some(idx) = thread_idx {
+        crate::task::scheduler::unblock(idx);
     }
     if let Some(waker) = inner.reader_waker.take() {
         waker.wake();
     }
+    thread_idx
 }
 
 impl FileHandle for PipeWriter {
@@ -302,16 +324,30 @@ impl FileHandle for PipeWriter {
     }
 
     fn write(&self, buf: &[u8]) -> Result<usize, FileError> {
-        let mut inner = self.0.lock();
-        inner.buffer.extend(buf.iter());
-        pipe_wake_reader(&mut inner);
+        let woken = {
+            let mut inner = self.0.lock();
+            inner.buffer.extend(buf.iter());
+            pipe_wake_reader(&mut inner)
+        }; // pipe lock dropped before yield
+        if let Some(thread_idx) = woken {
+            crate::task::scheduler::set_donate_target(thread_idx);
+            crate::task::scheduler::yield_now();
+        }
         Ok(buf.len())
     }
 
     fn close(&self) {
         let mut inner = self.0.lock();
-        inner.write_closed = true;
-        pipe_wake_reader(&mut inner);
+        inner.writer_count -= 1;
+        if inner.writer_count == 0 {
+            inner.write_closed = true;
+            pipe_wake_reader(&mut inner);
+        }
+    }
+
+    fn on_dup(&self) {
+        let mut inner = self.0.lock();
+        inner.writer_count += 1;
     }
 
     fn kind(&self) -> &'static str { "pipe_w" }

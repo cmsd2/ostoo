@@ -136,6 +136,7 @@ pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
 pub const LAPIC_TIMER_VECTOR: u8 = 0x30;
+pub const IPC_YIELD_VECTOR: u8 = 0x50;
 
 pub static PICS: spin::Mutex<ChainedPics> =
     spin::Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
@@ -163,6 +164,10 @@ extern "C" {
     /// `global_asm!`.  Registered directly in the IDT so the CPU jumps
     /// straight to it without the `extern "x86-interrupt"` wrapper overhead.
     fn lapic_timer_stub();
+
+    /// Voluntary yield stub (vector 0x50) — same register save/restore as
+    /// `lapic_timer_stub` but calls `yield_tick` instead of `preempt_tick`.
+    fn ipc_yield_stub();
 }
 
 lazy_static! {
@@ -180,6 +185,9 @@ lazy_static! {
             // RSP for context switching before/after iretq.
             idt[LAPIC_TIMER_VECTOR]
                 .set_handler_addr(x86_64::VirtAddr::new(lapic_timer_stub as *const () as usize as u64));
+            // Voluntary yield vector (int 0x50) — software-triggered context switch.
+            idt[IPC_YIELD_VECTOR]
+                .set_handler_addr(x86_64::VirtAddr::new(ipc_yield_stub as *const () as usize as u64));
         }
         idt[InterruptIndex::Timer.as_u8()]
             .set_handler_fn(timer_interrupt_handler);
