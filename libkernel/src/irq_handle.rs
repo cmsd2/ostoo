@@ -117,6 +117,7 @@ pub fn irq_fd_dispatch(slot: usize) {
             opcode: OP_IRQ_WAIT,
             read_buf: None,
             read_dest: 0,
+            transfer_fds: None,
         });
     } else {
         // No pending wait — buffer the scancode so it isn't lost.
@@ -144,6 +145,7 @@ pub fn arm_irq(inner: &Arc<IrqMutex<IrqInner>>, port: Arc<IrqMutex<CompletionPor
             opcode: OP_IRQ_WAIT,
             read_buf: None,
             read_dest: 0,
+            transfer_fds: None,
         });
         return;
     }

@@ -2,6 +2,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use crate::channel::TransferFds;
 use crate::task::scheduler;
 
 // ---------------------------------------------------------------------------
@@ -29,6 +30,8 @@ pub struct Completion {
     pub read_buf: Option<Vec<u8>>,
     /// For async OP_READ: user-space destination address for read_buf data.
     pub read_dest: u64,
+    /// For OP_IPC_RECV: transferred fd objects to install in receiver's fd table.
+    pub transfer_fds: Option<TransferFds>,
 }
 
 // ---------------------------------------------------------------------------

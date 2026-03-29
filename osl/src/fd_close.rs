@@ -25,6 +25,7 @@ pub fn handle_close_result(result: CloseResult) {
                 opcode: OP_IPC_RECV,
                 read_buf: None,
                 read_dest: 0,
+                transfer_fds: None,
             });
             if let Some(thread_idx) = woken {
                 scheduler::set_donate_target(thread_idx);
@@ -32,6 +33,8 @@ pub fn handle_close_result(result: CloseResult) {
             }
         }
         CloseResult::NotifySendPort(ps) => {
+            // Drop the envelope (closes any transferred fds that were pending).
+            drop(ps.envelope);
             let woken = ps.port.lock().post(Completion {
                 user_data: ps.user_data,
                 result: -errno::EPIPE,
@@ -39,6 +42,7 @@ pub fn handle_close_result(result: CloseResult) {
                 opcode: OP_IPC_SEND,
                 read_buf: None,
                 read_dest: 0,
+                transfer_fds: None,
             });
             if let Some(thread_idx) = woken {
                 scheduler::set_donate_target(thread_idx);

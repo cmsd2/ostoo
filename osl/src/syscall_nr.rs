@@ -13,6 +13,7 @@ pub const SYS_BRK: u64 = 12;
 pub const SYS_RT_SIGACTION: u64 = 13;
 pub const SYS_RT_SIGPROCMASK: u64 = 14;
 pub const SYS_IOCTL: u64 = 16;
+pub const SYS_PIPE: u64 = 22;
 pub const SYS_WRITEV: u64 = 20;
 pub const SYS_MADVISE: u64 = 28;
 pub const SYS_DUP2: u64 = 33;

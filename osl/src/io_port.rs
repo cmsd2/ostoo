@@ -13,7 +13,7 @@ use libkernel::completion_port::{
     OP_NOP, OP_TIMEOUT, OP_READ, OP_WRITE, OP_IRQ_WAIT, OP_IPC_RECV, OP_IPC_SEND,
 };
 use libkernel::irq_mutex::IrqMutex;
-use libkernel::channel::{ArmRecvAction, ArmSendAction, IpcMessage, PendingPortRecv, PendingPortSend};
+use libkernel::channel::{ArmRecvAction, ArmSendAction, EnvelopedMessage, IpcMessage, PendingPortRecv, PendingPortSend};
 use libkernel::file::{ChannelFd, FileHandle, FileError, FdObject};
 use libkernel::task::{executor, scheduler, timer, Task};
 
@@ -159,6 +159,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                     opcode: OP_NOP,
                     read_buf: None,
                     read_dest: 0,
+                    transfer_fds: None,
                 });
                 if let Some(thread_idx) = woken {
                     scheduler::set_donate_target(thread_idx);
@@ -181,6 +182,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                         opcode: OP_TIMEOUT,
                         read_buf: None,
                         read_dest: 0,
+                        transfer_fds: None,
                     });
                 }));
             }
@@ -197,6 +199,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_READ,
                             read_buf: None,
                             read_dest: 0,
+                            transfer_fds: None,
                         });
                         processed += 1;
                         continue;
@@ -211,6 +214,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                         opcode: OP_READ,
                         read_buf: None,
                         read_dest: 0,
+                        transfer_fds: None,
                     });
                 } else if !validate_user_buf(sub.buf_addr, sub.buf_len as u64) {
                     port.lock().post(Completion {
@@ -220,6 +224,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                         opcode: OP_READ,
                         read_buf: None,
                         read_dest: 0,
+                        transfer_fds: None,
                     });
                 } else {
                     // Spawn async task: read into kernel buffer, post
@@ -245,6 +250,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_READ,
                             read_buf: Some(buf),
                             read_dest: buf_addr,
+                            transfer_fds: None,
                         });
                     }));
                 }
@@ -261,6 +267,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_WRITE,
                             read_buf: None,
                             read_dest: 0,
+                            transfer_fds: None,
                         });
                         processed += 1;
                         continue;
@@ -275,6 +282,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                         opcode: OP_WRITE,
                         read_buf: None,
                         read_dest: 0,
+                        transfer_fds: None,
                     });
                 } else if !validate_user_buf(sub.buf_addr, sub.buf_len as u64) {
                     port.lock().post(Completion {
@@ -284,6 +292,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                         opcode: OP_WRITE,
                         read_buf: None,
                         read_dest: 0,
+                        transfer_fds: None,
                     });
                 } else {
                     // Copy user data to kernel buffer while page table is
@@ -311,6 +320,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_WRITE,
                             read_buf: None,
                             read_dest: 0,
+                            transfer_fds: None,
                         });
                     }));
                 }
@@ -327,6 +337,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_IRQ_WAIT,
                             read_buf: None,
                             read_dest: 0,
+                            transfer_fds: None,
                         });
                         processed += 1;
                         continue;
@@ -347,6 +358,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_IPC_RECV,
                             read_buf: None,
                             read_dest: 0,
+                            transfer_fds: None,
                         });
                         processed += 1;
                         continue;
@@ -362,6 +374,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                         opcode: OP_IPC_RECV,
                         read_buf: None,
                         read_dest: 0,
+                        transfer_fds: None,
                     });
                     processed += 1;
                     continue;
@@ -374,8 +387,9 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                 };
                 let action = channel.lock().arm_recv(info);
                 match action {
-                    ArmRecvAction::Ready(msg) => {
-                        let bytes = ipc_msg_to_bytes(&msg);
+                    ArmRecvAction::Ready(mut env) => {
+                        let bytes = ipc_msg_to_bytes(&env.msg);
+                        let tfds = env.transfer_fds.take();
                         let woken = port.lock().post(Completion {
                             user_data: sub.user_data,
                             result: 0,
@@ -383,15 +397,17 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_IPC_RECV,
                             read_buf: Some(bytes),
                             read_dest: sub.buf_addr,
+                            transfer_fds: tfds,
                         });
                         if let Some(thread_idx) = woken {
                             scheduler::set_donate_target(thread_idx);
                             scheduler::yield_now();
                         }
                     }
-                    ArmRecvAction::ReadyAndNotifySendPort(msg, send_port, send_ud) => {
+                    ArmRecvAction::ReadyAndNotifySendPort(mut env, send_port, send_ud) => {
                         // Post the message to the recv port.
-                        let bytes = ipc_msg_to_bytes(&msg);
+                        let bytes = ipc_msg_to_bytes(&env.msg);
+                        let tfds = env.transfer_fds.take();
                         port.lock().post(Completion {
                             user_data: sub.user_data,
                             result: 0,
@@ -399,6 +415,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_IPC_RECV,
                             read_buf: Some(bytes),
                             read_dest: sub.buf_addr,
+                            transfer_fds: tfds,
                         });
                         // Post success to the send port.
                         let woken = send_port.lock().post(Completion {
@@ -408,6 +425,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_IPC_SEND,
                             read_buf: None,
                             read_dest: 0,
+                            transfer_fds: None,
                         });
                         if let Some(thread_idx) = woken {
                             scheduler::set_donate_target(thread_idx);
@@ -422,6 +440,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_IPC_RECV,
                             read_buf: None,
                             read_dest: 0,
+                            transfer_fds: None,
                         });
                     }
                     ArmRecvAction::Armed => {
@@ -442,6 +461,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_IPC_SEND,
                             read_buf: None,
                             read_dest: 0,
+                            transfer_fds: None,
                         });
                         processed += 1;
                         continue;
@@ -457,6 +477,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                         opcode: OP_IPC_SEND,
                         read_buf: None,
                         read_dest: 0,
+                        transfer_fds: None,
                     });
                     processed += 1;
                     continue;
@@ -465,10 +486,28 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                 // Copy message from user memory.
                 let msg = unsafe { *(sub.buf_addr as *const IpcMessage) };
 
+                // Extract transferred fd objects from sender's fd table.
+                let transfer_fds = match crate::ipc::extract_transfer_fds(&msg) {
+                    Ok(fds) => fds,
+                    Err(_) => {
+                        port.lock().post(Completion {
+                            user_data: sub.user_data,
+                            result: -errno::EBADF,
+                            flags: 0,
+                            opcode: OP_IPC_SEND,
+                            read_buf: None,
+                            read_dest: 0,
+                            transfer_fds: None,
+                        });
+                        processed += 1;
+                        continue;
+                    }
+                };
+
                 let info = PendingPortSend {
                     port: port.clone(),
                     user_data: sub.user_data,
-                    msg,
+                    envelope: EnvelopedMessage { msg, transfer_fds },
                 };
                 let action = channel.lock().arm_send(info);
                 match action {
@@ -480,6 +519,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_IPC_SEND,
                             read_buf: None,
                             read_dest: 0,
+                            transfer_fds: None,
                         });
                         if let Some(thread_idx) = woken {
                             scheduler::set_donate_target(thread_idx);
@@ -494,16 +534,18 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_IPC_SEND,
                             read_buf: None,
                             read_dest: 0,
+                            transfer_fds: None,
                         });
                         // Donate to the receiver that was unblocked.
                         let target = woken.unwrap_or(recv_thread);
                         scheduler::set_donate_target(target);
                         scheduler::yield_now();
                     }
-                    ArmSendAction::ReadyToRecvPort(pr, msg) => {
+                    ArmSendAction::ReadyToRecvPort(pr, mut env) => {
                         // Both send and recv were port-based.
                         // Post the message to the recv port.
-                        let bytes = ipc_msg_to_bytes(&msg);
+                        let bytes = ipc_msg_to_bytes(&env.msg);
+                        let tfds = env.transfer_fds.take();
                         pr.port.lock().post(Completion {
                             user_data: pr.user_data,
                             result: 0,
@@ -511,6 +553,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_IPC_RECV,
                             read_buf: Some(bytes),
                             read_dest: pr.buf_dest,
+                            transfer_fds: tfds,
                         });
                         // Post success to the send port.
                         let woken = port.lock().post(Completion {
@@ -520,6 +563,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_IPC_SEND,
                             read_buf: None,
                             read_dest: 0,
+                            transfer_fds: None,
                         });
                         if let Some(thread_idx) = woken {
                             scheduler::set_donate_target(thread_idx);
@@ -538,6 +582,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                             opcode: OP_IPC_SEND,
                             read_buf: None,
                             read_dest: 0,
+                            transfer_fds: None,
                         });
                     }
                 }
@@ -551,6 +596,7 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                     opcode: sub.opcode,
                     read_buf: None,
                     read_dest: 0,
+                    transfer_fds: None,
                 });
             }
         }
@@ -631,8 +677,21 @@ pub fn sys_io_wait(port_fd: i32, completions_ptr: u64, max: u32, min: u32, timeo
                         count,
                     )
                 };
-                for (i, c) in drained.iter().enumerate().take(count) {
-                    // For async OP_READ: copy kernel read buffer to user space.
+                for (i, mut c) in drained.into_iter().enumerate().take(count) {
+                    // For OP_IPC_RECV: install transferred fds into receiver's
+                    // fd table and rewrite the serialized message bytes.
+                    if let Some(tfds) = c.transfer_fds.take() {
+                        if let Some(ref mut buf) = c.read_buf {
+                            if buf.len() == core::mem::size_of::<IpcMessage>() {
+                                let msg_ptr = buf.as_mut_ptr() as *mut IpcMessage;
+                                let msg = unsafe { &mut *msg_ptr };
+                                // Best-effort: if install fails, the fds field
+                                // keeps -1 values and the completion still posts.
+                                let _ = crate::ipc::install_transfer_fds(msg, tfds);
+                            }
+                        }
+                    }
+                    // For async OP_READ / OP_IPC_RECV: copy kernel buffer to user space.
                     // We're in the process's syscall context so page tables are correct.
                     if let Some(ref buf) = c.read_buf {
                         if !buf.is_empty() && c.read_dest != 0

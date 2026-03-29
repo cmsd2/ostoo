@@ -5,8 +5,7 @@ use futures_util::task::AtomicWaker;
 use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use crate::print;
-use crate::println;
+use crate::{print, serial_println};
 
 pub use pc_keyboard::DecodedKey as Key;
 pub use pc_keyboard::KeyCode;
@@ -91,14 +90,14 @@ impl Stream for KeyStream {
 /// Must not block or allocate.
 pub(crate) fn add_scancode(scancode: u8) {
     if let Ok(queue) = SCANCODE_QUEUE.try_get() {
-        if let Err(_) = queue.push(scancode) {
-            println!("WARNING: scancode queue full; dropping keyboard input");
+        if queue.push(scancode).is_err() {
+            // ISR context — must not use println! (VGA lock is not re-entrant).
+            serial_println!("WARNING: scancode queue full; dropping keyboard input");
         } else {
             WAKER.wake();
         }
-    } else {
-        log::info!("scancode queue not yet initialized; dropping input");
     }
+    // Queue not initialized: silently drop (keyboard actor hasn't started yet).
 }
 
 pub async fn print_keypresses() {

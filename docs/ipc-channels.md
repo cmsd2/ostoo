@@ -33,9 +33,9 @@ struct ipc_message {
 
 The `tag` field is opaque to the kernel -- applications use it to identify
 message types.  The `data` array carries the payload (pointers, handles,
-small structs).  The `fds` array is reserved for future fd-passing
-(SCM_RIGHTS-style capability transfer); set unused slots to -1.
-For bulk data, use shared memory with a channel for signaling.
+small structs).  The `fds` array carries file descriptors for capability
+passing (set unused slots to -1).  For bulk data, use shared memory with
+a channel for signaling.
 
 ---
 
@@ -134,6 +134,44 @@ while (ipc_recv(fds[1], &m, IPC_NONBLOCK) == 0) {
 }
 /* returns -EAGAIN when empty */
 ```
+
+### fd-passing (capability transfer)
+
+```c
+/* Create a pipe and an IPC channel */
+int pipe_fds[2], ch_fds[2];
+pipe(pipe_fds);
+ipc_create(ch_fds, 4, 0);
+
+/* Send the pipe write-end through the channel */
+struct ipc_message msg = {
+    .tag = 1,
+    .data = { 0, 0, 0 },
+    .fds = { pipe_fds[1], -1, -1, -1 },   /* transfer pipe write-end */
+};
+ipc_send(ch_fds[0], &msg, 0);
+
+/* Receive — kernel allocates a new fd for the pipe write-end */
+struct ipc_message recv_msg;
+ipc_recv(ch_fds[1], &recv_msg, 0);
+int new_write_fd = recv_msg.fds[0];   /* new fd number in receiver */
+
+write(new_write_fd, "hello", 5);      /* writes to the same pipe */
+```
+
+**Semantics**: When `ipc_send` is called with non-(-1) values in the `fds`
+array, the kernel looks up each fd in the sender's fd table, increments
+reference counts, and stores the kernel objects inside the channel.  When
+`ipc_recv` delivers the message, the kernel allocates new fds in the
+receiver's fd table and rewrites `msg.fds` with the new fd numbers.
+
+**Error handling**: If any fd in `msg.fds` is invalid, the entire send fails
+with `-EBADF`.  If the receiver's fd table is full, recv fails with
+`-EMFILE`.
+
+**Cleanup**: If a message with transferred fds is never received (e.g., the
+channel is destroyed with messages in the queue), the kernel closes the
+transferred fd objects automatically.
 
 ---
 
@@ -304,5 +342,5 @@ reversed), preventing deadlocks.
 
 - **ipc_call(fd, send_msg, recv_msg)** -- atomic send+recv for RPC
 - **Bidirectional channels** -- two queues in one object
-- **fd-passing in messages** -- SCM_RIGHTS-style capability transfer (message layout reserves `fds[4]`)
+- ~~**fd-passing in messages**~~ -- implemented: `fds[4]` in IpcMessage, kernel transfers fd objects between processes
 - **Notification objects** -- seL4-style bitmask signaling

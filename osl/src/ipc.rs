@@ -8,7 +8,9 @@ use core::mem;
 
 use alloc::vec::Vec;
 
-use libkernel::channel::{ChannelInner, IpcMessage, RecvAction, SendAction};
+use libkernel::channel::{
+    ChannelInner, EnvelopedMessage, IpcMessage, RecvAction, SendAction, TransferFds,
+};
 use libkernel::completion_port::{Completion, OP_IPC_RECV, OP_IPC_SEND};
 use libkernel::file::{ChannelFd, FdObject, FD_CLOEXEC};
 use libkernel::irq_mutex::IrqMutex;
@@ -84,8 +86,18 @@ pub fn sys_ipc_send(fd: i32, msg_ptr: u64, flags: u32) -> i64 {
     // Copy the message from user memory.
     let msg = unsafe { *(msg_ptr as *const IpcMessage) };
 
+    // Extract transferred fd objects from sender's fd table.
+    let transfer_fds = match extract_transfer_fds(&msg) {
+        Ok(fds) => fds,
+        Err(e) => return e,
+    };
+
+    let env = EnvelopedMessage { msg, transfer_fds };
+
+    let mut retry_env = Some(env);
     loop {
-        let action = channel.lock().try_send(msg, nonblock);
+        let env = retry_env.take().unwrap();
+        let action = channel.lock().try_send(env, nonblock);
         match action {
             SendAction::Done => return 0,
             SendAction::Donated(thread_idx) => {
@@ -103,16 +115,20 @@ pub fn sys_ipc_send(fd: i32, msg_ptr: u64, flags: u32) -> i64 {
                 }
                 return 0;
             }
-            SendAction::BlockWithMsg(_retry_msg) => {
+            SendAction::BlockWithMsg(env) => {
                 // Queue was full; block until receiver drains and wakes us.
+                retry_env = Some(env);
                 scheduler::block_current_thread();
                 // Retry — the receiver unblocked us, so there should be space.
                 continue;
             }
-            SendAction::WouldBlock => return -errno::EAGAIN,
-            SendAction::PeerClosed => return -errno::EPIPE,
-            SendAction::PostToPort(pr, msg) => {
-                let bytes = ipc_msg_to_bytes(&msg);
+            SendAction::WouldBlock(_env) => return -errno::EAGAIN,
+            SendAction::PeerClosed(_env) => return -errno::EPIPE,
+            SendAction::PostToPort(pr, mut env) => {
+                let bytes = ipc_msg_to_bytes(&env.msg);
+                // Take transfer_fds out so they travel with the Completion,
+                // not dropped when env is dropped.
+                let tfds = env.transfer_fds.take();
                 let woken = pr.port.lock().post(Completion {
                     user_data: pr.user_data,
                     result: 0,
@@ -120,6 +136,7 @@ pub fn sys_ipc_send(fd: i32, msg_ptr: u64, flags: u32) -> i64 {
                     opcode: OP_IPC_RECV,
                     read_buf: Some(bytes),
                     read_dest: pr.buf_dest,
+                    transfer_fds: tfds,
                 });
                 if let Some(thread_idx) = woken {
                     scheduler::set_donate_target(thread_idx);
@@ -150,10 +167,8 @@ pub fn sys_ipc_recv(fd: i32, msg_ptr: u64, flags: u32) -> i64 {
     loop {
         let action = channel.lock().try_recv(nonblock);
         match action {
-            RecvAction::Message(msg) => {
-                // Copy message to user memory.
-                unsafe { *(msg_ptr as *mut IpcMessage) = msg; }
-                return 0;
+            RecvAction::Message(env) => {
+                return deliver_to_user(env, msg_ptr);
             }
             RecvAction::Block => {
                 // No message; block until sender wakes us.
@@ -161,9 +176,8 @@ pub fn sys_ipc_recv(fd: i32, msg_ptr: u64, flags: u32) -> i64 {
                 // Retry — sender may have deposited a message or closed.
                 continue;
             }
-            RecvAction::MessageAndNotifySendPort(msg, port, user_data) => {
-                // Copy message to user memory.
-                unsafe { *(msg_ptr as *mut IpcMessage) = msg; }
+            RecvAction::MessageAndNotifySendPort(env, port, user_data) => {
+                let rc = deliver_to_user(env, msg_ptr);
                 // Post success to the armed OP_IPC_SEND port.
                 let woken = port.lock().post(Completion {
                     user_data,
@@ -172,17 +186,116 @@ pub fn sys_ipc_recv(fd: i32, msg_ptr: u64, flags: u32) -> i64 {
                     opcode: OP_IPC_SEND,
                     read_buf: None,
                     read_dest: 0,
+                    transfer_fds: None,
                 });
                 if let Some(thread_idx) = woken {
                     scheduler::set_donate_target(thread_idx);
                     scheduler::yield_now();
                 }
-                return 0;
+                return rc;
             }
             RecvAction::WouldBlock => return -errno::EAGAIN,
             RecvAction::PeerClosed => return -errno::EPIPE,
         }
     }
+}
+
+// -------------------------------------------------------------------------
+// fd-passing helpers
+
+/// Extract fd objects from the sender's fd table based on `msg.fds`.
+///
+/// Returns `None` if all fd slots are -1 (no transfer needed).
+/// On error (bad fd), rolls back any already-duped objects and returns EBADF.
+pub fn extract_transfer_fds(msg: &IpcMessage) -> Result<Option<TransferFds>, i64> {
+    // Fast path: no fds to transfer.
+    if msg.fds.iter().all(|&fd| fd == -1) {
+        return Ok(None);
+    }
+
+    let pid = process::current_pid();
+    let mut objects: TransferFds = [None, None, None, None];
+
+    for (i, &fd) in msg.fds.iter().enumerate() {
+        if fd == -1 {
+            continue;
+        }
+        if fd < 0 {
+            // Negative fds other than -1 are invalid.
+            rollback_transfer_fds(&mut objects);
+            return Err(-errno::EBADF);
+        }
+        match process::with_process(pid, |p| p.get_fd_entry(fd as usize)) {
+            Some(Ok(entry)) => {
+                entry.object.notify_dup();
+                objects[i] = Some(entry.object);
+            }
+            _ => {
+                rollback_transfer_fds(&mut objects);
+                return Err(-errno::EBADF);
+            }
+        }
+    }
+    Ok(Some(objects))
+}
+
+/// Install transferred fd objects into the receiver's fd table.
+///
+/// Rewrites `msg.fds` with the new fd numbers.  On error (too many fds),
+/// rolls back and returns EMFILE.
+pub fn install_transfer_fds(msg: &mut IpcMessage, mut fds: TransferFds) -> Result<(), i64> {
+    let pid = process::current_pid();
+    let mut allocated: [i32; 4] = [-1; 4];
+
+    for i in 0..4 {
+        if let Some(object) = fds[i].take() {
+            match process::with_process(pid, |p| p.alloc_fd(object)) {
+                Some(Ok(new_fd)) => {
+                    allocated[i] = new_fd as i32;
+                }
+                _ => {
+                    // Rollback: close already-allocated fds.
+                    for &afd in &allocated {
+                        if afd != -1 {
+                            process::with_process(pid, |p| {
+                                p.close_fd(afd as usize).ok();
+                            });
+                        }
+                    }
+                    // Close remaining uninstalled objects.
+                    for slot in fds.iter_mut().skip(i) {
+                        if let Some(obj) = slot.take() {
+                            obj.close();
+                        }
+                    }
+                    return Err(-errno::EMFILE);
+                }
+            }
+        }
+    }
+    msg.fds = allocated;
+    Ok(())
+}
+
+/// Close any already-duped objects on send-side error.
+fn rollback_transfer_fds(objects: &mut TransferFds) {
+    for slot in objects.iter_mut() {
+        if let Some(obj) = slot.take() {
+            obj.close();
+        }
+    }
+}
+
+/// Deliver an enveloped message to user memory, installing any transferred fds.
+fn deliver_to_user(mut env: EnvelopedMessage, msg_ptr: u64) -> i64 {
+    if let Some(fds) = env.transfer_fds.take() {
+        if let Err(e) = install_transfer_fds(&mut env.msg, fds) {
+            return e;
+        }
+    }
+    // Copy message to user memory.
+    unsafe { *(msg_ptr as *mut IpcMessage) = env.msg; }
+    0
 }
 
 // -------------------------------------------------------------------------
@@ -211,11 +324,12 @@ fn get_channel_recv(fd: usize) -> Result<Arc<IrqMutex<ChannelInner>>, i64> {
 }
 
 /// Serialize an IpcMessage to a byte Vec for Completion::read_buf.
-fn ipc_msg_to_bytes(msg: &IpcMessage) -> Vec<u8> {
+pub fn ipc_msg_to_bytes(msg: &IpcMessage) -> Vec<u8> {
     unsafe {
         core::slice::from_raw_parts(
             msg as *const IpcMessage as *const u8,
             core::mem::size_of::<IpcMessage>(),
         )
-    }.to_vec()
+    }
+    .to_vec()
 }

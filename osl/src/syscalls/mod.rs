@@ -74,6 +74,7 @@ fn syscall_inner(
         SYS_SET_TID_ADDRESS => process::sys_set_tid_address(),
         SYS_CLOCK_GETTIME  => misc::sys_clock_gettime(a1, a2),
         SYS_SET_ROBUST_LIST => 0,
+        SYS_PIPE           => fs::sys_pipe2(a1, 0),
         SYS_PIPE2          => fs::sys_pipe2(a1, a2),
         SYS_GETRANDOM      => misc::sys_getrandom(a1, a2, a3),
         SYS_IO_CREATE      => crate::io_port::sys_io_create(a1 as u32),
