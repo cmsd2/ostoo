@@ -1,14 +1,18 @@
-# pipe2 (nr 293)
+# pipe (nr 22) / pipe2 (nr 293)
 
 ## Linux Signature
 
 ```c
+int pipe(int pipefd[2]);
 int pipe2(int pipefd[2], int flags);
 ```
 
 ## Description
 
 Creates a unidirectional data channel (pipe). Returns two file descriptors: `pipefd[0]` for reading and `pipefd[1]` for writing.
+
+Both syscalls share the same implementation: `pipe(fds)` is dispatched as
+`pipe2(fds, 0)` (no flags).
 
 ## Current Implementation
 
@@ -23,7 +27,7 @@ Creates a unidirectional data channel (pipe). Returns two file descriptors: `pip
 - **Write:** Appends data to the shared buffer and wakes any blocked reader. Currently unbounded (no backpressure).
 - **Close:** Closing the write end sets `write_closed = true` and wakes any blocked reader (so it gets EOF). Closing the read end drops the reader's Arc reference.
 
-**Source:** `osl/src/syscalls/fs.rs` — `sys_pipe2`, `libkernel/src/file.rs` — `PipeReader`, `PipeWriter`, `make_pipe`
+**Source:** `osl/src/syscalls/fs.rs` — `sys_pipe2`, `osl/src/syscalls/mod.rs` — pipe(22) dispatch, `libkernel/src/file.rs` — `PipeReader`, `PipeWriter`, `make_pipe`
 
 ## Usage from C (musl)
 

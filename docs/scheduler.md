@@ -159,11 +159,13 @@ pub const QUANTUM_TICKS: u32 = 50;
 | `WAKE_QUEUE`   | `Arc<ArrayQueue<TaskId>>`       | Lock-free waker notifications (ISR-safe) |
 | `WAKER_CACHE`  | `Mutex<BTreeMap<TaskId, Waker>>`| One Waker per live task; keeps Arc count ≥ 2 to prevent ISR deallocation |
 
-`TASK_QUEUE` and `WAIT_MAP` use `spin::Mutex`.  On a single CPU with
-preemption, a thread can be preempted while holding a spinlock; the new thread
-spinning on the same lock will waste its quantum and yield back, at which
-point the original thread releases the lock.  This is safe but not maximally
-efficient — acceptable for a demo kernel.
+`TASK_QUEUE` and `WAIT_MAP` use `SpinMutex` (a `spin::Mutex` wrapper with
+deadlock detection).  On a single CPU with preemption, a thread can be
+preempted while holding a spinlock; the new thread spinning on the same lock
+will waste its quantum and yield back, at which point the original thread
+releases the lock.  If this doesn't resolve within ~100 ms (`SPIN_LIMIT`
+iterations), `SpinMutex` panics with a serial diagnostic rather than hanging
+silently.
 
 ### ISR-safe waker deallocation (`WAKER_CACHE`)
 
@@ -206,6 +208,21 @@ loops:
 
 The ISR already runs with IF = 0, so it never needs to call
 `without_interrupts`.
+
+### Deadlock Detection
+
+All `spin::Mutex` locks have been replaced with `SpinMutex`
+(`libkernel/src/spin_mutex.rs`), which counts spin iterations and panics
+after a threshold:
+
+| Lock type | Threshold | Rationale |
+|-----------|-----------|-----------|
+| `SpinMutex` | 100,000,000 (~100 ms) | Well beyond the 10 ms quantum; allows for legitimate preemption contention |
+| `IrqMutex`  | 10,000,000 (~10 ms)   | Interrupts are disabled — no preemption, so any contention is a true deadlock |
+
+On timeout, `deadlock_panic()` writes directly to serial port 0x3F8
+(bypassing `SERIAL1`'s lock) and then panics.  This turns silent hangs into
+actionable diagnostics.
 
 ---
 

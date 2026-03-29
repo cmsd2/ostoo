@@ -29,7 +29,7 @@ Toolchain: current nightly (floating, `rust-toolchain.toml`).
 - Entry point via `entry_point!` macro (`libkernel_main` in `kernel/src/main.rs`).
 
 ### 3. VGA Text Mode
-- `libkernel/src/vga_buffer/mod.rs` — a `Writer` behind a `spin::Mutex`.
+- `libkernel/src/vga_buffer/mod.rs` — a `Writer` behind an `IrqMutex`.
 - `print!` / `println!` macros available globally.
 - Volatile writes to avoid compiler optimisation of MMIO.
 - Hardware cursor (CRTC registers 0x3D4/0x3D5) kept in sync on every write.
@@ -146,11 +146,12 @@ are present, racing all event sources in a single future.
 ### User Space and Process Isolation
 - Full ring-3 process support with per-process page tables, SYSCALL/SYSRET,
   and preemptive scheduling.
-- 30+ Linux-compatible syscalls in `osl/src/syscalls/`.
+- 35+ Linux-compatible syscalls in `osl/src/syscalls/`.
 - Per-process FD table, CWD tracking, parent/child relationships, zombie
   lifecycle with `wait4`/`reap`.
 - ELF loader for static x86-64 binaries; initial stack with `argc/argv/auxv`.
-- Custom `spawn` syscall (nr 500) for launching child processes.
+- IPC channels with fd-passing (capability transfer) — syscalls 505–507.
+  See [`docs/ipc-channels.md`](ipc-channels.md).
 - Console input buffer with foreground PID routing and blocking `read(0)`.
 - Async-to-sync bridge (`osl/src/blocking.rs`) for VFS calls from syscall
   context.
@@ -214,7 +215,7 @@ are present, racing all event sources in a single future.
 - `p9_proto.rs` — minimal 9P2000.L wire protocol: 8 message pairs (version,
   attach, walk, lopen, read, readdir, getattr, clunk).
 - `p9.rs` — `P9Client` high-level client wrapping `VirtIO9p<KernelHal, PciTransport>`.
-  Synchronous API behind `spin::Mutex`; performs version handshake + attach on
+  Synchronous API behind `SpinMutex`; performs version handshake + attach on
   construction.  Public methods: `list_dir`, `read_file`, `stat`.
 - QEMU shares `./user` directory via `-fsdev local,...,security_model=none`
   + `-device virtio-9p-pci,...,mount_tag=hostfs`.
@@ -237,7 +238,7 @@ are present, racing all event sources in a single future.
 - Uniform path namespace over multiple filesystems; shell no longer calls
   filesystem drivers directly.
 - Enum dispatch (`AnyVfs`) avoids `Pin<Box<dyn Future>>` trait objects.
-- Mount table (`MOUNTS`: `spin::Mutex<Vec<(String, Arc<AnyVfs>)>>`) sorted
+- Mount table (`MOUNTS`: `SpinMutex<Vec<(String, Arc<AnyVfs>)>>`) sorted
   longest-mountpoint-first; the `Arc` is cloned out before any `.await` so
   the lock is never held across a suspension point.
 - `ExfatVfs` — wraps a `BlkInbox` and delegates to the exFAT driver.
@@ -297,8 +298,33 @@ are present, racing all event sources in a single future.
 - On close, the original IO APIC entry is restored.
 - Demo: `user/irq_demo.c` — keyboard scancode display via OP_IRQ_WAIT.
 
+### IPC Channels (`libkernel/src/channel.rs`, `osl/src/ipc.rs`)
+- Capability-based IPC channels for structured message passing between processes.
+- Unidirectional with configurable buffer capacity: capacity=0 for synchronous
+  rendezvous (seL4-style), capacity>0 for async buffered.
+- Fixed 48-byte messages: `tag` (u64) + `data[3]` (u64) + `fds[4]` (i32).
+- **fd-passing** (capability transfer): sender's fds are extracted at send time,
+  kernel objects are stored in the channel, and new fds are allocated in the
+  receiver's fd table at recv time. Cleanup on drop for undelivered messages.
+- Completion port integration: `OP_IPC_SEND` (5) and `OP_IPC_RECV` (6) for
+  multiplexing IPC with timers, IRQs, and file I/O.
+- Syscalls: `ipc_create` (505), `ipc_send` (506), `ipc_recv` (507).
+- Demos: `ipc_sync.c`, `ipc_async.c`, `ipc_port.c`, `ipc_fdpass.c`.
+- See [`docs/ipc-channels.md`](ipc-channels.md) for full design.
+
+### Deadlock Detection (`libkernel/src/spin_mutex.rs`)
+- All `spin::Mutex` locks replaced with `SpinMutex` — a drop-in wrapper that
+  counts spin iterations and panics after a threshold, turning silent hangs
+  into actionable diagnostics with serial output.
+- `SpinMutex`: 100M iteration limit (~100 ms) — allows for legitimate
+  preemption contention on a single-core scheduler.
+- `IrqMutex`: 10M iteration limit (~10 ms) — interrupts disabled means no
+  preemption, so any contention indicates a true deadlock.
+- `deadlock_panic()` writes directly to COM1 (0x3F8) bypassing `SERIAL1`'s
+  lock, then panics.
+
 ### POSIX Signals (`libkernel/src/signal.rs`, `osl/src/signal.rs`)
-- Phase 1: basic signal infrastructure and delivery on SYSCALL return.
+- Phases 1–2: signal infrastructure, delivery on SYSCALL return, Ctrl+C/SIGINT.
 - `rt_sigaction` (13): install/query signal handlers (SA_SIGINFO, SA_RESTORER).
 - `rt_sigprocmask` (14): SIG_BLOCK/UNBLOCK/SETMASK for the signal mask.
 - `kill` (62): send a signal to a specific pid.
@@ -306,8 +332,11 @@ are present, racing all event sources in a single future.
 - Signal delivery via `check_pending_signals` in the SYSCALL return path:
   constructs a Linux-ABI-compatible `rt_sigframe` on the user stack, rewrites
   the saved register frame so `sysretq` "returns" into the handler.
+- Ctrl+C: keyboard actor queues SIGINT on `foreground_pid()`, wakes blocked
+  console reader.
 - Default actions: SIG_DFL terminate (SIGKILL, SIGTERM, etc.) or ignore (SIGCHLD).
-- Demo: `user/sig_demo.c` — SIGUSR1 self-signal with handler verification.
+- Demos: `user/sig_demo.c` (SIGUSR1 self-signal), userspace shell handles
+  SIGINT via `sigaction`.
 - See [`docs/signals.md`](signals.md) for full design.
 
 ### Dummy Driver (`devices/src/dummy.rs`)
@@ -356,15 +385,9 @@ but concurrent processes will still pressure the heap. The
 `DumbVmemAllocator` has no reclamation path, so virtual address space for
 MMIO/ACPI mappings is also consumed monotonically.
 
-### virtio-blk Busy Polling
-`CompletionFuture` re-schedules itself immediately rather than sleeping on an
-IRQ waker. This burns CPU on every block read. The IRQ handler sets
-`IRQ_PENDING` but the executor does not yet have an `AtomicWaker` integration
-to park the future until the device signals completion.
-
-### Single-sector DMA Buffers
-Block I/O is done one 512-byte sector at a time. For large directory scans or
-file reads this results in many round-trips through the virtio queue.
+### virtio-blk Single-sector I/O
+Block I/O uses IRQ-driven completion via `AtomicWaker`, but is still limited
+to one 512-byte sector per request.
 
 ### exFAT Write Support
 The exFAT driver is read-only. All filesystem state changes (create, write,
@@ -405,10 +428,11 @@ output but functionally harmless.
 
 ### Process Model
 
-5. **Signals Phase 2+** — Phase 1 (basic signal delivery) is complete:
-   `rt_sigaction`, `rt_sigprocmask`, `kill`, signal delivery on SYSCALL return,
-   `rt_sigreturn`.  Remaining: exception-generated signals (SIGSEGV, SIGILL),
-   SIGINT from Ctrl+C, SIGCHLD on child exit.  See [`docs/signals.md`](signals.md).
+5. **Signals Phase 3+** — Phases 1–2 (basic signal delivery + Ctrl+C/SIGINT)
+   are complete: `rt_sigaction`, `rt_sigprocmask`, `kill`, signal delivery on
+   SYSCALL return, `rt_sigreturn`, Ctrl+C → SIGINT to foreground process.
+   Remaining: exception-generated signals (SIGSEGV, SIGILL), SIGCHLD on child
+   exit.  See [`docs/signals.md`](signals.md).
 
 6. **`fork` + CoW page faults** — standard POSIX `fork`.  `clone(CLONE_VM|CLONE_VFORK)`
    and `execve` are now implemented, enabling unpatched musl `posix_spawn` and
@@ -417,22 +441,19 @@ output but functionally harmless.
 
 ### Drivers & I/O
 
-7. **IRQ-driven virtio-blk** — wire `IRQ_PENDING` to an `AtomicWaker` so
-   `CompletionFuture` parks instead of busy-polling.
-
-8. **Multi-sector DMA** — batch multiple sectors per virtio request to reduce
+7. **Multi-sector DMA** — batch multiple sectors per virtio request to reduce
    queue round-trips for directory scans and file reads.
 
-9. **exFAT write support** — directory entry creation, FAT chain allocation,
+8. **exFAT write support** — directory entry creation, FAT chain allocation,
    and sector writes to enable `touch`, `mkdir`, `cp`, `rm`.
 
 ### Microkernel Path
 
-10. **Microkernel Phase B** — kernel primitives for userspace drivers:
+9. **Microkernel Phase B** — kernel primitives for userspace drivers:
     `MAP_SHARED`, device MMIO mapping, DMA syscalls.  IRQ fd is complete
     (syscall 504 + OP_IRQ_WAIT).  Remaining items unblock userspace NIC driver.
     See [`docs/microkernel-design.md`](microkernel-design.md).
 
-11. **Networking** — virtio-net driver + smoltcp TCP/IP stack.  The
+10. **Networking** — virtio-net driver + smoltcp TCP/IP stack.  The
     completion port is ready to back it once the NIC driver lands.
     See [`docs/networking-design.md`](networking-design.md).
