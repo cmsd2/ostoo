@@ -2,7 +2,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use spin::Mutex;
+use libkernel::spin_mutex::SpinMutex as Mutex;
 use virtio_drivers::device::virtio_9p::VirtIO9p;
 use virtio_drivers::transport::pci::PciTransport;
 

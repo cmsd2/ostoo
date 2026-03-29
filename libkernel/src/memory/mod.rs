@@ -1,6 +1,6 @@
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::Mutex;
+use crate::spin_mutex::SpinMutex as Mutex;
 use x86_64::{VirtAddr, PhysAddr};
 use x86_64::structures::paging::{
     OffsetPageTable,

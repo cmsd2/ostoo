@@ -53,7 +53,7 @@ pub fn init_irq(gsi: u32) {
 // CompletionFuture — woken by IRQ via AtomicWaker.
 
 struct CompletionFuture<'a> {
-    device: &'a spin::Mutex<VirtIOBlk<KernelHal, PciTransport>>,
+    device: &'a libkernel::spin_mutex::SpinMutex<VirtIOBlk<KernelHal, PciTransport>>,
 }
 
 impl<'a> Future for CompletionFuture<'a> {
@@ -109,13 +109,13 @@ pub struct VirtioBlkInfo {
 // Actor
 
 pub struct VirtioBlkActor {
-    device: spin::Mutex<VirtIOBlk<KernelHal, PciTransport>>,
+    device: libkernel::spin_mutex::SpinMutex<VirtIOBlk<KernelHal, PciTransport>>,
     reads:  AtomicU64,
     writes: AtomicU64,
 }
 
 // VirtIOBlk contains raw pointers (queue DMA buffers).  Access is always
-// serialised through the spin::Mutex so these impls are sound.
+// serialised through the libkernel::spin_mutex::SpinMutex so these impls are sound.
 unsafe impl Send for VirtioBlkActor {}
 unsafe impl Sync for VirtioBlkActor {}
 
@@ -124,7 +124,7 @@ impl VirtioBlkActor {
         let device = VirtIOBlk::<KernelHal, PciTransport>::new(transport)
             .expect("virtio-blk init failed");
         VirtioBlkActor {
-            device: spin::Mutex::new(device),
+            device: libkernel::spin_mutex::SpinMutex::new(device),
             reads:  AtomicU64::new(0),
             writes: AtomicU64::new(0),
         }

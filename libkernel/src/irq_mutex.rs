@@ -1,5 +1,6 @@
 use core::ops::{Deref, DerefMut};
 use spin::MutexGuard;
+use crate::spin_mutex::{deadlock_panic, IRQ_SPIN_LIMIT};
 
 /// A spinlock that automatically disables local interrupts while held.
 ///
@@ -26,8 +27,19 @@ impl<T> IrqMutex<T> {
     pub fn lock(&self) -> IrqMutexGuard<'_, T> {
         let was_enabled = x86_64::instructions::interrupts::are_enabled();
         x86_64::instructions::interrupts::disable();
+        let mut spins: u32 = 0;
+        let guard = loop {
+            if let Some(g) = self.0.try_lock() {
+                break g;
+            }
+            spins += 1;
+            if spins >= IRQ_SPIN_LIMIT {
+                deadlock_panic("IrqMutex");
+            }
+            core::hint::spin_loop();
+        };
         IrqMutexGuard {
-            guard: Some(self.0.lock()),
+            guard: Some(guard),
             was_enabled,
         }
     }

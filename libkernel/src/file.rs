@@ -3,7 +3,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use snafu::Snafu;
-use spin::Mutex;
+use crate::spin_mutex::SpinMutex as Mutex;
 
 use crate::channel::{ChannelInner, CloseRecvAction, CloseSendAction, PendingPortRecv, PendingPortSend};
 use crate::completion_port::CompletionPort;

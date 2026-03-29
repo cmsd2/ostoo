@@ -2,7 +2,7 @@
 
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::Mutex;
+use crate::spin_mutex::SpinMutex as Mutex;
 
 use crate::process::ProcessId;
 use crate::task::scheduler;

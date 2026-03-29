@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use alloc::sync::Arc;
 use lazy_static::lazy_static;
 use libkernel::process::ProcessId;
-use spin::Mutex;
+use libkernel::spin_mutex::SpinMutex as Mutex;
 
 pub mod exfat_vfs;
 pub mod plan9_vfs;

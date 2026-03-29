@@ -4,7 +4,7 @@ pub mod io_apic;
 use alloc::vec::Vec;
 use acpi::platform::interrupt::{InterruptModel, IoApic as AcpiIoApic, InterruptSourceOverride, Polarity, TriggerMode};
 use core::sync::atomic::{AtomicU32, Ordering};
-use spin::Mutex;
+use crate::spin_mutex::SpinMutex as Mutex;
 use lazy_static::lazy_static;
 use crate::memory::MemoryServices;
 use x86_64::{PhysAddr, VirtAddr};

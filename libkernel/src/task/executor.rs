@@ -6,7 +6,7 @@ use core::task::Waker;
 use core::task::{Context, Poll};
 use crossbeam_queue::ArrayQueue;
 use lazy_static::lazy_static;
-use spin::Mutex;
+use crate::spin_mutex::SpinMutex as Mutex;
 
 // ---------------------------------------------------------------------------
 // Global executor state

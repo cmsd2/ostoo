@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
-use spin::Mutex;
+use libkernel::spin_mutex::SpinMutex as Mutex;
 use x86_64::instructions::port::Port;
 
 #[derive(Debug, Clone)]

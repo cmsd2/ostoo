@@ -2,7 +2,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
-use spin::Mutex;
+use crate::spin_mutex::SpinMutex as Mutex;
 use x86_64::instructions::interrupts;
 
 /// LAPIC timer is configured at 1000 Hz → 1 tick = 1 ms.

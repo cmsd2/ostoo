@@ -1,6 +1,6 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
-use spin;
+use crate::spin_mutex::SpinMutex;
 use x86_64::structures::idt::{
     InterruptDescriptorTable,
     InterruptStackFrame,
@@ -19,8 +19,8 @@ pub const DYNAMIC_BASE: u8 = 0x40;
 /// Number of dynamically allocatable vectors.
 pub const DYNAMIC_COUNT: usize = 16;
 
-static DYNAMIC_HANDLERS: spin::Mutex<[Option<fn(usize)>; DYNAMIC_COUNT]> =
-    spin::Mutex::new([None; DYNAMIC_COUNT]);
+static DYNAMIC_HANDLERS: SpinMutex<[Option<fn(usize)>; DYNAMIC_COUNT]> =
+    SpinMutex::new([None; DYNAMIC_COUNT]);
 
 fn dispatch_dynamic(idx: usize) {
     // Copy the fn pointer out before calling so the lock is released first.
@@ -138,8 +138,8 @@ pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 pub const LAPIC_TIMER_VECTOR: u8 = 0x30;
 pub const IPC_YIELD_VECTOR: u8 = 0x50;
 
-pub static PICS: spin::Mutex<ChainedPics> =
-    spin::Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
+pub static PICS: SpinMutex<ChainedPics> =
+    SpinMutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]

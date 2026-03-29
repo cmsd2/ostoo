@@ -18,7 +18,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use spin::Mutex;
+use crate::spin_mutex::SpinMutex as Mutex;
 use lazy_static::lazy_static;
 use super::mailbox::{ActorMsg, ActorStatus, ErasedInfo, Mailbox, Reply};
 

@@ -1,7 +1,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use spin::Mutex;
+use crate::spin_mutex::SpinMutex as Mutex;
 
 use crate::process::ProcessId;
 use crate::serial_println;

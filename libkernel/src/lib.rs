@@ -20,6 +20,7 @@ use linked_list_allocator::LockedHeap;
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 pub mod serial;
+pub mod spin_mutex;
 pub mod irq_mutex;
 pub mod vga_buffer;
 pub mod interrupts;

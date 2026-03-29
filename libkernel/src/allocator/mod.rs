@@ -27,13 +27,13 @@ pub fn align_up_pow_2(addr: usize, align: usize) -> usize {
 }
 
 pub struct Locked<A> {
-    inner: spin::Mutex<A>,
+    inner: crate::spin_mutex::SpinMutex<A>,
 }
 
 impl<A> Locked<A> {
     pub const fn new(inner: A) -> Self {
         Locked {
-            inner: spin::Mutex::new(inner),
+            inner: crate::spin_mutex::SpinMutex::new(inner),
         }
     }
 

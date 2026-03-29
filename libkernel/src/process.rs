@@ -2,7 +2,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::Mutex;
+use crate::spin_mutex::SpinMutex as Mutex;
 use x86_64::PhysAddr;
 use x86_64::structures::paging::PageTableFlags;
 

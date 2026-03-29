@@ -6,7 +6,7 @@ use core::future::Future;
 use futures_util::task::AtomicWaker;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use spin::Mutex;
+use crate::spin_mutex::SpinMutex as Mutex;
 
 // ---------------------------------------------------------------------------
 // ActorMsg — generic envelope for all actor mailboxes

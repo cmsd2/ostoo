@@ -1,7 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
-use spin::Mutex;
+use libkernel::spin_mutex::SpinMutex as Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverState {

@@ -3,7 +3,7 @@
 
 use alloc::sync::Arc;
 use core::future::Future;
-use spin::Mutex;
+use libkernel::spin_mutex::SpinMutex as Mutex;
 
 use libkernel::task::scheduler;
 use libkernel::task::executor;

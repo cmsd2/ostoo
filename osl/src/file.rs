@@ -1,7 +1,7 @@
 //! VFS-backed file handles for the per-process file descriptor table.
 
 use alloc::vec::Vec;
-use spin::Mutex;
+use libkernel::spin_mutex::SpinMutex as Mutex;
 
 use devices::vfs::VfsDirEntry;
 use libkernel::file::{FileHandle, FileError};

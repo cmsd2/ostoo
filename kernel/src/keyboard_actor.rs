@@ -244,9 +244,9 @@ impl LineState {
 pub struct KeyboardActor {
     keys_processed:   AtomicU64,
     lines_dispatched: AtomicU64,
-    line:             spin::Mutex<LineState>,
+    line:             libkernel::spin_mutex::SpinMutex<LineState>,
     /// Current prompt string, kept in sync with the shell via `SetPrompt`.
-    prompt:           spin::Mutex<alloc::string::String>,
+    prompt:           libkernel::spin_mutex::SpinMutex<alloc::string::String>,
 }
 
 impl KeyboardActor {
@@ -254,9 +254,9 @@ impl KeyboardActor {
         KeyboardActor {
             keys_processed:   AtomicU64::new(0),
             lines_dispatched: AtomicU64::new(0),
-            line:             spin::Mutex::new(LineState::new()),
+            line:             libkernel::spin_mutex::SpinMutex::new(LineState::new()),
             // Initial value matches Shell::new() CWD = "/".
-            prompt:           spin::Mutex::new(alloc::string::String::from("ostoo:/> ")),
+            prompt:           libkernel::spin_mutex::SpinMutex::new(alloc::string::String::from("ostoo:/> ")),
         }
     }
 }

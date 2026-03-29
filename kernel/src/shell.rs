@@ -19,12 +19,12 @@ pub enum ShellMsg {
 // Shell actor
 
 pub struct Shell {
-    cwd: spin::Mutex<String>,
+    cwd: libkernel::spin_mutex::SpinMutex<String>,
 }
 
 impl Shell {
     pub fn new() -> Self {
-        Shell { cwd: spin::Mutex::new("/".to_string()) }
+        Shell { cwd: libkernel::spin_mutex::SpinMutex::new("/".to_string()) }
     }
 }
 
