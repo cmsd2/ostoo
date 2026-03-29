@@ -11,12 +11,23 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
+#include <signal.h>
+#include <errno.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <spawn.h>
 #include <fcntl.h>
 
 extern char **environ;
+
+/* ── SIGINT handling ───────────────────────────────────────────────── */
+
+static volatile sig_atomic_t got_sigint = 0;
+
+static void sigint_handler(int sig) {
+    (void)sig;
+    got_sigint = 1;
+}
 
 /* ── small helpers (no libc printf to avoid buffering issues) ───────── */
 
@@ -75,6 +86,15 @@ static int read_line(void) {
 
     for (;;) {
         ssize_t n = read(0, &c, 1);
+        if (n < 0 && errno == EINTR) {
+            if (got_sigint) {
+                got_sigint = 0;
+                puts_stdout("^C\n");
+                line_clear();
+                print_prompt();
+            }
+            continue;
+        }
         if (n <= 0) return 0; /* EOF / error */
 
         switch (c) {
@@ -98,12 +118,6 @@ static int read_line(void) {
                 for (int i = 0; i <= line_len - line_cursor; i++)
                     put_char('\b');
             }
-            break;
-
-        case 0x03: /* Ctrl+C */
-            puts_stdout("^C\n");
-            line_clear();
-            print_prompt();
             break;
 
         case 0x04: /* Ctrl+D */
@@ -419,6 +433,14 @@ static void cmd_run(char *cmdline) {
 
 int main(void) {
     env_init();
+
+    /* Install SIGINT handler so Ctrl+C cancels the current line
+       instead of killing the shell. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigint_handler;
+    sigaction(SIGINT, &sa, NULL);
+
     puts_stdout("\nostoo userspace shell\n");
 
     for (;;) {
