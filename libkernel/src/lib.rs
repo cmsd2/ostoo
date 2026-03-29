@@ -43,6 +43,7 @@ pub mod msr;
 pub mod path;
 pub mod gap;
 pub mod signal;
+pub mod channel;
 pub mod framebuffer;
 pub mod font;
 

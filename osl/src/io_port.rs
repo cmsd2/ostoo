@@ -10,10 +10,11 @@ use core::task::{Context, Poll};
 
 use libkernel::completion_port::{
     CompletionPort, Completion,
-    OP_NOP, OP_TIMEOUT, OP_READ, OP_WRITE, OP_IRQ_WAIT,
+    OP_NOP, OP_TIMEOUT, OP_READ, OP_WRITE, OP_IRQ_WAIT, OP_IPC_RECV, OP_IPC_SEND,
 };
 use libkernel::irq_mutex::IrqMutex;
-use libkernel::file::{FileHandle, FileError, FdObject};
+use libkernel::channel::{ArmRecvAction, ArmSendAction, IpcMessage, PendingPortRecv, PendingPortSend};
+use libkernel::file::{ChannelFd, FileHandle, FileError, FdObject};
 use libkernel::task::{executor, scheduler, timer, Task};
 
 use crate::fd_helpers;
@@ -335,6 +336,213 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                 libkernel::irq_handle::arm_irq(&irq, port.clone(), sub.user_data);
             }
 
+            OP_IPC_RECV => {
+                let channel = match get_ipc_recv_channel(sub.fd as usize) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        port.lock().post(Completion {
+                            user_data: sub.user_data,
+                            result: -errno::EBADF,
+                            flags: 0,
+                            opcode: OP_IPC_RECV,
+                            read_buf: None,
+                            read_dest: 0,
+                        });
+                        processed += 1;
+                        continue;
+                    }
+                };
+
+                let msg_size = core::mem::size_of::<IpcMessage>() as u64;
+                if sub.buf_addr != 0 && !validate_user_buf(sub.buf_addr, msg_size) {
+                    port.lock().post(Completion {
+                        user_data: sub.user_data,
+                        result: -errno::EFAULT,
+                        flags: 0,
+                        opcode: OP_IPC_RECV,
+                        read_buf: None,
+                        read_dest: 0,
+                    });
+                    processed += 1;
+                    continue;
+                }
+
+                let info = PendingPortRecv {
+                    port: port.clone(),
+                    user_data: sub.user_data,
+                    buf_dest: sub.buf_addr,
+                };
+                let action = channel.lock().arm_recv(info);
+                match action {
+                    ArmRecvAction::Ready(msg) => {
+                        let bytes = ipc_msg_to_bytes(&msg);
+                        let woken = port.lock().post(Completion {
+                            user_data: sub.user_data,
+                            result: 0,
+                            flags: 0,
+                            opcode: OP_IPC_RECV,
+                            read_buf: Some(bytes),
+                            read_dest: sub.buf_addr,
+                        });
+                        if let Some(thread_idx) = woken {
+                            scheduler::set_donate_target(thread_idx);
+                            scheduler::yield_now();
+                        }
+                    }
+                    ArmRecvAction::ReadyAndNotifySendPort(msg, send_port, send_ud) => {
+                        // Post the message to the recv port.
+                        let bytes = ipc_msg_to_bytes(&msg);
+                        port.lock().post(Completion {
+                            user_data: sub.user_data,
+                            result: 0,
+                            flags: 0,
+                            opcode: OP_IPC_RECV,
+                            read_buf: Some(bytes),
+                            read_dest: sub.buf_addr,
+                        });
+                        // Post success to the send port.
+                        let woken = send_port.lock().post(Completion {
+                            user_data: send_ud,
+                            result: 0,
+                            flags: 0,
+                            opcode: OP_IPC_SEND,
+                            read_buf: None,
+                            read_dest: 0,
+                        });
+                        if let Some(thread_idx) = woken {
+                            scheduler::set_donate_target(thread_idx);
+                            scheduler::yield_now();
+                        }
+                    }
+                    ArmRecvAction::PeerClosed => {
+                        port.lock().post(Completion {
+                            user_data: sub.user_data,
+                            result: -errno::EPIPE,
+                            flags: 0,
+                            opcode: OP_IPC_RECV,
+                            read_buf: None,
+                            read_dest: 0,
+                        });
+                    }
+                    ArmRecvAction::Armed => {
+                        // Port registered on channel; completion will be posted
+                        // when a sender sends a message.
+                    }
+                }
+            }
+
+            OP_IPC_SEND => {
+                let channel = match get_ipc_send_channel(sub.fd as usize) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        port.lock().post(Completion {
+                            user_data: sub.user_data,
+                            result: -errno::EBADF,
+                            flags: 0,
+                            opcode: OP_IPC_SEND,
+                            read_buf: None,
+                            read_dest: 0,
+                        });
+                        processed += 1;
+                        continue;
+                    }
+                };
+
+                let msg_size = core::mem::size_of::<IpcMessage>() as u64;
+                if !validate_user_buf(sub.buf_addr, msg_size) {
+                    port.lock().post(Completion {
+                        user_data: sub.user_data,
+                        result: -errno::EFAULT,
+                        flags: 0,
+                        opcode: OP_IPC_SEND,
+                        read_buf: None,
+                        read_dest: 0,
+                    });
+                    processed += 1;
+                    continue;
+                }
+
+                // Copy message from user memory.
+                let msg = unsafe { *(sub.buf_addr as *const IpcMessage) };
+
+                let info = PendingPortSend {
+                    port: port.clone(),
+                    user_data: sub.user_data,
+                    msg,
+                };
+                let action = channel.lock().arm_send(info);
+                match action {
+                    ArmSendAction::Ready => {
+                        let woken = port.lock().post(Completion {
+                            user_data: sub.user_data,
+                            result: 0,
+                            flags: 0,
+                            opcode: OP_IPC_SEND,
+                            read_buf: None,
+                            read_dest: 0,
+                        });
+                        if let Some(thread_idx) = woken {
+                            scheduler::set_donate_target(thread_idx);
+                            scheduler::yield_now();
+                        }
+                    }
+                    ArmSendAction::ReadyDonate(recv_thread) => {
+                        let woken = port.lock().post(Completion {
+                            user_data: sub.user_data,
+                            result: 0,
+                            flags: 0,
+                            opcode: OP_IPC_SEND,
+                            read_buf: None,
+                            read_dest: 0,
+                        });
+                        // Donate to the receiver that was unblocked.
+                        let target = woken.unwrap_or(recv_thread);
+                        scheduler::set_donate_target(target);
+                        scheduler::yield_now();
+                    }
+                    ArmSendAction::ReadyToRecvPort(pr, msg) => {
+                        // Both send and recv were port-based.
+                        // Post the message to the recv port.
+                        let bytes = ipc_msg_to_bytes(&msg);
+                        pr.port.lock().post(Completion {
+                            user_data: pr.user_data,
+                            result: 0,
+                            flags: 0,
+                            opcode: OP_IPC_RECV,
+                            read_buf: Some(bytes),
+                            read_dest: pr.buf_dest,
+                        });
+                        // Post success to the send port.
+                        let woken = port.lock().post(Completion {
+                            user_data: sub.user_data,
+                            result: 0,
+                            flags: 0,
+                            opcode: OP_IPC_SEND,
+                            read_buf: None,
+                            read_dest: 0,
+                        });
+                        if let Some(thread_idx) = woken {
+                            scheduler::set_donate_target(thread_idx);
+                            scheduler::yield_now();
+                        }
+                    }
+                    ArmSendAction::Armed => {
+                        // Port+message stored in channel; completion will be
+                        // posted when a receiver drains space.
+                    }
+                    ArmSendAction::PeerClosed => {
+                        port.lock().post(Completion {
+                            user_data: sub.user_data,
+                            result: -errno::EPIPE,
+                            flags: 0,
+                            opcode: OP_IPC_SEND,
+                            read_buf: None,
+                            read_dest: 0,
+                        });
+                    }
+                }
+            }
+
             _ => {
                 port.lock().post(Completion {
                     user_data: sub.user_data,
@@ -457,4 +665,42 @@ pub fn sys_io_wait(port_fd: i32, completions_ptr: u64, max: u32, min: u32, timeo
         scheduler::block_current_thread();
         // Woken — either by post() or by timeout timer. Loop back to check.
     }
+}
+
+// ---------------------------------------------------------------------------
+// IPC channel helpers for OP_IPC_RECV
+
+use libkernel::irq_mutex::IrqMutex as IrqMutex2;
+use libkernel::channel::ChannelInner;
+
+fn get_ipc_send_channel(fd: usize) -> Result<Arc<IrqMutex2<ChannelInner>>, i64> {
+    let pid = libkernel::process::current_pid();
+    match libkernel::process::with_process_ref(pid, |p| p.get_fd(fd)) {
+        Some(Ok(obj)) => match obj.as_channel() {
+            Some(ChannelFd::Send(inner)) => Ok(inner.clone()),
+            _ => Err(-errno::EBADF),
+        },
+        _ => Err(-errno::EBADF),
+    }
+}
+
+fn get_ipc_recv_channel(fd: usize) -> Result<Arc<IrqMutex2<ChannelInner>>, i64> {
+    let pid = libkernel::process::current_pid();
+    match libkernel::process::with_process_ref(pid, |p| p.get_fd(fd)) {
+        Some(Ok(obj)) => match obj.as_channel() {
+            Some(ChannelFd::Recv(inner)) => Ok(inner.clone()),
+            _ => Err(-errno::EBADF),
+        },
+        _ => Err(-errno::EBADF),
+    }
+}
+
+/// Serialize an IpcMessage to a byte Vec for use as Completion::read_buf.
+fn ipc_msg_to_bytes(msg: &IpcMessage) -> Vec<u8> {
+    unsafe {
+        core::slice::from_raw_parts(
+            msg as *const IpcMessage as *const u8,
+            core::mem::size_of::<IpcMessage>(),
+        )
+    }.to_vec()
 }

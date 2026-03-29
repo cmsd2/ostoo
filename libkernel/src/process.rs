@@ -6,7 +6,7 @@ use spin::Mutex;
 use x86_64::PhysAddr;
 use x86_64::structures::paging::PageTableFlags;
 
-use crate::file::{FileError, FdEntry, FdObject, FD_CLOEXEC};
+use crate::file::{CloseResult, FileError, FdEntry, FdObject, FD_CLOEXEC};
 use crate::signal::SignalState;
 
 // ---------------------------------------------------------------------------
@@ -187,9 +187,9 @@ impl Process {
         }
     }
 
-    /// Close a file descriptor.  Returns the thread index of a woken pipe
-    /// reader (if any), so the caller can yield after releasing outer locks.
-    pub fn close_fd(&mut self, fd: usize) -> Result<Option<usize>, FileError> {
+    /// Close a file descriptor.  Returns a `CloseResult` indicating what
+    /// action the caller should take (donate to woken thread, notify port, etc.).
+    pub fn close_fd(&mut self, fd: usize) -> Result<CloseResult, FileError> {
         if fd >= self.fd_table.len() {
             return Err(FileError::BadFd);
         }

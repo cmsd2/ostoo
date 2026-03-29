@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use snafu::Snafu;
 use spin::Mutex;
 
+use crate::channel::{ChannelInner, CloseRecvAction, CloseSendAction, PendingPortRecv, PendingPortSend};
 use crate::completion_port::CompletionPort;
 use crate::irq_handle::IrqInner;
 use crate::irq_mutex::IrqMutex;
@@ -18,6 +19,25 @@ pub const FD_CLOEXEC: u32 = 1;
 // ---------------------------------------------------------------------------
 // FdObject — what a file descriptor actually refers to
 
+/// Result of closing an fd object.
+pub enum CloseResult {
+    /// Nothing to do.
+    None,
+    /// A blocked thread was woken; caller should donate to it.
+    WakeThread(usize),
+    /// An armed OP_IPC_RECV port needs a peer-closed notification.
+    NotifyRecvPort(PendingPortRecv),
+    /// An armed OP_IPC_SEND port needs a peer-closed notification.
+    NotifySendPort(PendingPortSend),
+}
+
+/// Which end of an IPC channel a file descriptor refers to.
+#[derive(Clone)]
+pub enum ChannelFd {
+    Send(Arc<IrqMutex<ChannelInner>>),
+    Recv(Arc<IrqMutex<ChannelInner>>),
+}
+
 /// The kernel object referenced by a file descriptor.
 pub enum FdObject {
     /// A regular I/O endpoint (console, pipe, VFS file, directory).
@@ -26,6 +46,8 @@ pub enum FdObject {
     Port(Arc<IrqMutex<CompletionPort>>),
     /// An IRQ file descriptor for userspace interrupt delivery.
     Irq(Arc<IrqMutex<IrqInner>>),
+    /// An IPC channel endpoint (send or receive end).
+    Channel(ChannelFd),
 }
 
 impl Clone for FdObject {
@@ -34,6 +56,7 @@ impl Clone for FdObject {
             FdObject::File(h) => FdObject::File(h.clone()),
             FdObject::Port(p) => FdObject::Port(p.clone()),
             FdObject::Irq(i) => FdObject::Irq(i.clone()),
+            FdObject::Channel(c) => FdObject::Channel(c.clone()),
         }
     }
 }
@@ -43,22 +66,41 @@ impl FdObject {
     /// Call this when actually duplicating an fd (dup2, fork/clone), NOT
     /// for temporary access via get_fd().
     pub fn notify_dup(&self) {
-        if let FdObject::File(h) = self {
-            h.on_dup();
+        match self {
+            FdObject::File(h) => h.on_dup(),
+            FdObject::Channel(c) => match c {
+                ChannelFd::Send(inner) => inner.lock().dup_send(),
+                ChannelFd::Recv(inner) => inner.lock().dup_recv(),
+            },
+            _ => {}
         }
     }
 
-    /// Close the underlying object.  Returns the thread index of a woken
-    /// reader (if this was the last PipeWriter), so the caller can yield.
-    pub fn close(&self) -> Option<usize> {
+    /// Close the underlying object.
+    pub fn close(&self) -> CloseResult {
         match self {
-            FdObject::File(h) => h.close(),
-            FdObject::Port(_) => None,
+            FdObject::File(h) => match h.close() {
+                Some(idx) => CloseResult::WakeThread(idx),
+                None => CloseResult::None,
+            },
+            FdObject::Port(_) => CloseResult::None,
             FdObject::Irq(i) => {
                 let inner = i.lock();
                 crate::irq_handle::close_irq(&inner);
-                None
+                CloseResult::None
             }
+            FdObject::Channel(c) => match c {
+                ChannelFd::Send(inner) => match inner.lock().close_send() {
+                    CloseSendAction::None => CloseResult::None,
+                    CloseSendAction::WakeThread(idx) => CloseResult::WakeThread(idx),
+                    CloseSendAction::NotifyPort(pr) => CloseResult::NotifyRecvPort(pr),
+                },
+                ChannelFd::Recv(inner) => match inner.lock().close_recv() {
+                    CloseRecvAction::None => CloseResult::None,
+                    CloseRecvAction::WakeThread(idx) => CloseResult::WakeThread(idx),
+                    CloseRecvAction::NotifyPort(ps) => CloseResult::NotifySendPort(ps),
+                },
+            },
         }
     }
 
@@ -82,6 +124,14 @@ impl FdObject {
     pub fn as_irq(&self) -> Option<&Arc<IrqMutex<IrqInner>>> {
         match self {
             FdObject::Irq(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Get the channel fd, if this is a Channel.
+    pub fn as_channel(&self) -> Option<&ChannelFd> {
+        match self {
+            FdObject::Channel(c) => Some(c),
             _ => None,
         }
     }

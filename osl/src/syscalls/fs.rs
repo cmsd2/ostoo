@@ -54,11 +54,8 @@ pub(crate) fn sys_close(fd: u64) -> i64 {
     let pid = process::current_pid();
     let result = process::with_process(pid, |p| p.close_fd(fd as usize));
     match result {
-        Some(Ok(woken)) => {
-            if let Some(thread_idx) = woken {
-                libkernel::task::scheduler::set_donate_target(thread_idx);
-                libkernel::task::scheduler::yield_now();
-            }
+        Some(Ok(close_result)) => {
+            crate::fd_close::handle_close_result(close_result);
             0
         }
         Some(Err(e)) => errno::file_errno(e),

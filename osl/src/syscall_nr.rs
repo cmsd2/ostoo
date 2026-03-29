@@ -41,3 +41,6 @@ pub const SYS_IO_CREATE: u64 = 501;
 pub const SYS_IO_SUBMIT: u64 = 502;
 pub const SYS_IO_WAIT: u64 = 503;
 pub const SYS_IRQ_CREATE: u64 = 504;
+pub const SYS_IPC_CREATE: u64 = 505;
+pub const SYS_IPC_SEND: u64 = 506;
+pub const SYS_IPC_RECV: u64 = 507;

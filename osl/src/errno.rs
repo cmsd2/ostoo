@@ -20,6 +20,8 @@ pub const EMFILE:  i64 = 24;
 pub const ENOTTY:  i64 = 25;
 pub const ESPIPE:  i64 = 29;
 pub const ERANGE:  i64 = 34;
+pub const EAGAIN:  i64 = 11;
+pub const EPIPE:   i64 = 32;
 pub const ENOSYS:  i64 = 38;
 
 pub fn file_errno(e: FileError) -> i64 {
