@@ -47,6 +47,9 @@ const VIRTIO_BLK_LEGACY: u16 = 0x1001;
 const VIRTIO_9P_MODERN: u16 = 0x1049;
 const VIRTIO_9P_LEGACY: u16 = 0x1009;
 
+const BGA_VENDOR: u16 = 0x1234;
+const BGA_DEVICE: u16 = 0x1111;
+
 // ---------------------------------------------------------------------------
 // Panic handlers
 
@@ -102,7 +105,7 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
 // Kernel main (runs on heap stack)
 
 fn run_kernel() -> ! {
-    const BOOT_STEPS: usize = 7;
+    const BOOT_STEPS: usize = 8;
     let progress = |step, label| libkernel::vga_buffer::boot_progress(step, BOOT_STEPS, label);
 
     progress(0, "Remapping VGA...");
@@ -117,21 +120,25 @@ fn run_kernel() -> ! {
     init_pci();
     progress(3, "PCI bus scanned");
 
-    progress(3, "Probing virtio-blk...");
+    progress(3, "Switching to framebuffer...");
+    init_bga_framebuffer();
+    progress(4, "Display configured");
+
+    progress(4, "Probing virtio-blk...");
     init_virtio_blk();
-    progress(4, "virtio-blk done");
+    progress(5, "virtio-blk done");
 
-    progress(4, "Probing virtio-9p...");
+    progress(5, "Probing virtio-9p...");
     let p9_client = init_virtio_9p();
-    progress(5, "virtio-9p done");
+    progress(6, "virtio-9p done");
 
-    progress(5, "Mounting filesystems...");
+    progress(6, "Mounting filesystems...");
     init_vfs_mounts(p9_client);
-    progress(6, "Filesystems mounted");
+    progress(7, "Filesystems mounted");
 
-    progress(6, "Starting actors...");
+    progress(7, "Starting actors...");
     init_actors();
-    progress(7, "Ready");
+    progress(8, "Ready");
 
     libkernel::vga_buffer::boot_progress_done();
 
@@ -185,6 +192,77 @@ fn init_pci() {
     });
     devices::virtio::set_ecam_base(ecam_virt.as_u64());
     devices::pci::init();
+}
+
+/// Detect the BGA device, switch to 1024×768×32, and replace the VGA text
+/// backend with a pixel framebuffer.  Falls back to text mode if BGA is not
+/// present.
+fn init_bga_framebuffer() {
+    use libkernel::framebuffer;
+
+    if !framebuffer::bga_is_present() {
+        info!("[kernel] BGA not detected, staying in text mode");
+        return;
+    }
+
+    let devs = devices::pci::find_devices(BGA_VENDOR, BGA_DEVICE);
+    let dev = match devs.first() {
+        Some(d) => d,
+        None => {
+            info!("[kernel] BGA PCI device not found");
+            return;
+        }
+    };
+
+    // Read BAR0 (and BAR1 for 64-bit BARs) to find the LFB physical address.
+    let bar0 = devices::pci::read_bar(dev.bus, dev.device, dev.function, 0);
+    let bar1 = devices::pci::read_bar(dev.bus, dev.device, dev.function, 1);
+    let lfb_phys = framebuffer::lfb_phys_from_bars(bar0, bar1);
+    let lfb_size = framebuffer::FB_WIDTH * framebuffer::FB_HEIGHT * (framebuffer::FB_BPP / 8);
+
+    info!(
+        "[kernel] BGA LFB at phys {:#x}, mapping {} bytes",
+        lfb_phys, lfb_size
+    );
+
+    // Map the LFB into kernel virtual address space.
+    let lfb_virt = libkernel::memory::with_memory(|mem| {
+        mem.map_mmio_region(x86_64::PhysAddr::new(lfb_phys), lfb_size)
+    });
+
+    // Snapshot the VGA text buffer BEFORE the mode switch — the BGA mode
+    // change remaps VRAM, making 0xB8000 return garbage.
+    let apply_snapshot = libkernel::vga_buffer::snapshot_for_framebuffer();
+
+    // Set BGA resolution (display stays disabled so we can clear first).
+    framebuffer::bga_set_resolution(
+        framebuffer::FB_WIDTH as u16,
+        framebuffer::FB_HEIGHT as u16,
+        framebuffer::FB_BPP as u16,
+    );
+
+    // Create the Framebuffer and clear it to black before enabling the display.
+    let mut fb = unsafe {
+        framebuffer::Framebuffer::new(
+            lfb_virt.as_mut_ptr(),
+            framebuffer::FB_WIDTH,
+            framebuffer::FB_HEIGHT,
+            framebuffer::FB_STRIDE,
+        )
+    };
+    fb.clear(0x00000000);
+
+    // Now make the display visible.
+    framebuffer::bga_enable();
+
+    // Switch the Writer backend so all subsequent output renders as pixels.
+    apply_snapshot(fb);
+    info!(
+        "[kernel] BGA framebuffer active: {}x{}x{}",
+        framebuffer::FB_WIDTH,
+        framebuffer::FB_HEIGHT,
+        framebuffer::FB_BPP,
+    );
 }
 
 /// Find the first PCI device matching the given vendor and either device ID.

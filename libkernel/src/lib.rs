@@ -43,6 +43,8 @@ pub mod msr;
 pub mod path;
 pub mod gap;
 pub mod signal;
+pub mod framebuffer;
+pub mod font;
 
 pub fn init() {
     cpuid::init();
