@@ -48,14 +48,16 @@ impl FdObject {
         }
     }
 
-    /// Close the underlying object.
-    pub fn close(&self) {
+    /// Close the underlying object.  Returns the thread index of a woken
+    /// reader (if this was the last PipeWriter), so the caller can yield.
+    pub fn close(&self) -> Option<usize> {
         match self {
             FdObject::File(h) => h.close(),
-            FdObject::Port(_) => {} // no-op
+            FdObject::Port(_) => None,
             FdObject::Irq(i) => {
                 let inner = i.lock();
                 crate::irq_handle::close_irq(&inner);
+                None
             }
         }
     }
@@ -146,7 +148,10 @@ pub enum FileError {
 pub trait FileHandle: Send + Sync {
     fn read(&self, buf: &mut [u8]) -> Result<usize, FileError>;
     fn write(&self, buf: &[u8]) -> Result<usize, FileError>;
-    fn close(&self) {}
+    /// Close the handle.  Returns the thread index of a woken reader (if
+    /// this was the last PipeWriter), so the caller can yield to it after
+    /// releasing any outer locks.
+    fn close(&self) -> Option<usize> { None }
     /// Called when the fd referencing this handle is duplicated (dup2, fork,
     /// posix_spawn).  Used by PipeWriter to track writer reference count.
     fn on_dup(&self) {}
@@ -336,12 +341,14 @@ impl FileHandle for PipeWriter {
         Ok(buf.len())
     }
 
-    fn close(&self) {
+    fn close(&self) -> Option<usize> {
         let mut inner = self.0.lock();
         inner.writer_count -= 1;
         if inner.writer_count == 0 {
             inner.write_closed = true;
-            pipe_wake_reader(&mut inner);
+            pipe_wake_reader(&mut inner)
+        } else {
+            None
         }
     }
 

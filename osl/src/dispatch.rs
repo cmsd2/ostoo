@@ -293,8 +293,18 @@ fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> i64 {
 
 fn sys_close(fd: u64) -> i64 {
     let pid = libkernel::process::current_pid();
-    match libkernel::process::with_process(pid, |p| p.close_fd(fd as usize)) {
-        Some(Ok(())) => 0,
+    // close_fd returns the thread index of a woken pipe reader (if any).
+    // We must yield AFTER with_process returns so the process table lock
+    // is no longer held.
+    let result = libkernel::process::with_process(pid, |p| p.close_fd(fd as usize));
+    match result {
+        Some(Ok(woken)) => {
+            if let Some(thread_idx) = woken {
+                libkernel::task::scheduler::set_donate_target(thread_idx);
+                libkernel::task::scheduler::yield_now();
+            }
+            0
+        }
         Some(Err(e)) => errno::file_errno(e),
         None => -errno::EBADF,
     }

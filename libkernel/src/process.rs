@@ -182,13 +182,14 @@ impl Process {
         }
     }
 
-    /// Close a file descriptor.
-    pub fn close_fd(&mut self, fd: usize) -> Result<(), FileError> {
+    /// Close a file descriptor.  Returns the thread index of a woken pipe
+    /// reader (if any), so the caller can yield after releasing outer locks.
+    pub fn close_fd(&mut self, fd: usize) -> Result<Option<usize>, FileError> {
         if fd >= self.fd_table.len() {
             return Err(FileError::BadFd);
         }
         match self.fd_table[fd].take() {
-            Some(entry) => { entry.object.close(); Ok(()) }
+            Some(entry) => Ok(entry.object.close()),
             None => Err(FileError::BadFd),
         }
     }

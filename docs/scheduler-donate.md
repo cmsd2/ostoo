@@ -56,11 +56,15 @@ dispatched it), `yield_tick` falls back to regular round-robin.
 drops the pipe lock, then calls `set_donate_target` + `yield_now()` if a
 reader was woken.
 
-`PipeWriter::close()` does NOT yield — it runs inside `with_process()`
-which holds the process table lock.  `PipeInner` tracks `writer_count`
-(incremented by `on_dup()`, decremented by `close()`).  `write_closed`
-is set only when `writer_count` reaches 0, matching Unix pipe semantics
-where EOF is delivered only after all writer fds are closed.
+`PipeWriter::close()` returns the woken thread index (if writer_count
+reaches 0 and a reader was woken).  It cannot yield itself because it
+runs inside `with_process()` which holds the process table lock.
+Instead, `sys_close` yields after the lock is released.
+
+`PipeInner` tracks `writer_count` (incremented by `on_dup()`,
+decremented by `close()`).  `write_closed` is set only when
+`writer_count` reaches 0, matching Unix pipe semantics where EOF is
+delivered only after all writer fds are closed.
 
 `FdObject::clone()` does NOT call `on_dup()` — it is a plain Arc clone.
 `on_dup()` is only called via `FdObject::notify_dup()` at actual
