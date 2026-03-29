@@ -15,6 +15,7 @@ pub const OP_WRITE: u32 = 3;
 pub const OP_IRQ_WAIT: u32 = 4;
 pub const OP_IPC_SEND: u32 = 5;
 pub const OP_IPC_RECV: u32 = 6;
+// Reserved: OP_RING_WAIT = 7 (shared-memory ring wakeup, future)
 
 // ---------------------------------------------------------------------------
 // Completion — kernel-side completion entry

@@ -241,14 +241,16 @@ Total size: 24 bytes.
 
 ## Operations
 
-| Opcode | Name | Description |
-|---|---|---|
-| 0 | `OP_NOP` | No operation.  Completes immediately.  Useful for testing. |
-| 1 | `OP_TIMEOUT` | Completes after `timeout_ns` nanoseconds. |
-| 2 | `OP_READ` | Read from `fd` into `buf_addr`. |
-| 3 | `OP_WRITE` | Write to `fd` from `buf_addr`. |
-| 4 | `OP_IRQ_WAIT` | Wait for interrupt on IRQ fd. |
-| 5 | `OP_RING_WAIT` | Wait for shared-memory ring wakeup. |
+| Opcode | Name | Description | Status |
+|---|---|---|---|
+| 0 | `OP_NOP` | No operation.  Completes immediately.  Useful for testing. | Implemented |
+| 1 | `OP_TIMEOUT` | Completes after `timeout_ns` nanoseconds. | Implemented |
+| 2 | `OP_READ` | Read from `fd` into `buf_addr`. | Implemented |
+| 3 | `OP_WRITE` | Write to `fd` from `buf_addr`. | Implemented |
+| 4 | `OP_IRQ_WAIT` | Wait for interrupt on IRQ fd. | Implemented |
+| 5 | `OP_IPC_SEND` | Send a message through an IPC channel. | Implemented |
+| 6 | `OP_IPC_RECV` | Receive a message from an IPC channel. | Implemented |
+| 7 | `OP_RING_WAIT` | Wait for shared-memory ring wakeup. | Future |
 
 ### OP_NOP (0)
 
@@ -293,7 +295,36 @@ Waits for a hardware interrupt on an IRQ fd (from
 Implementation: the IRQ fd's ISR-safe notification calls `port.post()` when
 the interrupt fires.  No worker thread needed — the ISR posts directly.
 
-### OP_RING_WAIT (5)
+### OP_IPC_SEND (5)
+
+Sends a message through an IPC channel send-end fd as an async operation.
+
+- `fd` must be a channel send-end fd.
+- `buf_addr` points to a user-space `struct ipc_message` (48 bytes).
+- `result` = 0 on success, `-EPIPE` if receive end closed.
+
+The message (including any fd-passing entries in `fds[4]`) is read from user
+memory at submission time.  If the channel can accept the message immediately,
+a completion is posted right away.  Otherwise the message is stored and the
+completion fires when a receiver drains space.
+
+See [ipc-channels.md](ipc-channels.md) for full details.
+
+### OP_IPC_RECV (6)
+
+Receives a message from an IPC channel receive-end fd as an async operation.
+
+- `fd` must be a channel receive-end fd.
+- `buf_addr` points to a user-space `struct ipc_message` buffer (48 bytes).
+- `result` = 0 on success, `-EPIPE` if send end closed and no messages remain.
+
+When a message arrives on the channel, a completion is posted to the port.
+The message (including any transferred fds, allocated in the receiver's fd
+table) is copied to `buf_addr` during `io_wait`.
+
+See [ipc-channels.md](ipc-channels.md) for full details.
+
+### OP_RING_WAIT (7) — Future
 
 Waits for a shared-memory ring buffer to transition from empty to non-empty.
 
@@ -360,9 +391,8 @@ impl CompletionPort {
 }
 ```
 
-The `Mutex` around `CompletionPort` must disable interrupts while held (this
-matches the existing `Mutex` in libkernel which wraps `spin::Mutex` with
-interrupt disable).
+The `CompletionPort` is wrapped in an `IrqMutex` which disables interrupts
+while held, making `post()` safe to call from ISR context.
 
 ### io_wait blocking pattern
 
@@ -541,7 +571,7 @@ The ultimate optimisation is to map the submission and completion queues into
 userspace as shared-memory ring buffers, eliminating syscalls entirely on the
 hot path.
 
-### io_setup_rings (future syscall 504)
+### io_setup_rings (future syscall)
 
 ```
 io_setup_rings(port_fd, sq_size, cq_size) → (sq_mmap_offset, cq_mmap_offset)
@@ -605,6 +635,17 @@ model.
 | **Delivers** | `irq_create(gsi)` syscall (504), submit OP_IRQ_WAIT on an IRQ fd, ISR masks line and posts completion to port, rearm via another OP_IRQ_WAIT unmasks |
 | **Test** | `user/irq_demo.c`: create IRQ fd for keyboard GSI 1, submit OP_IRQ_WAIT, press key, verify completion with scancode in result. |
 
+### Phase 3b: OP_IPC_SEND + OP_IPC_RECV — **Implemented**
+
+**Goal:** Multiplex IPC channel operations with other async I/O sources.
+
+| Item | Detail |
+|---|---|
+| **Files** | `libkernel/src/channel.rs` (arm_send, arm_recv, PendingPortSend/Recv), `libkernel/src/completion_port.rs` (OP_IPC_SEND/RECV constants, transfer_fds on Completion), `osl/src/io_port.rs` (OP_IPC_SEND/RECV handlers) |
+| **Dependencies** | Phase 1; IPC channels (syscalls 505–507) |
+| **Delivers** | Submit OP_IPC_SEND/RECV on channel fds, completions posted when message delivered/received. Supports fd-passing: transferred fds installed in receiver during `io_wait`. |
+| **Test** | `user/ipc_port.c`: IPC send/recv multiplexed with timers via completion port. `user/ipc_fdpass.c`: fd-passing through IPC channels. |
+
 ### Phase 4: OP_RING_WAIT
 
 **Goal:** Shared-memory ring buffer wakeup through the completion port.
@@ -646,14 +687,21 @@ model.
                                │       │  │
           ┌────────────────────┘       │  │
           │                            │  │
-  ┌───────▼────────┐    ┌─────────────▼──▼───────────────┐
-  │  Phase 3        │    │  Phase 5                       │
-  │  OP_IRQ_WAIT    │    │  Shared-memory SQ/CQ rings     │
-  │                 │    │                                 │
-  │  requires:      │    │  requires:                      │
-  │  microkernel    │    │  mmap Phase 5 (MAP_SHARED)      │
-  │  Phase B        │    └─────────────────────────────────┘
-  └─────────────────┘
+  ┌───────▼────────┐  ┌───────────┐   │  │
+  │  Phase 3  ✓    │  │ Phase 3b ✓│   │  │
+  │  OP_IRQ_WAIT   │  │ OP_IPC_*  │   │  │
+  │                │  │           │   │  │
+  │  requires:     │  │ requires: │   │  │
+  │  IO APIC       │  │ IPC chans │   │  │
+  └────────────────┘  └───────────┘   │  │
+                                      │  │
+                    ┌─────────────────▼──▼───────────────┐
+                    │  Phase 5                           │
+                    │  Shared-memory SQ/CQ rings         │
+                    │                                    │
+                    │  requires:                         │
+                    │  mmap Phase 5 (MAP_SHARED)         │
+                    └────────────────────────────────────┘
                         ┌──────────────────────────────────┐
                         │  Phase 4                         │
                         │  OP_RING_WAIT                    │
@@ -664,13 +712,11 @@ model.
                         └──────────────────────────────────┘
 
 Cross-dependencies:
-  microkernel Phase B ──────▶ CompletionPort Phase 3
   mmap Phase 5 (MAP_SHARED) ──▶ CompletionPort Phases 4, 5
 ```
 
-Phase 1 is self-contained.  Phase 2 depends only on Phase 1.  Phases 3, 4,
-and 5 depend on Phase 1 plus external primitives from the microkernel and
-mmap designs.  Phases 3, 4, and 5 are independent of each other.
+Phases 1–3b are complete.  Phases 4 and 5 depend on `MAP_SHARED` from
+[mmap-design.md](mmap-design.md) and are independent of each other.
 
 ---
 
@@ -739,10 +785,9 @@ ticks; Delay builds on this.
 
 ### ISR-safe posting
 
-`CompletionPort::post()` must work from interrupt context.  The Mutex around
-the port disables interrupts while held (matching the existing
-`spin::Mutex`-based Mutex in libkernel).  The `scheduler::unblock()` call is
-already ISR-safe (it just pushes to the ready queue).
+`CompletionPort::post()` must work from interrupt context.  The `IrqMutex`
+around the port disables interrupts while held.  The `scheduler::unblock()`
+call is already ISR-safe (it just pushes to the ready queue).
 
 ### No cancellation in Phase 1
 
