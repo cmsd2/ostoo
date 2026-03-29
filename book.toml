@@ -1,0 +1,7 @@
+[book]
+title = "ostoo"
+description = "Documentation for the ostoo x86-64 microkernel"
+src = "docs"
+
+[output.html]
+git-repository-url = "https://github.com/cmsd2/ostoo"

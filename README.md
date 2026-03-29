@@ -1,5 +1,7 @@
 # ostoo
 
+[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://cmsd2.github.io/ostoo/)
+
 A hobby x86-64 kernel written in Rust with a userspace shell, VFS, syscall
 layer, and virtio drivers.
 
