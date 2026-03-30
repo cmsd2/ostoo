@@ -15,7 +15,7 @@ use ostoo_rt::{eprintln, println};
 
 // ── Constants ────────────────────────────────────────────────────────
 
-/// Terminal window size in cells.
+/// Initial terminal window size in cells.
 const TERM_COLS: usize = 80;
 const TERM_ROWS: usize = 24;
 
@@ -41,6 +41,8 @@ struct Terminal {
     buf_w: usize,
     buf_h: usize,
     stride: usize,
+    cols: usize,
+    rows: usize,
     cursor_row: usize,
     cursor_col: usize,
     fg: u32,
@@ -55,6 +57,8 @@ impl Terminal {
             buf_w: w,
             buf_h: h,
             stride: w * 4,
+            cols: w / font::FONT_WIDTH,
+            rows: h / font::FONT_HEIGHT,
             cursor_row: 0,
             cursor_col: 0,
             fg: vt100::DEFAULT_FG,
@@ -65,13 +69,30 @@ impl Terminal {
         t
     }
 
+    fn resize(&mut self, buf_ptr: *mut u8, w: usize, h: usize) {
+        self.buf_ptr = buf_ptr;
+        self.buf_w = w;
+        self.buf_h = h;
+        self.stride = w * 4;
+        self.cols = w / font::FONT_WIDTH;
+        self.rows = h / font::FONT_HEIGHT;
+        // Clamp cursor.
+        if self.cursor_col >= self.cols {
+            self.cursor_col = self.cols.saturating_sub(1);
+        }
+        if self.cursor_row >= self.rows {
+            self.cursor_row = self.rows.saturating_sub(1);
+        }
+        self.clear_screen();
+    }
+
     fn process_byte(&mut self, byte: u8) {
         let action = self.parser.feed(byte);
         match action {
             vt100::Action::Print(ch) => {
                 self.put_char(ch);
                 self.cursor_col += 1;
-                if self.cursor_col >= TERM_COLS {
+                if self.cursor_col >= self.cols {
                     self.cursor_col = 0;
                     self.advance_row();
                 }
@@ -99,7 +120,7 @@ impl Terminal {
                 self.cursor_col = 0;
             }
             vt100::Action::EraseToEol => {
-                for col in self.cursor_col..TERM_COLS {
+                for col in self.cursor_col..self.cols {
                     self.draw_char_at(self.cursor_row, col, b' ');
                 }
             }
@@ -107,10 +128,10 @@ impl Terminal {
                 self.cursor_row = self.cursor_row.saturating_sub(n);
             }
             vt100::Action::CursorDown(n) => {
-                self.cursor_row = (self.cursor_row + n).min(TERM_ROWS - 1);
+                self.cursor_row = (self.cursor_row + n).min(self.rows.saturating_sub(1));
             }
             vt100::Action::CursorRight(n) => {
-                self.cursor_col = (self.cursor_col + n).min(TERM_COLS - 1);
+                self.cursor_col = (self.cursor_col + n).min(self.cols.saturating_sub(1));
             }
             vt100::Action::CursorLeft(n) => {
                 self.cursor_col = self.cursor_col.saturating_sub(n);
@@ -146,7 +167,7 @@ impl Terminal {
     }
 
     fn advance_row(&mut self) {
-        if self.cursor_row < TERM_ROWS - 1 {
+        if self.cursor_row < self.rows.saturating_sub(1) {
             self.cursor_row += 1;
         } else {
             self.scroll_up();
@@ -154,9 +175,8 @@ impl Terminal {
     }
 
     fn scroll_up(&mut self) {
-        // Shift pixel data up by one character row.
         let row_bytes = font::FONT_HEIGHT * self.stride;
-        let total_bytes = TERM_ROWS * row_bytes;
+        let total_bytes = self.rows * row_bytes;
         unsafe {
             core::ptr::copy(
                 self.buf_ptr.add(row_bytes),
@@ -164,8 +184,7 @@ impl Terminal {
                 total_bytes - row_bytes,
             );
         }
-        // Clear the last row.
-        let last_row_y = (TERM_ROWS - 1) * font::FONT_HEIGHT;
+        let last_row_y = (self.rows - 1) * font::FONT_HEIGHT;
         let bg_bytes = self.bg.to_le_bytes();
         for y in last_row_y..last_row_y + font::FONT_HEIGHT {
             for x in 0..self.buf_w {
@@ -246,8 +265,8 @@ fn run() -> Result<i32, OsError> {
     let buf_fd = reply.fds[0];
     let notify_fd = reply.fds[1];
 
-    let buf = SharedMem::from_fd(buf_fd, w * h * 4);
-    let buf_ptr = buf.mmap()?;
+    let mut _buf = SharedMem::from_fd(buf_fd, w * h * 4);
+    let buf_ptr = _buf.mmap()?;
     let notify = NotifyFd::from_raw_fd(notify_fd);
 
     println!("term: window {}x{}", w, h);
@@ -343,17 +362,34 @@ fn run() -> Result<i32, OsError> {
             let cqe = completions[i];
 
             if cqe.user_data == TAG_KEY {
-                // Key event from compositor.
-                if cqe.result >= 0 && key_msg.tag == MSG_KEY_EVENT {
-                    let byte = key_msg.data[0] as u8;
-                    let key_type = key_msg.data[2];
+                if cqe.result >= 0 {
+                    if key_msg.tag == MSG_KEY_EVENT {
+                        // Key event from compositor.
+                        let byte = key_msg.data[0] as u8;
+                        let key_type = key_msg.data[2];
 
-                    if key_type == 0 {
-                        // ASCII key — write to shell's stdin pipe.
-                        let b = [byte];
-                        syscall::write(stdin_write_fd as u32, &b);
+                        if key_type == 0 {
+                            // ASCII key — write to shell's stdin pipe.
+                            let b = [byte];
+                            syscall::write(stdin_write_fd as u32, &b);
+                        }
+                        // TODO: handle special keys (arrows → ESC sequences)
+                    } else if key_msg.tag == MSG_WINDOW_RESIZED {
+                        // Window was resized by compositor.
+                        let new_w = key_msg.data[0] as usize;
+                        let new_h = key_msg.data[1] as usize;
+                        let new_buf_fd = key_msg.fds[0];
+                        if new_buf_fd >= 0 && new_w > 0 && new_h > 0 {
+                            let new_buf = SharedMem::from_fd(new_buf_fd, new_w * new_h * 4);
+                            if let Ok(new_ptr) = new_buf.mmap() {
+                                _buf = new_buf;
+                                term.resize(new_ptr, new_w, new_h);
+                                need_present = true;
+                                // Nudge the shell to redraw its prompt.
+                                syscall::write(stdin_write_fd as u32, b"\n");
+                            }
+                        }
                     }
-                    // TODO: handle special keys (arrows → ESC sequences)
                 }
                 // Re-arm.
                 key_msg = IpcMessage::default();

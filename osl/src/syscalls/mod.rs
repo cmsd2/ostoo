@@ -24,16 +24,7 @@ extern "sysv64" fn syscall_dispatch(
     a1: u64, a2: u64, a3: u64,
     a4: u64, a5: u64,
 ) -> i64 {
-    let pid = libkernel::process::current_pid();
-    if pid != libkernel::process::ProcessId::KERNEL {
-        libkernel::serial_println!("[syscall] pid={} nr={} a1={:#x} a2={:#x} a3={:#x}",
-            pid.as_u64(), nr, a1, a2, a3);
-    }
-    let ret = syscall_inner(nr, a1, a2, a3, a4, a5);
-    if pid != libkernel::process::ProcessId::KERNEL {
-        libkernel::serial_println!("[syscall] pid={} nr={} => {}", pid.as_u64(), nr, ret);
-    }
-    ret
+    syscall_inner(nr, a1, a2, a3, a4, a5)
 }
 
 fn syscall_inner(

@@ -7,6 +7,7 @@ mod cpuinfo;
 mod drivers;
 mod idt;
 mod ioapic;
+mod irq_stats;
 mod lapic;
 mod maps;
 mod meminfo;
@@ -27,6 +28,7 @@ impl ProcVfs {
                 VfsDirEntry { name: "drivers".to_string(),  is_dir: false, size: 0 },
                 VfsDirEntry { name: "idt".to_string(),      is_dir: false, size: 0 },
                 VfsDirEntry { name: "ioapic".to_string(),   is_dir: false, size: 0 },
+                VfsDirEntry { name: "irq_stats".to_string(), is_dir: false, size: 0 },
                 VfsDirEntry { name: "lapic".to_string(),    is_dir: false, size: 0 },
                 VfsDirEntry { name: "maps".to_string(),     is_dir: false, size: 0 },
                 VfsDirEntry { name: "meminfo".to_string(),  is_dir: false, size: 0 },
@@ -55,7 +57,8 @@ impl ProcVfs {
             "/pci"     => Ok(pci::generate().into_bytes()),
             "/lapic"   => Ok(lapic::generate().into_bytes()),
             "/maps"    => Ok(maps::generate(caller_pid).into_bytes()),
-            "/ioapic"  => Ok(ioapic::generate().into_bytes()),
+            "/ioapic"    => Ok(ioapic::generate().into_bytes()),
+            "/irq_stats" => Ok(irq_stats::generate().into_bytes()),
             _ => Err(VfsError::NotFound),
         }
     }

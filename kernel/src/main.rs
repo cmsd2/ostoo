@@ -148,6 +148,7 @@ fn run_kernel() -> ! {
     executor::spawn(Task::new(timer_task()));
     executor::spawn(Task::new(status_task()));
     executor::spawn(Task::new(launch_keyboard_driver()));
+    executor::spawn(Task::new(launch_mouse_driver()));
     executor::spawn(Task::new(launch_compositor()));
     executor::spawn(Task::new(launch_userspace_shell()));
 
@@ -433,6 +434,31 @@ async fn launch_keyboard_driver() {
         }
         Err(e) => {
             warn!("[kernel] failed to spawn kbd: {}", e);
+        }
+    }
+}
+
+async fn launch_mouse_driver() {
+    Delay::from_millis(100).await; // let VFS settle
+
+    let data = match devices::vfs::read_file("/bin/mouse", libkernel::process::ProcessId::KERNEL).await {
+        Ok(d) => d,
+        Err(_) => {
+            info!("[kernel] /bin/mouse not found, skipping mouse driver");
+            return;
+        }
+    };
+
+    let env: &[&[u8]] = &[
+        b"PATH=/host/bin",
+        b"HOME=/",
+    ];
+    match ring3::spawn_process_with_env(&data, env) {
+        Ok(pid) => {
+            info!("[kernel] launched mouse driver as pid {}", pid.as_u64());
+        }
+        Err(e) => {
+            warn!("[kernel] failed to spawn mouse: {}", e);
         }
     }
 }

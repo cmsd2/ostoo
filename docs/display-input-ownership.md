@@ -102,12 +102,83 @@ MSG_KB_KEY (tag=1): keyboard service → client (via passed channel)
 - `key_type`: 0 = ASCII byte, 1 = special key (arrow, etc.)
 - `modifiers`: bitmask (bit 0 = shift, bit 1 = ctrl, bit 2 = alt)
 
-### Compositor Key Forwarding
+### Input Ownership — Userspace Mouse Driver
 
-The compositor connects to the keyboard service on startup using
-`svc_lookup_retry("keyboard")`. Key events are forwarded to the
-focused window's client via `MSG_KEY_EVENT` (tag 5) on the per-window
-`s2c_send` IPC channel.
+The mouse uses the same architecture as the keyboard: a userspace
+service (`/bin/mouse`) claiming the PS/2 mouse IRQ.
+
+```
+┌──────────┐  IRQ fd    ┌──────────┐  IPC channel  ┌────────────┐
+│ IO APIC  │───────────▶│ /bin/mouse│──────────────▶│ Compositor │
+│ (GSI 12) │  byte       │          │  mouse events  │            │
+└──────────┘  in result  └──────────┘               └────────────┘
+```
+
+How it works:
+
+1. `/bin/mouse` calls `irq_create(12)` — claims mouse IRQ via the
+   existing IRQ fd mechanism. The kernel automatically initializes
+   the PS/2 auxiliary port (i8042 controller) when GSI 12 is claimed,
+   enabling mouse data reporting and IRQ 12 delivery.
+2. Creates a registration channel and calls `svc_register("mouse")`.
+3. Event loop: collects 3-byte PS/2 packets (sync on byte 0 bit 3),
+   decodes deltas and buttons, tracks absolute cursor position
+   (clamped to screen bounds), broadcasts to connected clients.
+
+### Mouse Protocol
+
+```
+MSG_MOUSE_CONNECT (tag=1): client → mouse service
+  data = [0, 0, 0]
+  fds  = [event_send_fd, -1, -1, -1]
+
+MSG_MOUSE_MOVE (tag=1): mouse service → client (via passed channel)
+  data = [x, y, buttons]
+  fds  = [-1, -1, -1, -1]
+```
+
+- `buttons`: bitmask (bit 0 = left, bit 1 = right, bit 2 = middle)
+- `x`, `y`: absolute screen coordinates
+
+### Compositor Key & Mouse Forwarding
+
+The compositor connects to both keyboard and mouse services on startup
+using `svc_lookup_retry()`. Key events are forwarded to the focused
+window's client via `MSG_KEY_EVENT` (tag 5). Mouse events drive the
+cursor, focus, window movement, and resizing.
+
+### Window Decorations (Server-Side)
+
+The compositor draws server-side decorations around each client window:
+
+```
+┌─────────────────────────────┐ ─┐
+│ [X] Win 1                   │  │ TITLE_H = 20px
+├─────────────────────────────┤ ─┘
+│                             │
+│       Client Content        │  client buffer (w × h)
+│                             │
+└─────────────────────────────┘
+  BORDER_W = 2px on all sides
+```
+
+- Title bar: highlighted when focused, dimmed when unfocused
+- Close button: `[X]` in top-right of title bar
+- Window title: "Win N" rendered with 8×16 CP437 font
+
+### Window Management
+
+**Focus**: Click anywhere in a window to focus it. The focused window
+moves to the top of the Z-order and receives keyboard input.
+
+**Move**: Drag the title bar to move a window.
+
+**Resize**: Drag the bottom edge, right edge, or bottom-right corner
+to resize. On mouse-up, the compositor allocates a new shared buffer
+and sends `MSG_WINDOW_RESIZED` to the client. The terminal emulator
+recalculates cols/rows and clears the screen.
+
+**Close**: Click the `[X]` button to close a window.
 
 ### Compositor Double Buffering
 
@@ -166,9 +237,14 @@ Boot
  │   └─ /bin/kbd: irq_create(1), svc_register("keyboard")
  │      keyboard IRQ rerouted → kernel actor dormant
  │
+ ├─ launch_mouse_driver() [100ms VFS settle]
+ │   └─ /bin/mouse: irq_create(12) → PS/2 aux init, svc_register("mouse")
+ │      mouse IRQ 12 claimed → 3-byte packet decoding
+ │
  ├─ launch_compositor() [100ms VFS settle]
  │   ├─ /bin/compositor: framebuffer_open → WRITER suppressed
  │   ├─ svc_lookup_retry("keyboard") → receive key events
+ │   ├─ svc_lookup_retry("mouse") → receive mouse events
  │   ├─ svc_register("compositor")
  │   └─ kernel spawns /bin/term
  │       ├─ svc_lookup_retry("compositor") → get window
@@ -188,12 +264,12 @@ than hardcoded sleep timings:
 
 ## Fallback Matrix
 
-| kbd | compositor | term | Result |
-|-----|-----------|------|--------|
-| yes | yes | yes | Full graphical: kbd→compositor→term→shell |
-| yes | yes | no | Compositor up, no terminal (display-only) |
-| no | yes | yes | Compositor up, no key events (display-only) |
-| no | no | - | Classic fallback: kernel kbd actor + shell on console |
+| kbd | mouse | compositor | term | Result |
+|-----|-------|-----------|------|--------|
+| yes | yes | yes | yes | Full graphical: kbd+mouse→compositor→term→shell |
+| yes | no | yes | yes | Graphical, keyboard only (no cursor/mouse) |
+| yes | yes | yes | no | Compositor up, no terminal (display-only) |
+| no | no | no | - | Classic fallback: kernel kbd actor + shell on console |
 
 ## No New Syscalls
 
@@ -201,12 +277,14 @@ This design uses only existing kernel primitives:
 
 | Primitive | Syscall | Use |
 |-----------|---------|-----|
-| `irq_create` | 504 | keyboard driver claims IRQ 1 |
-| `svc_register` / `svc_lookup` | 513/514 | keyboard and compositor service discovery |
-| `ipc_create` / `ipc_send` / `ipc_recv` | 505-507 | key event delivery with fd passing |
+| `irq_create` | 504 | keyboard driver claims IRQ 1, mouse driver claims IRQ 12 |
+| `svc_register` / `svc_lookup` | 513/514 | keyboard, mouse, and compositor service discovery |
+| `ipc_create` / `ipc_send` / `ipc_recv` | 505-507 | key/mouse event delivery with fd passing |
+| `shmem_create` | 508 | window buffers, resize buffer allocation |
 | `framebuffer_open` | 515 | display ownership (with suppression side effect) |
 | `pipe2` | 293 | terminal↔shell communication |
 | `clone` / `execve` / `dup2` | 56/59/33 | terminal spawns shell |
 
-The only kernel change is adding a suppression flag to WRITER, triggered
-by the existing `framebuffer_open` syscall.
+The only kernel changes beyond the initial suppression flag are:
+- PS/2 auxiliary port initialization on `irq_create(12)` (`libkernel/src/ps2.rs`)
+- `irq_fd_dispatch` reads port 0x60 for GSI 12 (mouse) in addition to GSI 1 (keyboard)

@@ -2,14 +2,78 @@
 //! through file descriptors and completion ports.
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::completion_port::{Completion, CompletionPort, OP_IRQ_WAIT};
 use crate::irq_mutex::IrqMutex;
 
 // ---------------------------------------------------------------------------
+// Per-slot IRQ counters (lock-free, safe from ISR context)
+
+struct IrqCounters {
+    total: AtomicU64,
+    delivered: AtomicU64,
+    buffered: AtomicU64,
+    spurious: AtomicU64,
+    wrong_source: AtomicU64,
+}
+
+impl IrqCounters {
+    const fn new() -> Self {
+        Self {
+            total: AtomicU64::new(0),
+            delivered: AtomicU64::new(0),
+            buffered: AtomicU64::new(0),
+            spurious: AtomicU64::new(0),
+            wrong_source: AtomicU64::new(0),
+        }
+    }
+}
+
+const fn new_counters_array() -> [IrqCounters; 16] {
+    const C: IrqCounters = IrqCounters::new();
+    [C, C, C, C, C, C, C, C, C, C, C, C, C, C, C, C]
+}
+
+static IRQ_COUNTERS: [IrqCounters; 16] = new_counters_array();
+
+/// Print IRQ statistics for all active slots to serial.
+pub fn print_irq_stats() {
+    crate::serial_println!("{}", format_irq_stats());
+}
+
+/// Format IRQ statistics as a string (for /proc/irq_stats).
+pub fn format_irq_stats() -> alloc::string::String {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+
+    let slots = IRQ_SLOTS.lock();
+    writeln!(s, "{:<4} {:>5} {:>8} {:>8} {:>8} {:>8} {:>10}",
+        "SLOT", "GSI", "TOTAL", "DELIVER", "BUFFER", "SPURIOUS", "WRONG_SRC").unwrap();
+    for slot in 0..16 {
+        let c = &IRQ_COUNTERS[slot];
+        let total = c.total.load(Ordering::Relaxed);
+        if total == 0 {
+            continue;
+        }
+        let gsi = match &slots[slot] {
+            Some(arc) => arc.lock().gsi,
+            None => 0,
+        };
+        let delivered = c.delivered.load(Ordering::Relaxed);
+        let buffered = c.buffered.load(Ordering::Relaxed);
+        let spurious = c.spurious.load(Ordering::Relaxed);
+        let wrong_src = c.wrong_source.load(Ordering::Relaxed);
+        writeln!(s, "{:<4} {:>5} {:>8} {:>8} {:>8} {:>8} {:>10}",
+            slot, gsi, total, delivered, buffered, spurious, wrong_src).unwrap();
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
 // IrqInner — per-IRQ-fd kernel state
 
-const SCANCODE_BUF_SIZE: usize = 16;
+const SCANCODE_BUF_SIZE: usize = 64;
 
 pub struct IrqInner {
     pub gsi: u32,
@@ -94,36 +158,48 @@ pub fn irq_fd_dispatch(slot: usize) {
     drop(slots);
 
     let mut inner = inner_arc.lock();
+    let counters = &IRQ_COUNTERS[slot];
+    counters.total.fetch_add(1, Ordering::Relaxed);
 
-    // Do NOT mask the GSI — keyboard IRQ is edge-triggered, and masking
-    // would lose edges that arrive between here and the next arm_irq().
-    // Instead, we buffer scancodes when no pending wait is registered.
-
-    // For keyboard (GSI 1): read the scancode to deassert the IRQ.
-    let scancode = if inner.gsi == 1 {
+    if inner.gsi == 1 || inner.gsi == 12 {
+        // Drain all available bytes from the i8042 output buffer in one ISR.
+        // The controller can queue multiple bytes; reading them all in one
+        // interrupt avoids losing data to the small scancode ring buffer.
         unsafe {
+            let mut status_port = x86_64::instructions::port::Port::<u8>::new(0x64);
             let mut port_60 = x86_64::instructions::port::Port::<u8>::new(0x60);
-            Some(port_60.read())
-        }
-    } else {
-        None
-    };
 
-    if let Some((port, user_data)) = inner.pending.take() {
-        let result = scancode.map(|s| s as i64).unwrap_or(0);
-        port.lock().post(Completion {
-            user_data,
-            result,
-            flags: 0,
-            opcode: OP_IRQ_WAIT,
-            read_buf: None,
-            read_dest: 0,
-            transfer_fds: None,
-        });
-    } else {
-        // No pending wait — buffer the scancode so it isn't lost.
-        if let Some(code) = scancode {
-            inner.scancode_push(code);
+            for _ in 0..16 {
+                let status = status_port.read();
+                if status & 0x01 == 0 {
+                    break; // Output buffer empty.
+                }
+                let byte = port_60.read();
+                let from_aux = status & 0x20 != 0;
+
+                // Only deliver if source matches this IRQ's device.
+                if (inner.gsi == 1 && from_aux) || (inner.gsi == 12 && !from_aux) {
+                    counters.wrong_source.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                // First byte can go directly to a pending wait; rest get buffered.
+                if let Some((port, user_data)) = inner.pending.take() {
+                    counters.delivered.fetch_add(1, Ordering::Relaxed);
+                    port.lock().post(Completion {
+                        user_data,
+                        result: byte as i64,
+                        flags: 0,
+                        opcode: OP_IRQ_WAIT,
+                        read_buf: None,
+                        read_dest: 0,
+                        transfer_fds: None,
+                    });
+                } else {
+                    counters.buffered.fetch_add(1, Ordering::Relaxed);
+                    inner.scancode_push(byte);
+                }
+            }
         }
     }
 }
@@ -132,13 +208,14 @@ pub fn irq_fd_dispatch(slot: usize) {
 // Arm and close — called from osl (io_submit and close_fd paths)
 
 /// Arm an IRQ fd for OP_IRQ_WAIT: register the port to post to on interrupt,
-/// then unmask the GSI.  If there are buffered scancodes (keyboard), post a
-/// completion immediately from the buffer without unmasking.
+/// then unmask the GSI.  If there are buffered scancodes, post completions
+/// for ALL buffered bytes so userspace can drain them in one io_wait batch.
 pub fn arm_irq(inner: &Arc<IrqMutex<IrqInner>>, port: Arc<IrqMutex<CompletionPort>>, user_data: u64) {
     let mut guard = inner.lock();
 
-    // If there's a buffered scancode, satisfy the request immediately.
-    if let Some(code) = guard.scancode_pop() {
+    // Drain entire buffer into completions.
+    let mut posted = false;
+    while let Some(code) = guard.scancode_pop() {
         port.lock().post(Completion {
             user_data,
             result: code as i64,
@@ -148,11 +225,16 @@ pub fn arm_irq(inner: &Arc<IrqMutex<IrqInner>>, port: Arc<IrqMutex<CompletionPor
             read_dest: 0,
             transfer_fds: None,
         });
-        // Must unmask so the next interrupt can arrive and be buffered.
+        posted = true;
+    }
+
+    if posted {
+        // Buffer drained; unmask so future IRQs are caught.
         crate::apic::unmask_gsi(guard.gsi);
         return;
     }
 
+    // Nothing buffered — wait for next IRQ.
     guard.pending = Some((port, user_data));
     crate::apic::unmask_gsi(guard.gsi);
 }

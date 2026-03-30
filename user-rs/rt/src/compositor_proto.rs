@@ -35,3 +35,15 @@ pub const MSG_CLOSE: u64 = 4;
 /// `data = [byte, modifiers, key_type]`
 /// `fds  = [-1, -1, -1, -1]`
 pub const MSG_KEY_EVENT: u64 = 5;
+
+/// Compositor → client (per-client channel): mouse event (reserved for future use).
+///
+/// `data = [x, y, buttons]`
+/// `fds  = [-1, -1, -1, -1]`
+pub const MSG_MOUSE_EVENT: u64 = 6;
+
+/// Compositor → client (per-client channel): window resized.
+///
+/// `data = [new_width, new_height, 0]`
+/// `fds  = [new_buffer_fd, -1, -1, -1]`
+pub const MSG_WINDOW_RESIZED: u64 = 7;

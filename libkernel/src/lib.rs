@@ -50,6 +50,7 @@ pub mod font;
 pub mod shmem;
 pub mod notify;
 pub mod service;
+pub mod ps2;
 
 pub fn init() {
     cpuid::init();

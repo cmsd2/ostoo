@@ -38,6 +38,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mouse"
+version = "0.1.0"
+dependencies = [
+ "ostoo-rt",
+]
+
+[[package]]
 name = "ostoo-rt"
 version = "0.1.0"
 

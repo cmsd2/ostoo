@@ -4,10 +4,13 @@
 extern crate alloc;
 extern crate ostoo_rt;
 
+mod font;
+
 use alloc::vec;
 use alloc::vec::Vec;
 use ostoo_rt::compositor_proto::*;
 use ostoo_rt::kbd_proto;
+use ostoo_rt::mouse_proto;
 use ostoo_rt::ostoo::{
     self, CompletionPort, FramebufferMem, IpcRecv, IpcSend, NotifyFd, OsError, SharedMem,
 };
@@ -18,42 +21,180 @@ use ostoo_rt::{eprintln, println};
 
 const FB_WIDTH: usize = 1024;
 const FB_HEIGHT: usize = 768;
-const FB_STRIDE: usize = FB_WIDTH * 4; // bytes per scanline (BGRA)
+const FB_STRIDE: usize = FB_WIDTH * 4;
 
 const BG_COLOR: u32 = 0x00282828; // dark grey background
+
+// Window decoration dimensions
+const TITLE_H: usize = 20;
+const BORDER_W: usize = 2;
+
+// Colors (BGRA)
+const TITLE_FOCUSED: u32 = 0x00505080; // blueish
+const TITLE_UNFOCUSED: u32 = 0x00404040; // dim grey
+const TITLE_TEXT: u32 = 0x00FFFFFF; // white
+const BORDER_COLOR: u32 = 0x00606060; // medium grey
+const CLOSE_BG: u32 = 0x00404060; // close button bg
+#[allow(dead_code)]
+const CLOSE_HOVER: u32 = 0x000000CC; // red-ish close button (reserved for hover)
 
 const MAX_WINDOWS: usize = 4;
 const MAX_COMPLETIONS: usize = 16;
 
 // Completion user_data tag encoding:
-//   0x1000          = new client on registration channel
-//   0x2000 + wid    = damage notification for window `wid`
-//   0x3000 + wid    = command message on per-client channel for `wid`
-//   0x4000          = keyboard event from keyboard service
 const TAG_NEW_CLIENT: u64 = 0x1000;
 const TAG_DAMAGE_BASE: u64 = 0x2000;
 const TAG_CMD_BASE: u64 = 0x3000;
 const TAG_KEYBOARD: u64 = 0x4000;
+const TAG_MOUSE: u64 = 0x5000;
+
+// Close button dimensions (top-right of title bar)
+const CLOSE_W: usize = 20;
+const CLOSE_H: usize = TITLE_H;
+
+// Cursor bitmap (12x16, 1-bit)
+#[rustfmt::skip]
+static CURSOR_BITMAP: [u16; 16] = [
+    0b1000_0000_0000_0000,
+    0b1100_0000_0000_0000,
+    0b1110_0000_0000_0000,
+    0b1111_0000_0000_0000,
+    0b1111_1000_0000_0000,
+    0b1111_1100_0000_0000,
+    0b1111_1110_0000_0000,
+    0b1111_1111_0000_0000,
+    0b1111_1111_1000_0000,
+    0b1111_1100_0000_0000,
+    0b1111_0000_0000_0000,
+    0b1101_1000_0000_0000,
+    0b1000_1100_0000_0000,
+    0b0000_1100_0000_0000,
+    0b0000_0110_0000_0000,
+    0b0000_0000_0000_0000,
+];
+const CURSOR_W: usize = 12;
+const CURSOR_H: usize = 16;
 
 // ── Window state ─────────────────────────────────────────────────────
 
 struct Window {
     id: u64,
+    /// Top-left of the decorated frame (including title bar and borders).
     x: usize,
     y: usize,
+    /// Client content dimensions (excluding decorations).
     w: usize,
     h: usize,
+    /// Actual buffer dimensions — may differ from w/h during resize drag.
+    buf_w: usize,
+    buf_h: usize,
     buf_ptr: *const u8,
-    #[allow(dead_code)]
     buf_size: usize,
     dirty: bool,
-    // Keep RAII handles alive so fds stay open.
     _buf: SharedMem,
     _notify: NotifyFd,
     _c2s_recv: IpcRecv,
     s2c_send: IpcSend,
-    // IPC message buffer for re-arming OP_IPC_RECV (must live at stable address).
     cmd_msg: IpcMessage,
+}
+
+impl Window {
+    /// Full decorated width.
+    fn dec_w(&self) -> usize {
+        self.w + 2 * BORDER_W
+    }
+    /// Full decorated height.
+    fn dec_h(&self) -> usize {
+        self.h + TITLE_H + BORDER_W
+    }
+    /// X offset where client content starts in screen coords.
+    fn content_x(&self) -> usize {
+        self.x + BORDER_W
+    }
+    /// Y offset where client content starts in screen coords.
+    fn content_y(&self) -> usize {
+        self.y + TITLE_H
+    }
+}
+
+// ── Hit testing ──────────────────────────────────────────────────────
+
+const RESIZE_EDGE: usize = 6; // pixels from edge that count as resize zone
+
+#[derive(PartialEq)]
+enum HitZone {
+    TitleBar,
+    CloseButton,
+    Content,
+    ResizeBottomRight,
+    ResizeRight,
+    ResizeBottom,
+    None,
+}
+
+/// Hit-test mouse position against all windows (top to bottom z-order).
+/// Windows at the end of the vec are on top (painter's algo).
+fn hit_test(windows: &[Window], mx: usize, my: usize) -> (Option<usize>, HitZone) {
+    for (idx, win) in windows.iter().enumerate().rev() {
+        let x1 = win.x;
+        let y1 = win.y;
+        let x2 = x1 + win.dec_w();
+        let y2 = y1 + win.dec_h();
+
+        if mx >= x1 && mx < x2 && my >= y1 && my < y2 {
+            // Resize zones (bottom-right corner, right edge, bottom edge).
+            let near_right = mx + RESIZE_EDGE >= x2;
+            let near_bottom = my + RESIZE_EDGE >= y2;
+            if near_right && near_bottom {
+                return (Some(idx), HitZone::ResizeBottomRight);
+            }
+            if near_right && my >= y1 + TITLE_H {
+                return (Some(idx), HitZone::ResizeRight);
+            }
+            if near_bottom {
+                return (Some(idx), HitZone::ResizeBottom);
+            }
+
+            // Close button: top-right of title bar.
+            let close_x1 = x2.saturating_sub(CLOSE_W);
+            let close_y2 = y1 + TITLE_H;
+            if mx >= close_x1 && mx < x2 && my >= y1 && my < close_y2 {
+                return (Some(idx), HitZone::CloseButton);
+            }
+
+            // Title bar (excluding close button).
+            if my < y1 + TITLE_H {
+                return (Some(idx), HitZone::TitleBar);
+            }
+
+            // Client content area.
+            return (Some(idx), HitZone::Content);
+        }
+    }
+    (None, HitZone::None)
+}
+
+// ── Drag state ───────────────────────────────────────────────────────
+
+const MIN_WIN_W: usize = 128;
+const MIN_WIN_H: usize = 64;
+
+enum DragMode {
+    None,
+    Move {
+        wid: u64,
+        off_x: i32,
+        off_y: i32,
+    },
+    Resize {
+        wid: u64,
+        start_w: usize,
+        start_h: usize,
+        start_mx: usize,
+        start_my: usize,
+        resize_x: bool,
+        resize_y: bool,
+    },
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
@@ -102,7 +243,17 @@ fn run() -> Result<(), OsError> {
         }
     };
 
-    // 5. Arm OP_IPC_RECV on the registration channel.
+    // 5. Connect to mouse service (if available).
+    let mut mouse_msg = IpcMessage::default();
+    let _mouse_recv: Option<IpcRecv> = match connect_mouse(&port, &mut mouse_msg) {
+        Ok(recv) => Some(recv),
+        Err(_) => {
+            println!("compositor: mouse service not found, no mouse input");
+            None
+        }
+    };
+
+    // 6. Arm OP_IPC_RECV on the registration channel.
     let mut reg_msg = IpcMessage::default();
     port.submit(&[IoSubmission::ipc_recv(
         TAG_NEW_CLIENT,
@@ -110,31 +261,45 @@ fn run() -> Result<(), OsError> {
         &mut reg_msg,
     )])?;
 
-    // 6. Event loop.
+    // 7. State.
     let mut windows: Vec<Window> = Vec::new();
     let mut next_wid: u64 = 1;
     let mut completions = [IoCompletion::default(); MAX_COMPLETIONS];
 
+    // Mouse & focus state.
+    let mut cursor_x: usize = FB_WIDTH / 2;
+    let mut cursor_y: usize = FB_HEIGHT / 2;
+    let mut prev_cursor_x: usize = cursor_x;
+    let mut prev_cursor_y: usize = cursor_y;
+    let mut buttons: u8 = 0;
+    let mut focused_wid: Option<u64> = None;
+    let mut drag = DragMode::None;
+
+    // Initial paint.
+    composite(fb_ptr, back_ptr, &windows, focused_wid);
+    draw_cursor(fb_ptr, cursor_x, cursor_y);
+
+    // 8. Event loop.
     loop {
         let n = port.wait(&mut completions, 1, 0)?;
-        let mut any_dirty = false;
+        let mut scene_dirty = false;
+        let mut cursor_moved = false;
 
         for i in 0..n {
             let cqe = completions[i];
             let ud = cqe.user_data;
 
             if ud == TAG_NEW_CLIENT {
-                // New client connection.
                 if cqe.result >= 0 {
                     handle_connect(
                         &port,
                         &reg_msg,
                         &mut windows,
                         &mut next_wid,
-                        fb_ptr,
+                        &mut focused_wid,
                     );
+                    scene_dirty = true;
                 }
-                // Re-arm registration channel.
                 reg_msg = IpcMessage::default();
                 port.submit(&[IoSubmission::ipc_recv(
                     TAG_NEW_CLIENT,
@@ -142,34 +307,36 @@ fn run() -> Result<(), OsError> {
                     &mut reg_msg,
                 )])?;
             } else if ud >= TAG_DAMAGE_BASE && ud < TAG_CMD_BASE {
-                // Damage notification.
                 let wid = ud - TAG_DAMAGE_BASE;
                 if let Some(win) = windows.iter_mut().find(|w| w.id == wid) {
                     win.dirty = true;
-                    any_dirty = true;
-                    // Re-arm OP_RING_WAIT.
+                    scene_dirty = true;
                     port.submit(&[IoSubmission::ring_wait(
                         TAG_DAMAGE_BASE + wid,
                         win._notify.fd(),
                     )])?;
                 }
             } else if ud == TAG_KEYBOARD {
-                // Key event from keyboard service.
                 if cqe.result >= 0 && kbd_msg.tag == kbd_proto::MSG_KB_KEY {
                     let byte = kbd_msg.data[0];
                     let modifiers = kbd_msg.data[1];
                     let key_type = kbd_msg.data[2];
-                    // Forward to the first (focused) window.
-                    if let Some(win) = windows.first() {
-                        let key_msg = IpcMessage {
-                            tag: MSG_KEY_EVENT,
-                            data: [byte, modifiers, key_type],
-                            fds: [-1; 4],
-                        };
-                        let _ = sys::ipc_send(win.s2c_send.fd(), &key_msg, sys::IPC_NONBLOCK);
+                    // Forward to focused window.
+                    if let Some(fwid) = focused_wid {
+                        if let Some(win) = windows.iter().find(|w| w.id == fwid) {
+                            let key_msg = IpcMessage {
+                                tag: MSG_KEY_EVENT,
+                                data: [byte, modifiers, key_type],
+                                fds: [-1; 4],
+                            };
+                            let _ = sys::ipc_send(
+                                win.s2c_send.fd(),
+                                &key_msg,
+                                sys::IPC_NONBLOCK,
+                            );
+                        }
                     }
                 }
-                // Re-arm keyboard recv.
                 kbd_msg = IpcMessage::default();
                 if let Some(ref recv) = _kbd_recv {
                     port.submit(&[IoSubmission::ipc_recv(
@@ -178,30 +345,215 @@ fn run() -> Result<(), OsError> {
                         &mut kbd_msg,
                     )])?;
                 }
+            } else if ud == TAG_MOUSE {
+                if cqe.result >= 0 && mouse_msg.tag == mouse_proto::MSG_MOUSE_MOVE {
+                    cursor_x = mouse_msg.data[0] as usize;
+                    cursor_y = mouse_msg.data[1] as usize;
+                    let new_buttons = mouse_msg.data[2] as u8;
+
+                    let left_down = new_buttons & 1 != 0 && buttons & 1 == 0;
+                    let left_up = new_buttons & 1 == 0 && buttons & 1 != 0;
+
+                    buttons = new_buttons;
+
+                    cursor_moved = true;
+
+                    // Handle drag.
+                    match &drag {
+                        DragMode::Move { wid, off_x, off_y } => {
+                            if left_up {
+                                drag = DragMode::None;
+                            } else {
+                                let wid = *wid;
+                                let off_x = *off_x;
+                                let off_y = *off_y;
+                                if let Some(win) =
+                                    windows.iter_mut().find(|w| w.id == wid)
+                                {
+                                    let new_x =
+                                        (cursor_x as i32 + off_x).max(0) as usize;
+                                    let new_y =
+                                        (cursor_y as i32 + off_y).max(0) as usize;
+                                    win.x = new_x;
+                                    win.y = new_y;
+                                }
+                            }
+                            scene_dirty = true;
+                        }
+                        DragMode::Resize {
+                            wid,
+                            start_w,
+                            start_h,
+                            start_mx,
+                            start_my,
+                            resize_x,
+                            resize_y,
+                        } => {
+                            let wid = *wid;
+                            let start_w = *start_w;
+                            let start_h = *start_h;
+                            let start_mx = *start_mx;
+                            let start_my = *start_my;
+                            let rx = *resize_x;
+                            let ry = *resize_y;
+
+                            if left_up {
+                                // Finalize resize: allocate new buffer.
+                                if let Some(win) =
+                                    windows.iter_mut().find(|w| w.id == wid)
+                                {
+                                    let new_w = if rx {
+                                        ((start_w as i32
+                                            + cursor_x as i32
+                                            - start_mx as i32)
+                                            .max(MIN_WIN_W as i32)
+                                            as usize)
+                                            .min(FB_WIDTH)
+                                    } else {
+                                        win.w
+                                    };
+                                    let new_h = if ry {
+                                        ((start_h as i32
+                                            + cursor_y as i32
+                                            - start_my as i32)
+                                            .max(MIN_WIN_H as i32)
+                                            as usize)
+                                            .min(FB_HEIGHT)
+                                    } else {
+                                        win.h
+                                    };
+
+                                    if new_w != win.buf_w || new_h != win.buf_h {
+                                        finalize_resize(win, new_w, new_h);
+                                    } else {
+                                        // Drag ended at original size — reset visual w/h.
+                                        win.w = win.buf_w;
+                                        win.h = win.buf_h;
+                                    }
+                                }
+                                drag = DragMode::None;
+                            } else if let Some(win) =
+                                windows.iter_mut().find(|w| w.id == wid)
+                            {
+                                // Live preview: update visual size during drag.
+                                if rx {
+                                    let nw = (start_w as i32
+                                        + cursor_x as i32
+                                        - start_mx as i32)
+                                        .max(MIN_WIN_W as i32)
+                                        as usize;
+                                    win.w = nw.min(FB_WIDTH);
+                                }
+                                if ry {
+                                    let nh = (start_h as i32
+                                        + cursor_y as i32
+                                        - start_my as i32)
+                                        .max(MIN_WIN_H as i32)
+                                        as usize;
+                                    win.h = nh.min(FB_HEIGHT);
+                                }
+                            }
+                            scene_dirty = true;
+                        }
+                        DragMode::None => {
+                            if left_down {
+                                let (hit_idx, zone) =
+                                    hit_test(&windows, cursor_x, cursor_y);
+                                if let Some(idx) = hit_idx {
+                                    let wid = windows[idx].id;
+                                    // Focus + raise to top.
+                                    focused_wid = Some(wid);
+                                    let win = windows.remove(idx);
+                                    windows.push(win);
+
+                                    match zone {
+                                        HitZone::TitleBar => {
+                                            let win = windows.last().unwrap();
+                                            let off_x =
+                                                win.x as i32 - cursor_x as i32;
+                                            let off_y =
+                                                win.y as i32 - cursor_y as i32;
+                                            drag = DragMode::Move {
+                                                wid,
+                                                off_x,
+                                                off_y,
+                                            };
+                                        }
+                                        HitZone::CloseButton => {
+                                            println!(
+                                                "compositor: window {} closed",
+                                                wid
+                                            );
+                                            windows.retain(|w| w.id != wid);
+                                            if focused_wid == Some(wid) {
+                                                focused_wid = windows
+                                                    .last()
+                                                    .map(|w| w.id);
+                                            }
+                                        }
+                                        HitZone::ResizeBottomRight
+                                        | HitZone::ResizeRight
+                                        | HitZone::ResizeBottom => {
+                                            let win = windows.last().unwrap();
+                                            drag = DragMode::Resize {
+                                                wid,
+                                                start_w: win.w,
+                                                start_h: win.h,
+                                                start_mx: cursor_x,
+                                                start_my: cursor_y,
+                                                resize_x: zone
+                                                    != HitZone::ResizeBottom,
+                                                resize_y: zone
+                                                    != HitZone::ResizeRight,
+                                            };
+                                        }
+                                        HitZone::Content => {
+                                            // Focus only, no drag.
+                                        }
+                                        HitZone::None => {}
+                                    }
+                                    scene_dirty = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                mouse_msg = IpcMessage::default();
+                if let Some(ref recv) = _mouse_recv {
+                    port.submit(&[IoSubmission::ipc_recv(
+                        TAG_MOUSE,
+                        recv.fd(),
+                        &mut mouse_msg,
+                    )])?;
+                }
             } else if ud >= TAG_CMD_BASE {
-                // Per-client command.
                 let wid = ud - TAG_CMD_BASE;
-                // Read the tag before borrowing mutably.
-                let tag = windows.iter().find(|w| w.id == wid)
+                let tag = windows
+                    .iter()
+                    .find(|w| w.id == wid)
                     .map(|w| w.cmd_msg.tag);
                 if let Some(tag) = tag {
                     if cqe.result >= 0 {
                         match tag {
                             MSG_PRESENT => {
-                                if let Some(w) = windows.iter_mut().find(|w| w.id == wid) {
+                                if let Some(w) =
+                                    windows.iter_mut().find(|w| w.id == wid)
+                                {
                                     w.dirty = true;
-                                    any_dirty = true;
+                                    scene_dirty = true;
                                 }
                             }
                             MSG_CLOSE => {
                                 println!("compositor: window {} closed", wid);
                                 windows.retain(|w| w.id != wid);
-                                composite(fb_ptr, back_ptr, &mut windows);
+                                if focused_wid == Some(wid) {
+                                    focused_wid = windows.last().map(|w| w.id);
+                                }
+                                scene_dirty = true;
                             }
                             _ => {}
                         }
                     }
-                    // Re-arm OP_IPC_RECV on client channel (if window still exists).
                     if let Some(win) = windows.iter_mut().find(|w| w.id == wid) {
                         win.cmd_msg = IpcMessage::default();
                         port.submit(&[IoSubmission::ipc_recv(
@@ -214,10 +566,52 @@ fn run() -> Result<(), OsError> {
             }
         }
 
-        if any_dirty {
-            composite(fb_ptr, back_ptr, &mut windows);
+        if scene_dirty {
+            // Full recomposite: redraw scene to back buffer, copy to LFB, draw cursor.
+            composite(fb_ptr, back_ptr, &windows, focused_wid);
+            draw_cursor(fb_ptr, cursor_x, cursor_y);
+            prev_cursor_x = cursor_x;
+            prev_cursor_y = cursor_y;
+        } else if cursor_moved {
+            // Cursor-only: restore old cursor rect from back buffer, draw at new pos.
+            restore_rect(fb_ptr, back_ptr, prev_cursor_x, prev_cursor_y, CURSOR_W, CURSOR_H);
+            draw_cursor(fb_ptr, cursor_x, cursor_y);
+            prev_cursor_x = cursor_x;
+            prev_cursor_y = cursor_y;
         }
     }
+}
+
+// ── Resize ───────────────────────────────────────────────────────────
+
+fn finalize_resize(win: &mut Window, new_w: usize, new_h: usize) {
+    let new_size = new_w * new_h * 4;
+    let new_buf = match SharedMem::new(new_size, 0) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let new_ptr = match new_buf.mmap() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    // Send MSG_WINDOW_RESIZED to client with new buffer fd.
+    let msg = IpcMessage {
+        tag: MSG_WINDOW_RESIZED,
+        data: [new_w as u64, new_h as u64, 0],
+        fds: [new_buf.fd(), -1, -1, -1],
+    };
+    let _ = sys::ipc_send(win.s2c_send.fd(), &msg, 0);
+
+    // Update window state.
+    win.w = new_w;
+    win.h = new_h;
+    win.buf_w = new_w;
+    win.buf_h = new_h;
+    win.buf_ptr = new_ptr as *const u8;
+    win.buf_size = new_size;
+    win._buf = new_buf;
+    win.dirty = true;
 }
 
 // ── Connection handling ──────────────────────────────────────────────
@@ -227,7 +621,7 @@ fn handle_connect(
     msg: &IpcMessage,
     windows: &mut Vec<Window>,
     next_wid: &mut u64,
-    _fb_ptr: *mut u8,
+    focused_wid: &mut Option<u64>,
 ) {
     if msg.tag != MSG_CONNECT {
         eprintln!("compositor: unexpected tag {} on reg channel", msg.tag);
@@ -244,14 +638,12 @@ fn handle_connect(
     let c2s_recv_fd = msg.fds[0];
     let s2c_send_fd = msg.fds[1];
 
-    // Clamp window size.
     let w = req_w.min(FB_WIDTH).max(64);
     let h = req_h.min(FB_HEIGHT).max(64);
 
     let wid = *next_wid;
     *next_wid += 1;
 
-    // Allocate buffer + notification fd.
     let buf_size = w * h * 4;
     let buf = match SharedMem::new(buf_size, 0) {
         Ok(b) => b,
@@ -268,7 +660,6 @@ fn handle_connect(
         }
     };
 
-    // Map buffer in compositor's address space.
     let buf_ptr = match buf.mmap() {
         Ok(p) => p,
         Err(e) => {
@@ -277,40 +668,34 @@ fn handle_connect(
         }
     };
 
-    // Send MSG_WINDOW_CREATED to client.
     let reply = IpcMessage {
         tag: MSG_WINDOW_CREATED,
         data: [wid, w as u64, h as u64],
         fds: [buf.fd(), notify.fd(), -1, -1],
     };
-    // Use raw ipc_send with the s2c_send fd we received (not wrapped in RAII yet).
     if sys::ipc_send(s2c_send_fd, &reply, 0) < 0 {
         eprintln!("compositor: failed to send WINDOW_CREATED");
         return;
     }
 
-    // Auto-tile: 2×2 grid.
+    // Position: tile with room for decorations.
     let idx = windows.len();
-    let (x, y) = tile_position(idx, w, h);
+    let (x, y) = tile_position(idx);
 
     println!(
         "compositor: window {} created ({}x{} at {},{})",
         wid, w, h, x, y
     );
 
-    // Wrap the received fds.
     let c2s_recv = IpcRecv::from_raw_fd(c2s_recv_fd);
     let s2c_send = IpcSend::from_raw_fd(s2c_send_fd);
 
     let mut cmd_msg = IpcMessage::default();
 
-    // Arm OP_RING_WAIT on notify fd.
     let _ = port.submit(&[IoSubmission::ring_wait(
         TAG_DAMAGE_BASE + wid,
         notify.fd(),
     )]);
-
-    // Arm OP_IPC_RECV on client channel.
     let _ = port.submit(&[IoSubmission::ipc_recv(
         TAG_CMD_BASE + wid,
         c2s_recv.fd(),
@@ -323,47 +708,140 @@ fn handle_connect(
         y,
         w,
         h,
+        buf_w: w,
+        buf_h: h,
         buf_ptr: buf_ptr as *const u8,
         buf_size,
         dirty: false,
         _buf: buf,
         _notify: notify,
         _c2s_recv: c2s_recv,
-        s2c_send: s2c_send,
+        s2c_send,
         cmd_msg,
     });
+
+    // Auto-focus the new window.
+    *focused_wid = Some(wid);
 }
 
 // ── Compositing ──────────────────────────────────────────────────────
 
-fn composite(fb_ptr: *mut u8, back_ptr: *mut u8, windows: &mut Vec<Window>) {
-    // Composite into back buffer to avoid flicker.
+/// Recomposite the scene (without cursor) into back_buf, then copy to LFB.
+/// Caller draws the cursor on LFB afterwards.
+fn composite(
+    fb_ptr: *mut u8,
+    back_ptr: *mut u8,
+    windows: &[Window],
+    focused_wid: Option<u64>,
+) {
     fill_rect(back_ptr, 0, 0, FB_WIDTH, FB_HEIGHT, BG_COLOR);
 
-    // Painter's algorithm — back to front (first connected = bottom).
-    for win in windows.iter_mut() {
+    for win in windows.iter() {
+        draw_decorations(back_ptr, win, focused_wid == Some(win.id));
         blit_window(back_ptr, win);
-        win.dirty = false;
     }
 
-    // Copy back buffer to framebuffer in one pass.
     let total = FB_WIDTH * FB_HEIGHT * 4;
     unsafe {
         core::ptr::copy_nonoverlapping(back_ptr, fb_ptr, total);
     }
 }
 
+/// Restore a rectangle on the LFB from the back buffer (cursor erase).
+fn restore_rect(fb_ptr: *mut u8, back_ptr: *mut u8, x: usize, y: usize, w: usize, h: usize) {
+    for row in y..(y + h).min(FB_HEIGHT) {
+        let x_end = (x + w).min(FB_WIDTH);
+        if x >= x_end {
+            continue;
+        }
+        let off = row * FB_STRIDE + x * 4;
+        let bytes = (x_end - x) * 4;
+        unsafe {
+            core::ptr::copy_nonoverlapping(back_ptr.add(off), fb_ptr.add(off), bytes);
+        }
+    }
+}
+
+fn draw_decorations(fb_ptr: *mut u8, win: &Window, focused: bool) {
+    let x = win.x;
+    let y = win.y;
+    let dw = win.dec_w();
+    let dh = win.dec_h();
+
+    // Border.
+    fill_rect(fb_ptr, x, y, dw, dh, BORDER_COLOR);
+
+    // Title bar.
+    let title_color = if focused { TITLE_FOCUSED } else { TITLE_UNFOCUSED };
+    fill_rect(fb_ptr, x + BORDER_W, y, dw - 2 * BORDER_W, TITLE_H, title_color);
+
+    // Close button.
+    let close_x = x + dw - CLOSE_W;
+    fill_rect(fb_ptr, close_x, y, CLOSE_W, CLOSE_H, CLOSE_BG);
+
+    // Draw "X" text in close button.
+    let cx = close_x + (CLOSE_W - font::FONT_WIDTH) / 2;
+    let cy = y + (TITLE_H - font::FONT_HEIGHT) / 2;
+    font::draw_char(fb_ptr, FB_STRIDE, FB_WIDTH, FB_HEIGHT, b'X', cx, cy, TITLE_TEXT, CLOSE_BG);
+
+    // Draw window title: "Win N".
+    let title_x = x + BORDER_W + 4;
+    let title_y = y + (TITLE_H - font::FONT_HEIGHT) / 2;
+    let title = window_title(win.id);
+    for (i, &ch) in title.iter().enumerate() {
+        if ch == 0 {
+            break;
+        }
+        let px = title_x + i * font::FONT_WIDTH;
+        if px + font::FONT_WIDTH > close_x {
+            break;
+        }
+        font::draw_char(fb_ptr, FB_STRIDE, FB_WIDTH, FB_HEIGHT, ch, px, title_y, TITLE_TEXT, title_color);
+    }
+}
+
+/// Format "Win N" into a fixed buffer. N can be up to ~20 digits.
+fn window_title(id: u64) -> [u8; 24] {
+    let mut buf = [0u8; 24];
+    buf[0] = b'W';
+    buf[1] = b'i';
+    buf[2] = b'n';
+    buf[3] = b' ';
+    // Convert id to decimal.
+    if id == 0 {
+        buf[4] = b'0';
+    } else {
+        let mut tmp = [0u8; 20];
+        let mut n = id;
+        let mut pos = 0;
+        while n > 0 {
+            tmp[pos] = b'0' + (n % 10) as u8;
+            n /= 10;
+            pos += 1;
+        }
+        for i in 0..pos {
+            buf[4 + i] = tmp[pos - 1 - i];
+        }
+    }
+    buf
+}
+
 fn blit_window(fb_ptr: *mut u8, win: &Window) {
     let src = win.buf_ptr;
-    let src_stride = win.w * 4;
+    let src_stride = win.buf_w * 4; // use actual buffer width, not visual width
+    let dst_x = win.content_x();
+    let dst_y_start = win.content_y();
 
-    for row in 0..win.h {
-        let dst_y = win.y + row;
+    // Blit rows up to min(visual height, buffer height).
+    let blit_h = win.h.min(win.buf_h);
+    let blit_w = win.w.min(win.buf_w);
+
+    for row in 0..blit_h {
+        let dst_y = dst_y_start + row;
         if dst_y >= FB_HEIGHT {
             break;
         }
-        let dst_x = win.x;
-        let copy_w = win.w.min(FB_WIDTH.saturating_sub(dst_x));
+        let copy_w = blit_w.min(FB_WIDTH.saturating_sub(dst_x));
         if copy_w == 0 {
             continue;
         }
@@ -373,11 +851,7 @@ fn blit_window(fb_ptr: *mut u8, win: &Window) {
         let bytes = copy_w * 4;
 
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                src.add(src_off),
-                fb_ptr.add(dst_off),
-                bytes,
-            );
+            core::ptr::copy_nonoverlapping(src.add(src_off), fb_ptr.add(dst_off), bytes);
         }
     }
 }
@@ -394,21 +868,48 @@ fn fill_rect(fb_ptr: *mut u8, x: usize, y: usize, w: usize, h: usize, color: u32
     }
 }
 
-// ── Keyboard service connection ──────────────────────────────────────
+fn draw_cursor(fb_ptr: *mut u8, cx: usize, cy: usize) {
+    let white = 0x00FFFFFFu32.to_le_bytes();
+    let black = 0x00000000u32.to_le_bytes();
 
-/// Connect to the userspace keyboard service.  Returns the IpcRecv end
-/// for receiving key events.  The completion port is armed with TAG_KEYBOARD.
+    for row in 0..CURSOR_H {
+        let dy = cy + row;
+        if dy >= FB_HEIGHT {
+            break;
+        }
+        let bits = CURSOR_BITMAP[row];
+        for col in 0..CURSOR_W {
+            let dx = cx + col;
+            if dx >= FB_WIDTH {
+                break;
+            }
+            if bits & (1 << (15 - col)) != 0 {
+                let off = dy * FB_STRIDE + dx * 4;
+                // Draw white pixel with black outline (simple: just white for now).
+                unsafe {
+                    // Black outline: check if this is an edge pixel.
+                    let is_edge = col == 0
+                        || row == 0
+                        || (bits & (1 << (15 - col + 1)) == 0)
+                        || (row + 1 < CURSOR_H
+                            && CURSOR_BITMAP[row + 1] & (1 << (15 - col)) == 0);
+                    let color = if is_edge { &black } else { &white };
+                    core::ptr::copy_nonoverlapping(color.as_ptr(), fb_ptr.add(off), 4);
+                }
+            }
+        }
+    }
+}
+
+// ── Service connections ──────────────────────────────────────────────
+
 fn connect_keyboard(
     port: &CompletionPort,
     kbd_msg: &mut IpcMessage,
 ) -> Result<IpcRecv, OsError> {
-    // Retry lookup — the keyboard driver may still be starting up.
     let reg_send_fd = ostoo::service_lookup_retry(kbd_proto::SERVICE_NAME, 10)?;
-
-    // Create channel pair for key events: keyboard → compositor.
     let (evt_send, evt_recv) = ostoo::ipc_channel(4, 0)?;
 
-    // Send MSG_KB_CONNECT with our send-end so the keyboard driver can push events.
     let connect_msg = IpcMessage {
         tag: kbd_proto::MSG_KB_CONNECT,
         data: [0; 3],
@@ -417,22 +918,40 @@ fn connect_keyboard(
     if sys::ipc_send(reg_send_fd, &connect_msg, 0) < 0 {
         return Err(OsError(-1));
     }
-    // Close fds we no longer need.
     ostoo_rt::syscall::close(reg_send_fd as u32);
     drop(evt_send);
 
-    // Arm OP_IPC_RECV on the event channel.
-    port.submit(&[IoSubmission::ipc_recv(
-        TAG_KEYBOARD,
-        evt_recv.fd(),
-        kbd_msg,
-    )])?;
+    port.submit(&[IoSubmission::ipc_recv(TAG_KEYBOARD, evt_recv.fd(), kbd_msg)])?;
 
     println!("compositor: connected to keyboard service");
     Ok(evt_recv)
 }
 
-fn tile_position(idx: usize, _w: usize, _h: usize) -> (usize, usize) {
+fn connect_mouse(
+    port: &CompletionPort,
+    mouse_msg: &mut IpcMessage,
+) -> Result<IpcRecv, OsError> {
+    let reg_send_fd = ostoo::service_lookup_retry(mouse_proto::SERVICE_NAME, 10)?;
+    let (evt_send, evt_recv) = ostoo::ipc_channel(4, 0)?;
+
+    let connect_msg = IpcMessage {
+        tag: mouse_proto::MSG_MOUSE_CONNECT,
+        data: [0; 3],
+        fds: [evt_send.fd(), -1, -1, -1],
+    };
+    if sys::ipc_send(reg_send_fd, &connect_msg, 0) < 0 {
+        return Err(OsError(-1));
+    }
+    ostoo_rt::syscall::close(reg_send_fd as u32);
+    drop(evt_send);
+
+    port.submit(&[IoSubmission::ipc_recv(TAG_MOUSE, evt_recv.fd(), mouse_msg)])?;
+
+    println!("compositor: connected to mouse service");
+    Ok(evt_recv)
+}
+
+fn tile_position(idx: usize) -> (usize, usize) {
     let col = idx % 2;
     let row = idx / 2;
     let x = col * (FB_WIDTH / 2) + 20;

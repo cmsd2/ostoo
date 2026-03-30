@@ -27,6 +27,11 @@ pub fn sys_irq_create(gsi: u32) -> i64 {
         return -errno::EINVAL;
     }
 
+    // For mouse (GSI 12): initialize the PS/2 auxiliary port so IRQ 12 fires.
+    if gsi == 12 {
+        libkernel::ps2::aux_init();
+    }
+
     let inner = Arc::new(IrqMutex::new(IrqInner::new(
         gsi, vector, slot, saved_entry,
     )));
