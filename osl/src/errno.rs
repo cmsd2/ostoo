@@ -22,6 +22,7 @@ pub const ESPIPE:  i64 = 29;
 pub const ERANGE:  i64 = 34;
 pub const EAGAIN:  i64 = 11;
 pub const EPIPE:   i64 = 32;
+pub const EBUSY:   i64 = 16;
 pub const ENOSYS:  i64 = 38;
 
 pub fn file_errno(e: FileError) -> i64 {

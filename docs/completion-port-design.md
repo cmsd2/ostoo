@@ -571,37 +571,80 @@ blocking wait point — exactly the pattern needed for microkernel drivers.
 
 ---
 
-## Shared-Memory Ring Optimisation (Future Phase 5)
+## Shared-Memory Ring Optimisation (Phase 5 — Implemented)
 
 Under high throughput, even one syscall per batch can become a bottleneck.
-The ultimate optimisation is to map the submission and completion queues into
-userspace as shared-memory ring buffers, eliminating syscalls entirely on the
-hot path.
+The shared-memory ring optimisation maps the submission and completion queues
+into userspace as shared-memory ring buffers, eliminating syscalls on the
+hot path for reading completions.
 
-### io_setup_rings (future syscall)
+### Syscalls
+
+| Nr | Name | Purpose |
+|---|---|---|
+| 511 | `io_setup_rings` | Allocate SQ/CQ shared memory, put port in ring mode |
+| 512 | `io_ring_enter` | Process SQ entries + optionally block for CQ completions |
+
+### io_setup_rings (511)
 
 ```
-io_setup_rings(port_fd, sq_size, cq_size) → (sq_mmap_offset, cq_mmap_offset)
+io_setup_rings(port_fd, params: *mut IoRingParams) → 0 or -errno
 ```
 
-After this call, the process `mmap`s the SQ and CQ regions from the port fd:
+Allocates SQ and CQ ring pages and returns shmem fds that the process
+`mmap`s with `MAP_SHARED`:
 
 ```c
-void *sq = mmap(NULL, sq_size, PROT_READ|PROT_WRITE, MAP_SHARED, port_fd, sq_offset);
-void *cq = mmap(NULL, cq_size, PROT_READ,            MAP_SHARED, port_fd, cq_offset);
+struct io_ring_params params = { .sq_entries = 64, .cq_entries = 128 };
+io_setup_rings(port, &params);
+void *sq = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, params.sq_fd, 0);
+void *cq = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, params.cq_fd, 0);
 ```
 
-The kernel and userspace communicate through atomic head/tail pointers in the
-rings.  The kernel only needs to be notified (via `io_submit` with count=0 or
-a dedicated `io_ring_enter` syscall) when:
+### io_ring_enter (512)
 
-- The SQ transitions from empty to non-empty (userspace submitted work while
-  the kernel was idle).
-- The waiter needs to block (no completions available, equivalent to
-  `io_wait`).
+```
+io_ring_enter(port_fd, to_submit, min_complete, flags) → i64
+```
 
-This matches Linux io_uring's model.  It requires `MAP_SHARED` from
-[mmap-design.md](mmap-design.md) Phase 5.
+Processes up to `to_submit` SQEs from the shared SQ ring, flushes deferred
+completions, and optionally blocks until `min_complete` CQEs are available
+in the CQ ring.
+
+### Ring layout
+
+Single 4 KiB page per ring:
+
+```
+Offset 0:  RingHeader (16 bytes)
+  AtomicU32 head  — consumer advances (SQ: kernel, CQ: user)
+  AtomicU32 tail  — producer advances (SQ: user, CQ: kernel)
+  u32 mask        — capacity - 1
+  u32 flags       — reserved (0)
+
+Offset 64: entries[] (cache-line aligned)
+  SQ: IoSubmission[capacity]  — 48 bytes each, max 64
+  CQ: IoCompletion[capacity]  — 24 bytes each, max 128
+```
+
+Head and tail use atomic load/store with acquire/release ordering.
+
+### Dual-mode post()
+
+When rings are active, `CompletionPort::post()` routes completions:
+
+- **Simple** (no `read_buf`, no `transfer_fds`): CQE written directly to
+  the shared CQ ring via `IoRing::post_cqe()`.  Fast path for OP_NOP,
+  OP_TIMEOUT, OP_WRITE, OP_IRQ_WAIT, OP_IPC_SEND, OP_RING_WAIT.
+- **Deferred** (`read_buf` or `transfer_fds` present): pushed to the
+  kernel VecDeque.  `io_ring_enter` flushes these in syscall context
+  where page tables are correct for data copy and fd installation.
+
+### Backward compatibility
+
+- `io_submit` works in ring mode (completions go to CQ ring)
+- `io_wait` returns `-EINVAL` in ring mode (use `io_ring_enter`)
+- Ports without rings work exactly as before
 
 ---
 
@@ -665,16 +708,16 @@ notification fds.
 | **Delivers** | `notify_create(flags)` syscall (509), `notify(fd)` syscall (510), submit OP_RING_WAIT on notification fd, producer-side `notify()` posts completion |
 | **Test** | `user/ring_test.c`: parent creates shmem + notify fd, spawns child, child writes to shmem and signals, parent reaps OP_RING_WAIT completion and verifies data. |
 
-### Phase 5: Shared-Memory SQ/CQ Rings
+### Phase 5: Shared-Memory SQ/CQ Rings — **Implemented**
 
 **Goal:** Zero-syscall submission and completion for high-throughput paths.
 
 | Item | Detail |
 |---|---|
-| **Files** | `osl/src/io_port.rs` (io_setup_rings), `libkernel/src/file.rs` (mmap support on CompletionPortHandle) |
+| **Files** | `libkernel/src/completion_port.rs` (IoRing, IoSubmission, IoCompletion, RingHeader, dual-mode post()), `libkernel/src/shmem.rs` (from_existing), `osl/src/io_port.rs` (io_setup_rings 511, io_ring_enter 512, process_submission refactor) |
 | **Dependencies** | Phase 1; `MAP_SHARED` from [mmap-design.md](mmap-design.md) Phase 5 |
-| **Delivers** | Userspace-mapped SQ/CQ rings, kernel polls SQ on io_ring_enter |
-| **Test** | Submit OP_NOP via shared-memory SQ (no io_submit syscall), reap from CQ, verify completion. |
+| **Delivers** | Userspace-mapped SQ/CQ rings via shmem fds, io_ring_enter processes SQ + waits for CQ |
+| **Test** | `user/ring_sq_test.c`: submit OP_NOP + OP_TIMEOUT via shared-memory SQ, reap from CQ ring, verify completions. |
 
 ---
 
@@ -710,7 +753,7 @@ notification fds.
           └────────────────────┘      │  │
                                       │  │
                     ┌─────────────────▼──▼───────────────┐
-                    │  Phase 5                           │
+                    │  Phase 5  ✓                        │
                     │  Shared-memory SQ/CQ rings         │
                     │                                    │
                     │  requires:                         │
@@ -718,8 +761,7 @@ notification fds.
                     └────────────────────────────────────┘
 ```
 
-Phases 1–4 are complete.  Phase 5 (shared-memory SQ/CQ rings) is the
-remaining work.  Its MAP_SHARED prerequisite is now satisfied.
+All phases are complete.
 
 ---
 

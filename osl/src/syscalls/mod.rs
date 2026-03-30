@@ -88,6 +88,8 @@ fn syscall_inner(
         SYS_SHMEM_CREATE   => shmem::sys_shmem_create(a1, a2 as u32),
         SYS_NOTIFY_CREATE  => crate::notify::sys_notify_create(a1 as u32),
         SYS_NOTIFY         => crate::notify::sys_notify(a1 as i32),
+        SYS_IO_SETUP_RINGS => crate::io_port::sys_io_setup_rings(a1 as i32, a2),
+        SYS_IO_RING_ENTER  => crate::io_port::sys_io_ring_enter(a1 as i32, a2 as u32, a3 as u32, a4 as u32),
         other              => {
             log::warn!("unhandled syscall nr={} a1={:#x} a2={:#x} a3={:#x}",
                 other, a1, a2, a3);

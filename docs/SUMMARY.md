@@ -87,6 +87,8 @@
 - [shmem_create (508)](syscalls/shmem_create.md)
 - [notify_create (509)](syscalls/notify_create.md)
 - [notify (510)](syscalls/notify.md)
+- [io_setup_rings (511)](syscalls/io_setup_rings.md)
+- [io_ring_enter (512)](syscalls/io_ring_enter.md)
 
 # Userspace
 

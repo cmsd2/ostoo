@@ -280,12 +280,16 @@ are present, racing all event sources in a single future.
   downcast approach.
 - `IrqMutex` protects the `CompletionPort` for ISR-safe `post()` from
   interrupt context.
-- Syscalls: `io_create` (501), `io_submit` (502), `io_wait` (503).
+- Syscalls: `io_create` (501), `io_submit` (502), `io_wait` (503),
+  `io_setup_rings` (511), `io_ring_enter` (512).
 - Supported operations: `OP_NOP` (immediate), `OP_TIMEOUT` (async timer via
   executor), `OP_READ` / `OP_WRITE` (async — user buffers are copied to/from
   kernel memory during `io_submit`/`io_wait`; the actual I/O runs on executor
   tasks so `io_submit` returns immediately), `OP_IRQ_WAIT` (hardware interrupt
   delivery — ISR masks GSI and posts completion; rearm via another submit unmasks).
+- Shared-memory SQ/CQ rings (Phase 5): `io_setup_rings` allocates ring pages
+  as shmem fds; userspace writes SQEs to the SQ ring and reads CQEs from the
+  CQ ring.  `io_ring_enter` kicks the kernel and/or blocks for completions.
 - `FileHandle` trait has `poll_read` / `poll_write` methods (default impls
   delegate to sync `read`/`write`).  `PipeReader` and `ConsoleHandle`
   override `poll_read` with waker-based async semantics so completion port
@@ -293,7 +297,7 @@ are present, racing all event sources in a single future.
 - Userspace demo programs: `io_demo.c` (smoke test), `io_pingpong.c` /
   `io_pong.c` (parent-child IPC via completion port).
 - See [`docs/completion-port-design.md`](completion-port-design.md) for the
-  full phased roadmap (Phases 1–3 complete; Phases 4–5 pending prerequisites).
+  full phased roadmap (all phases complete).
 
 ### IRQ File Descriptors (`libkernel/src/irq_handle.rs`, `osl/src/irq.rs`)
 - Userspace interrupt delivery via `irq_create(gsi)` syscall (504).
@@ -408,13 +412,14 @@ output but functionally harmless.
 
 ## Possible Next Steps
 
-### Completion Port Phases 4–5 (blocked on prerequisites)
+### Completion Port — All Phases Complete
 
-- Phases 3–4 (OP_IRQ_WAIT, OP_RING_WAIT) are complete — see IRQ fd and
-  notification fd sections above.
-- **Phase 5: Shared-memory SQ/CQ rings** — zero-syscall submission/completion
-  via userspace-mapped ring buffers.  All prerequisites (MAP_SHARED,
-  notification fds) are now satisfied.
+- Phases 1–4 (core, read/write, OP_IRQ_WAIT, OP_RING_WAIT) — see sections above.
+- **Phase 5: Shared-memory SQ/CQ rings** — implemented.  `io_setup_rings` (511)
+  allocates shared SQ/CQ ring pages exposed as shmem fds.  `io_ring_enter` (512)
+  processes SQ entries and waits for CQ completions.  Dual-mode `post()` writes
+  simple CQEs directly to the shared CQ ring; deferred completions (OP_READ,
+  OP_IPC_RECV) are flushed in syscall context.  Test: `ring_sq_test`.
 
 ### Memory Management
 

@@ -48,3 +48,5 @@ pub const SYS_IPC_RECV: u64 = 507;
 pub const SYS_SHMEM_CREATE: u64 = 508;
 pub const SYS_NOTIFY_CREATE: u64 = 509;
 pub const SYS_NOTIFY: u64 = 510;
+pub const SYS_IO_SETUP_RINGS: u64 = 511;
+pub const SYS_IO_RING_ENTER: u64 = 512;

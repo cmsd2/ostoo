@@ -17,6 +17,12 @@ pub struct SharedMemInner {
     frames: Vec<PhysAddr>,
     /// Logical size in bytes (may be smaller than frames.len() * PAGE_SIZE).
     size: usize,
+    /// Whether this object owns its frames and should release them on drop.
+    ///
+    /// `true` for objects created via `new()` (normal shmem_create path).
+    /// `false` for objects created via `from_existing()` (wrapping IoRing
+    /// frames — the IoRing is the true owner).
+    owned: bool,
 }
 
 impl SharedMemInner {
@@ -42,7 +48,16 @@ impl SharedMemInner {
             Some(())
         })?;
 
-        Some(SharedMemInner { frames, size })
+        Some(SharedMemInner { frames, size, owned: true })
+    }
+
+    /// Wrap existing physical frames as a shared memory object.
+    ///
+    /// The frames are NOT owned by this object — they will not be released
+    /// on drop.  Used by `io_setup_rings` to expose IoRing pages as shmem
+    /// fds that can be mmap'd by userspace.
+    pub fn from_existing(frames: Vec<PhysAddr>, size: usize) -> Self {
+        SharedMemInner { frames, size, owned: false }
     }
 
     /// Physical frame addresses backing this object.
@@ -58,10 +73,12 @@ impl SharedMemInner {
 
 impl Drop for SharedMemInner {
     fn drop(&mut self) {
-        crate::memory::with_memory(|mem| {
-            for &phys in &self.frames {
-                mem.release_shared_frame(phys);
-            }
-        });
+        if self.owned {
+            crate::memory::with_memory(|mem| {
+                for &phys in &self.frames {
+                    mem.release_shared_frame(phys);
+                }
+            });
+        }
     }
 }
