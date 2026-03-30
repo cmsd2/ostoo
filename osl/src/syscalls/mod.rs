@@ -10,6 +10,7 @@ mod io;
 mod mem;
 mod misc;
 mod process;
+mod shmem;
 
 use crate::errno;
 use crate::syscall_nr::*;
@@ -84,6 +85,7 @@ fn syscall_inner(
         SYS_IPC_CREATE     => crate::ipc::sys_ipc_create(a1, a2 as u32, a3 as u32),
         SYS_IPC_SEND       => crate::ipc::sys_ipc_send(a1 as i32, a2, a3 as u32),
         SYS_IPC_RECV       => crate::ipc::sys_ipc_recv(a1 as i32, a2, a3 as u32),
+        SYS_SHMEM_CREATE   => shmem::sys_shmem_create(a1, a2 as u32),
         other              => {
             log::warn!("unhandled syscall nr={} a1={:#x} a2={:#x} a3={:#x}",
                 other, a1, a2, a3);

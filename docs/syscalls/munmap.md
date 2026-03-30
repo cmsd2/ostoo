@@ -25,7 +25,12 @@ Fully implemented. Validates arguments, splits/removes VMAs, unmaps page table e
    - **Front consumed** — VMA start/len adjusted forward.
    - **Tail consumed** — VMA len shortened.
    - **Middle consumed** — VMA split into two fragments.
-4. Each page in the unmapped range is removed from the page table and its physical frame returned to the free list.
+4. Each page in the unmapped range is removed from the page table.
+   Physical frames are released via refcount-aware logic: shared frames
+   (from `MAP_SHARED` mappings) are only freed when their reference count
+   reaches 0 (i.e. all processes have unmapped the frame and the backing
+   `shmem_create` fd has been closed).  Non-shared frames are freed
+   immediately.
 5. If no VMAs overlap the range, returns 0 (Linux no-op semantics).
 
 ### Lock ordering

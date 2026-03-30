@@ -69,6 +69,11 @@ pub struct MemoryServices {
     mmio_next:       u64,
     /// Cache: page-aligned physical base → virtual base of the mapped region.
     mmio_cache:      BTreeMap<u64, u64>,
+    /// Reference counts for shared physical frames.
+    ///
+    /// Only frames with refcount ≥ 2 appear in this map.  A frame absent
+    /// from the map has an implicit refcount of 1 (single owner).
+    refcounts:       BTreeMap<u64, u16>,
 }
 
 impl MemoryServices {
@@ -215,6 +220,48 @@ impl MemoryServices {
     }
 
     // -----------------------------------------------------------------------
+    // Frame reference counting
+
+    /// Mark a physical frame as shared by incrementing its reference count.
+    ///
+    /// If the frame is not yet in the refcount table (implicit count 1),
+    /// it is inserted with count 2.  Otherwise the count is incremented.
+    pub fn ref_share(&mut self, phys: PhysAddr) {
+        let key = phys.as_u64();
+        let count = self.refcounts.entry(key).or_insert(1);
+        *count += 1;
+    }
+
+    /// Release one reference to a shared physical frame.
+    ///
+    /// Returns `true` if the caller should free the frame (refcount reached 0).
+    /// Returns `false` if other references remain.
+    pub fn ref_release(&mut self, phys: PhysAddr) -> bool {
+        let key = phys.as_u64();
+        match self.refcounts.get_mut(&key) {
+            Some(count) => {
+                *count -= 1;
+                if *count <= 1 {
+                    // At most one owner remains — remove from the table
+                    // (implicit refcount 1 or 0).
+                    let final_count = *count;
+                    self.refcounts.remove(&key);
+                    final_count == 0
+                } else {
+                    false
+                }
+            }
+            // Not in table → implicit refcount 1 → now 0 → free.
+            None => true,
+        }
+    }
+
+    /// Check whether a physical frame is shared (refcount ≥ 2).
+    pub fn is_shared(&self, phys: PhysAddr) -> bool {
+        self.refcounts.contains_key(&phys.as_u64())
+    }
+
+    // -----------------------------------------------------------------------
     // Per-process page table management
 
     /// Allocate a fresh PML4 for a new user process.
@@ -333,6 +380,39 @@ impl MemoryServices {
         }
     }
 
+    /// Unmap a single user page with refcount-aware freeing.
+    ///
+    /// Decrements the frame's reference count.  The frame is only returned
+    /// to the free list when no references remain (refcount reaches 0).
+    /// Returns `true` if the page was mapped, `false` otherwise.
+    pub fn unmap_and_release_user_page(
+        &mut self,
+        pml4_phys: PhysAddr,
+        vaddr: VirtAddr,
+        flush_tlb: bool,
+    ) -> bool {
+        if let Some(frame) = self.unmap_user_page(pml4_phys, vaddr, flush_tlb) {
+            if self.ref_release(frame.start_address()) {
+                self.frame_allocator.deallocate_frame(frame);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Release a shared frame's reference count without unmapping.
+    ///
+    /// Used by `SharedMemInner::drop` to release the object's ownership
+    /// of its backing frames.  Frees the frame if refcount reaches 0.
+    pub fn release_shared_frame(&mut self, phys: PhysAddr) {
+        if self.ref_release(phys) {
+            self.frame_allocator.deallocate_frame(
+                PhysFrame::containing_address(phys),
+            );
+        }
+    }
+
     /// Update the page table flags for a single 4 KiB page in a page table
     /// rooted at `pml4_phys`.
     ///
@@ -403,12 +483,14 @@ impl MemoryServices {
                     let pt_phys = p2e.addr();
                     let pt: &PageTable = unsafe { &*(phys_off + pt_phys.as_u64()).as_ptr() };
 
-                    // Free all leaf data frames.
+                    // Free all leaf data frames (refcount-aware).
                     for p1_idx in 0..512u16 {
                         let p1e = &pt[PageTableIndex::new(p1_idx)];
                         if p1e.is_unused() { continue; }
                         let frame = PhysFrame::<Size4KiB>::containing_address(p1e.addr());
-                        self.frame_allocator.deallocate_frame(frame);
+                        if self.ref_release(frame.start_address()) {
+                            self.frame_allocator.deallocate_frame(frame);
+                        }
                     }
                     // Free the PT frame.
                     self.frame_allocator.deallocate_frame(
@@ -530,6 +612,7 @@ pub fn init_services(
         memory_map: heap_map,
         mmio_next:  MMIO_VIRT_BASE,
         mmio_cache: BTreeMap::new(),
+        refcounts:  BTreeMap::new(),
     });
 }
 

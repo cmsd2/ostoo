@@ -84,6 +84,7 @@
 - [ipc_create (505)](syscalls/ipc_create.md)
 - [ipc_send (506)](syscalls/ipc_send.md)
 - [ipc_recv (507)](syscalls/ipc_recv.md)
+- [shmem_create (508)](syscalls/shmem_create.md)
 
 # Userspace
 

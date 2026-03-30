@@ -317,52 +317,84 @@ munmaps, exits cleanly.
 
 ---
 
-## Phase 5b: MAP_SHARED + Refcounted Frames (future)
+## Phase 5b: MAP_SHARED + Refcounted Frames ✓ (anonymous shared memory)
 
-**Goal:** Support shared mappings with reference-counted frames.
+**Goal:** Support shared anonymous mappings with reference-counted frames.
 
-### MAP_SHARED + refcounted frames
+### Shared memory objects (`shmem_create`)
 
-Shared mappings require multiple processes to map the same physical frame.
-This needs:
+A custom syscall `shmem_create(size)` (nr 508) creates a shared memory
+object backed by eagerly-allocated, zeroed physical frames and returns
+a file descriptor.  The fd can be inherited by child processes or passed
+via IPC.  Both sides call `mmap(MAP_SHARED, fd)` to map the same physical
+frames into their address spaces.
 
-1. **Frame refcount table** — a global array (or hash map) from
-   `PhysAddr → u16` tracking how many PTEs reference each frame.
-   `mmap(MAP_SHARED)` increments, `munmap`/exit decrements, frame is freed
-   when refcount reaches 0.
-2. **Shared file cache** — a global `BTreeMap<(inode, page_offset) → PhysAddr>`
-   so that two processes mapping the same file page get the same frame.
-   (Requires the VFS to expose inode identifiers, which it does not today.)
-3. **Dirty tracking** — `msync` or process exit writes dirty shared pages
-   back to the file.  Deferred initially — start with read-only shared
-   mappings.
+### Frame refcount table
 
-### Future: inode-based VFS
+A `BTreeMap<u64, u16>` in `MemoryServices` tracks frames with refcount ≥ 2.
+Frames not in the table have an implicit refcount of 1 (single owner).
 
-The current `content_bytes()` approach reads from the fd's in-memory buffer.
-This is correct for MAP_PRIVATE (snapshot semantics) but MAP_SHARED requires
-an inode-keyed page cache so multiple processes can share the same physical
-pages.  This requires:
+Each shared frame has owners:
+1. The `SharedMemInner` object itself (1 ref, released on Arc drop)
+2. Each process mapping (1 ref per mmap, released on munmap or exit)
 
-- VFS inode identifiers (unique per file across mounts)
-- An inode-keyed page cache: `BTreeMap<(InodeId, page_offset) → PhysAddr>`
-- Refcounted frames with dirty tracking for writeback
+Methods:
+- `ref_share(phys)` — increment (insert with 2 if new to table)
+- `ref_release(phys) -> bool` — decrement, return true if frame should be freed
 
-Path-based re-reading is incorrect because files can be renamed/unlinked
-after open.  The fd (inode reference) is the correct identity.
+### Refcount-aware cleanup
 
-### Changes (planned)
+- `unmap_and_release_user_page()` — unmaps PTE, calls `ref_release`, only
+  frees when refcount reaches 0.
+- `cleanup_user_address_space()` — uses `ref_release` for all leaf frames.
+  Backwards-compatible: non-shared frames return true immediately.
+- `SharedMemInner::drop()` — calls `release_shared_frame()` for each backing
+  frame.  Safe because Drop only fires from fd close (outside `with_memory`).
+
+### MAP_SHARED in `sys_mmap`
+
+- Validates MAP_SHARED and MAP_PRIVATE are mutually exclusive
+- MAP_SHARED | MAP_ANONYMOUS returns `-EINVAL` (no fork)
+- MAP_SHARED with fd: extracts `SharedMemInner` from `FdObject::SharedMem`,
+  maps its physical frames, increments refcounts via `ref_share`
+
+### Changes
 
 | File | Change |
 |---|---|
-| `libkernel/src/memory/` | Frame refcount table |
-| VFS layer | Inode identifiers for shared page cache |
-| `osl/src/syscalls/mem.rs` | MAP_SHARED path in `sys_mmap` |
+| `libkernel/src/memory/mod.rs` | `refcounts: BTreeMap`, `ref_share`, `ref_release`, `unmap_and_release_user_page`, refcount-aware `cleanup_user_address_space` |
+| `libkernel/src/shmem.rs` | **New** — `SharedMemInner` struct with Drop |
+| `libkernel/src/file.rs` | `FdObject::SharedMem` variant, `as_shmem()` |
+| `libkernel/src/process.rs` | `MAP_SHARED` constant |
+| `osl/src/syscalls/shmem.rs` | **New** — `sys_shmem_create` |
+| `osl/src/syscalls/mod.rs` | Wire syscall 508 |
+| `osl/src/syscalls/mem.rs` | MAP_SHARED path in `sys_mmap`, refcount-aware `sys_munmap` |
+| `osl/src/fd_helpers.rs` | `get_fd_shmem` helper |
 
 ### Test
 
-Two processes `MAP_SHARED` the same file, one writes — the other should see
-the change (once writable shared mappings are supported).
+`user/src/shmem_test.c`: Parent creates shmem, writes magic pattern, spawns
+child.  Child inherits fd, mmaps it, verifies pattern, writes response.
+Parent waits, verifies response.
+
+---
+
+## Phase 5c: File-Backed MAP_SHARED (future)
+
+**Goal:** Multiple processes mapping the same file share physical frames
+via an inode-keyed page cache.
+
+This requires:
+
+1. **VFS inode identifiers** — unique per file across mounts.
+   The 9P protocol carries `qid.path` which serves as an inode, but it
+   is currently discarded when converting to `VfsDirEntry`.
+2. **Shared page cache** — a global `BTreeMap<(InodeId, page_offset) → PhysAddr>`
+   so multiple processes mapping the same file page get the same frame.
+3. **Dirty tracking** — `msync` or process exit writes dirty shared pages
+   back to the file.
+
+The frame refcount table from Phase 5b provides the foundation.
 
 ---
 
@@ -377,28 +409,19 @@ Phase 1 ─── VMA tracking + PROT flags
    │               │
    │               └──▶ Phase 4 ─── MAP_FIXED + gap finding
    │                       │
-   │                       └──▶ Phase 5a ─── File-backed MAP_PRIVATE (eager copy)
-   │
-   └──────────────────────────▶ Phase 5b ─── MAP_SHARED + refcounted frames
-                                     │
-                                (requires Phase 2 for refcount free,
-                                 Phase 3 for cleanup on exit,
-                                 inode-based VFS for shared page cache)
+   │                       ├──▶ Phase 5a ─── File-backed MAP_PRIVATE (eager copy)
+   │                       │
+   │                       └──▶ Phase 5b ─── MAP_SHARED (anonymous, shmem_create)
+   │                               │
+   │                               └──▶ Phase 5c ─── File-backed MAP_SHARED
+   │                                       (requires inode-based VFS + page cache)
 ```
 
-Phase 1 is a prerequisite for everything — VMAs are the foundation.
+Phase 5b (MAP_SHARED anonymous) uses frame refcounting and `shmem_create`
+to share physical frames between processes.  No VFS changes needed.
 
-Phase 2 (frame freeing) and Phase 3 (mprotect + cleanup) are sequential
-because cleanup reuses the unmap/free primitives from Phase 2.
-
-Phase 4 (MAP_FIXED + gap finding) requires munmap (Phase 2) for the implicit
-unmap-on-overlap behaviour.
-
-Phase 5a (file-backed MAP_PRIVATE) builds on Phase 4 and uses the fd's
-in-memory buffer via `content_bytes()`.
-
-Phase 5b (MAP_SHARED) requires inode-based VFS, frame refcounting, and
-all earlier phases.
+Phase 5c (file-backed MAP_SHARED) requires inode identifiers from the VFS
+and a global page cache, building on Phase 5b's refcount infrastructure.
 
 ---
 

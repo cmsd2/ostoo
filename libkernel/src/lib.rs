@@ -47,6 +47,7 @@ pub mod signal;
 pub mod channel;
 pub mod framebuffer;
 pub mod font;
+pub mod shmem;
 
 pub fn init() {
     cpuid::init();

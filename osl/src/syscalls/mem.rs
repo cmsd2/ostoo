@@ -58,8 +58,10 @@ pub(crate) fn sys_brk(addr: u64) -> i64 {
 }
 
 pub(crate) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, a5: u64) -> i64 {
-    use libkernel::process::{Vma, MAP_ANONYMOUS, MAP_FIXED};
+    use alloc::sync::Arc;
+    use libkernel::process::{Vma, MAP_ANONYMOUS, MAP_FIXED, MAP_SHARED, MAP_PRIVATE};
     use libkernel::memory::with_memory;
+    use libkernel::shmem::SharedMemInner;
 
     let pid = process::current_pid();
     if pid == process::ProcessId::KERNEL {
@@ -72,8 +74,63 @@ pub(crate) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, a5: u64) -
     }
     let num_pages = (aligned_len / PAGE_SIZE) as usize;
 
-    let anonymous = flags & MAP_ANONYMOUS as u64 != 0;
-    let fixed = flags & MAP_FIXED as u64 != 0;
+    let flags32 = flags as u32;
+    let anonymous = flags32 & MAP_ANONYMOUS != 0;
+    let fixed = flags32 & MAP_FIXED != 0;
+    let shared = flags32 & MAP_SHARED != 0;
+    let private = flags32 & MAP_PRIVATE != 0;
+
+    // MAP_SHARED and MAP_PRIVATE are mutually exclusive.
+    if shared == private {
+        return -errno::EINVAL;
+    }
+
+    // MAP_SHARED | MAP_ANONYMOUS is not supported (no fork()).
+    if shared && anonymous {
+        return -errno::EINVAL;
+    }
+
+    // -----------------------------------------------------------------------
+    // MAP_SHARED with a shmem fd
+    if shared {
+        let fd = a5 as usize;
+        let offset = libkernel::syscall::get_user_r9();
+        if offset & PAGE_MASK != 0 {
+            return -errno::EINVAL;
+        }
+
+        // Get the SharedMemInner from the fd table.
+        let shmem: Arc<SharedMemInner> = match process::with_process_ref(pid, |p| {
+            p.get_fd(fd).ok().and_then(|obj| obj.as_shmem().cloned())
+        }) {
+            Some(Some(s)) => s,
+            _ => return -errno::ENODEV,
+        };
+
+        // Validate that the requested range fits within the shmem object.
+        let offset_usize = offset as usize;
+        if offset_usize + aligned_len as usize > shmem.size() {
+            // Allow mapping up to the page-aligned size of the object.
+            let page_aligned_size = (shmem.size() as u64 + PAGE_MASK) & !PAGE_MASK;
+            if offset + aligned_len > page_aligned_size {
+                return -errno::EINVAL;
+            }
+        }
+
+        let frames = shmem.frames();
+        let first_page = (offset / PAGE_SIZE) as usize;
+        if first_page + num_pages > frames.len() {
+            return -errno::EINVAL;
+        }
+
+        return mmap_shared_inner(
+            pid, addr, aligned_len, prot as u32, flags32,
+            fixed, fd, offset, &frames[first_page..first_page + num_pages],
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MAP_PRIVATE path (anonymous or file-backed) — existing logic
 
     // For file-backed mappings: extract fd, offset, and grab file content.
     let file_info: Option<(i32, u64, alloc::vec::Vec<u8>)> = if !anonymous {
@@ -129,7 +186,7 @@ pub(crate) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, a5: u64) -
                 for (base, count) in &pages_to_free {
                     for i in 0..*count {
                         let vaddr = x86_64::VirtAddr::new(base + (i as u64) * PAGE_SIZE);
-                        mem.unmap_and_free_user_page(pml4_phys, vaddr, true);
+                        mem.unmap_and_release_user_page(pml4_phys, vaddr, true);
                     }
                 }
             });
@@ -139,7 +196,7 @@ pub(crate) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, a5: u64) -
             start: addr,
             len: aligned_len,
             prot: prot as u32,
-            flags: flags as u32,
+            flags: flags32,
             fd: vma_fd,
             offset: vma_offset,
         };
@@ -167,7 +224,7 @@ pub(crate) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, a5: u64) -
             start: region_base,
             len: aligned_len,
             prot: prot as u32,
-            flags: flags as u32,
+            flags: flags32,
             fd: vma_fd,
             offset: vma_offset,
         };
@@ -183,6 +240,118 @@ pub(crate) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, a5: u64) -
             -errno::ENOMEM
         }
     }
+}
+
+/// MAP_SHARED inner: map existing physical frames from a shmem object,
+/// incrementing refcounts.
+fn mmap_shared_inner(
+    pid: process::ProcessId,
+    addr: u64,
+    aligned_len: u64,
+    prot: u32,
+    flags: u32,
+    fixed: bool,
+    fd: usize,
+    offset: u64,
+    frames: &[x86_64::PhysAddr],
+) -> i64 {
+    use libkernel::process::Vma;
+    use libkernel::memory::with_memory;
+
+    let vma = Vma {
+        start: 0, // filled in below
+        len: aligned_len,
+        prot,
+        flags,
+        fd: Some(fd),
+        offset,
+    };
+    let pt_flags = vma.page_table_flags();
+
+    if fixed {
+        if addr == 0 || addr & PAGE_MASK != 0 {
+            return -errno::EINVAL;
+        }
+
+        let pml4_phys = match process::with_process_ref(pid, |p| p.pml4_phys) {
+            Some(v) => v,
+            None => return -errno::ENOMEM,
+        };
+
+        // Implicit munmap of overlapping VMAs.
+        let pages_to_free = process::with_process(pid, |p| {
+            p.munmap_vmas(addr, aligned_len)
+        }).unwrap_or_default();
+
+        if !pages_to_free.is_empty() {
+            with_memory(|mem| {
+                for (base, count) in &pages_to_free {
+                    for i in 0..*count {
+                        let vaddr = x86_64::VirtAddr::new(base + (i as u64) * PAGE_SIZE);
+                        mem.unmap_and_release_user_page(pml4_phys, vaddr, true);
+                    }
+                }
+            });
+        }
+
+        let ok = mmap_shared_pages(frames, addr, pml4_phys, pt_flags);
+        if ok {
+            let mut vma = vma;
+            vma.start = addr;
+            process::with_process(pid, |p| {
+                p.vma_map.insert(addr, vma);
+            });
+            addr as i64
+        } else {
+            -errno::ENOMEM
+        }
+    } else {
+        let (region_base, pml4_phys) = match process::with_process(pid, |p| {
+            p.find_mmap_gap(aligned_len).map(|base| (base, p.pml4_phys))
+        }) {
+            Some(Some(v)) => v,
+            _ => return -errno::ENOMEM,
+        };
+
+        let ok = mmap_shared_pages(frames, region_base, pml4_phys, pt_flags);
+        if ok {
+            let mut vma = vma;
+            vma.start = region_base;
+            process::with_process(pid, |p| {
+                p.vma_map.insert(region_base, vma);
+            });
+            region_base as i64
+        } else {
+            -errno::ENOMEM
+        }
+    }
+}
+
+/// Map existing physical frames into a process's page table, incrementing
+/// the reference count for each frame.
+fn mmap_shared_pages(
+    frames: &[x86_64::PhysAddr],
+    vaddr_base: u64,
+    pml4_phys: x86_64::PhysAddr,
+    flags: PageTableFlags,
+) -> bool {
+    use libkernel::memory::with_memory;
+
+    with_memory(|mem| {
+        for (i, &frame_phys) in frames.iter().enumerate() {
+            let page_vaddr = vaddr_base + (i as u64) * PAGE_SIZE;
+            if mem.map_user_page(
+                pml4_phys,
+                x86_64::VirtAddr::new(page_vaddr),
+                frame_phys,
+                flags,
+            ).is_err() {
+                return false;
+            }
+            mem.ref_share(frame_phys);
+        }
+        true
+    })
 }
 
 /// Allocate, zero (and optionally fill with file data), and map pages for mmap.
@@ -273,11 +442,13 @@ pub(crate) fn sys_munmap(addr: u64, length: u64) -> i64 {
         return 0;
     }
 
+    // Use refcount-aware release: shared frames are only freed when
+    // refcount reaches 0; non-shared frames are freed immediately.
     with_memory(|mem| {
         for (base, count) in &pages_to_free {
             for i in 0..*count {
                 let vaddr = x86_64::VirtAddr::new(base + (i as u64) * PAGE_SIZE);
-                mem.unmap_and_free_user_page(pml4_phys, vaddr, true);
+                mem.unmap_and_release_user_page(pml4_phys, vaddr, true);
             }
         }
     });

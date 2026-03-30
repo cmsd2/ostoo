@@ -9,6 +9,7 @@ use crate::channel::{ChannelInner, CloseRecvAction, CloseSendAction, PendingPort
 use crate::completion_port::CompletionPort;
 use crate::irq_handle::IrqInner;
 use crate::irq_mutex::IrqMutex;
+use crate::shmem::SharedMemInner;
 
 // ---------------------------------------------------------------------------
 // FD flags
@@ -48,6 +49,8 @@ pub enum FdObject {
     Irq(Arc<IrqMutex<IrqInner>>),
     /// An IPC channel endpoint (send or receive end).
     Channel(ChannelFd),
+    /// A shared memory object (for MAP_SHARED anonymous mappings).
+    SharedMem(Arc<SharedMemInner>),
 }
 
 impl Clone for FdObject {
@@ -57,6 +60,7 @@ impl Clone for FdObject {
             FdObject::Port(p) => FdObject::Port(p.clone()),
             FdObject::Irq(i) => FdObject::Irq(i.clone()),
             FdObject::Channel(c) => FdObject::Channel(c.clone()),
+            FdObject::SharedMem(s) => FdObject::SharedMem(s.clone()),
         }
     }
 }
@@ -72,6 +76,7 @@ impl FdObject {
                 ChannelFd::Send(inner) => inner.lock().dup_send(),
                 ChannelFd::Recv(inner) => inner.lock().dup_recv(),
             },
+            // SharedMem: Arc clone is sufficient, no extra bookkeeping.
             _ => {}
         }
     }
@@ -101,6 +106,8 @@ impl FdObject {
                     CloseRecvAction::NotifyPort(ps) => CloseResult::NotifySendPort(ps),
                 },
             },
+            // SharedMem: closing drops Arc ref; Drop impl handles frame release.
+            FdObject::SharedMem(_) => CloseResult::None,
         }
     }
 
@@ -132,6 +139,14 @@ impl FdObject {
     pub fn as_channel(&self) -> Option<&ChannelFd> {
         match self {
             FdObject::Channel(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Get the shared memory object, if this is a SharedMem.
+    pub fn as_shmem(&self) -> Option<&Arc<SharedMemInner>> {
+        match self {
+            FdObject::SharedMem(s) => Some(s),
             _ => None,
         }
     }

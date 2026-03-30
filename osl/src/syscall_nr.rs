@@ -45,3 +45,4 @@ pub const SYS_IRQ_CREATE: u64 = 504;
 pub const SYS_IPC_CREATE: u64 = 505;
 pub const SYS_IPC_SEND: u64 = 506;
 pub const SYS_IPC_RECV: u64 = 507;
+pub const SYS_SHMEM_CREATE: u64 = 508;

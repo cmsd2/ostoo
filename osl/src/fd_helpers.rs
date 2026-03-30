@@ -10,6 +10,7 @@ use libkernel::file::{FileHandle, FdObject};
 use libkernel::irq_handle::IrqInner;
 use libkernel::irq_mutex::IrqMutex;
 use libkernel::process;
+use libkernel::shmem::SharedMemInner;
 
 use crate::errno;
 
@@ -50,6 +51,20 @@ pub fn get_fd_irq(fd: usize) -> Result<Arc<IrqMutex<IrqInner>>, i64> {
     match process::with_process_ref(pid, |p| p.get_fd(fd)) {
         Some(Ok(obj)) => match obj.as_irq() {
             Some(i) => Ok(i.clone()),
+            None => Err(-errno::EBADF),
+        },
+        _ => Err(-errno::EBADF),
+    }
+}
+
+/// Get a `SharedMemInner` from the current process's fd table.
+///
+/// Returns `-EBADF` if the fd is invalid or refers to a non-shmem object.
+pub fn get_fd_shmem(fd: usize) -> Result<Arc<SharedMemInner>, i64> {
+    let pid = process::current_pid();
+    match process::with_process_ref(pid, |p| p.get_fd(fd)) {
+        Some(Ok(obj)) => match obj.as_shmem() {
+            Some(s) => Ok(s.clone()),
             None => Err(-errno::EBADF),
         },
         _ => Err(-errno::EBADF),

@@ -30,8 +30,8 @@ Adding a proper file descriptor layer enables:
                                        │
                          ┌─────────────┼──────────────┐
                          ▼             ▼              ▼
-                    ConsoleHandle  PipeWriter     (future: VfsHandle)
-                    → print!()     → PipeInner
+                    ConsoleHandle  PipeWriter     VfsHandle  SharedMem
+                    → print!()     → PipeInner    → VFS     → shmem frames
                                        ▲
                          ┌─────────────┘
                          │

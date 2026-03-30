@@ -152,6 +152,9 @@ are present, racing all event sources in a single future.
 - ELF loader for static x86-64 binaries; initial stack with `argc/argv/auxv`.
 - IPC channels with fd-passing (capability transfer) — syscalls 505–507.
   See [`docs/ipc-channels.md`](ipc-channels.md).
+- Shared memory via `shmem_create` (syscall 508) + `mmap(MAP_SHARED)` —
+  anonymous shared memory backed by reference-counted physical frames.
+  See [`docs/mmap-design.md`](mmap-design.md) Phase 5b.
 - Console input buffer with foreground PID routing and blocking `read(0)`.
 - Async-to-sync bridge (`osl/src/blocking.rs`) for VFS calls from syscall
   context.
@@ -406,9 +409,9 @@ output but functionally harmless.
 
 - Phase 3 (OP_IRQ_WAIT) is complete — see IRQ fd section above.
 - **Phase 4: OP_RING_WAIT** — shared-memory ring buffer wakeup notifications.
-  Blocked on mmap Phase 5 (`MAP_SHARED`).
+  `MAP_SHARED` prerequisite is now complete via `shmem_create`.
 - **Phase 5: Shared-memory SQ/CQ rings** — zero-syscall submission/completion
-  via userspace-mapped ring buffers.  Blocked on `MAP_SHARED`.
+  via userspace-mapped ring buffers.
 
 ### Memory Management
 
@@ -418,8 +421,10 @@ output but functionally harmless.
 2. **Reclaiming virtual address space** — replace `DumbVmemAllocator` with a
    proper free-list allocator so MMIO mappings can be released.
 
-3. **`MAP_SHARED`** — prerequisite for completion port Phases 4–5 and
-   microkernel Phase B.  See [`docs/mmap-design.md`](mmap-design.md) Phase 5.
+3. **File-backed `MAP_SHARED`** — anonymous shared memory (via
+   `shmem_create`) is complete; file-backed `MAP_SHARED` with inode page
+   cache remains future work.  See [`docs/mmap-design.md`](mmap-design.md)
+   Phase 5c.
 
 ### Process Model
 
@@ -445,8 +450,9 @@ output but functionally harmless.
 ### Microkernel Path
 
 8. **Microkernel Phase B** — kernel primitives for userspace drivers:
-   `MAP_SHARED`, device MMIO mapping, DMA syscalls.  IRQ fd is complete
-   (syscall 504 + OP_IRQ_WAIT).  Remaining items unblock userspace NIC driver.
+   device MMIO mapping, DMA syscalls.  IRQ fd (syscall 504 + OP_IRQ_WAIT)
+   and `MAP_SHARED` (via `shmem_create` 508) are complete.  Remaining items
+   unblock userspace NIC driver.
    See [`docs/microkernel-design.md`](microkernel-design.md).
 
 9. **Networking** — virtio-net driver + smoltcp TCP/IP stack.  The
