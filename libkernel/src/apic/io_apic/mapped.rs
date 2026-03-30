@@ -107,14 +107,14 @@ impl IoApic for MappedIoApic {
     unsafe fn read_reg_32(&self, index: IoApic32BitRegisterIndex) -> u32 {
         core::ptr::write_volatile(self.io_reg_sel_mut(), index.as_u32());
         let value = core::ptr::read_volatile(self.io_reg_win());
-        info!("[apic] read sel={:?} win={:?}", index.as_u32(), value);
+        trace!("[apic] read sel={:?} win={:?}", index.as_u32(), value);
         value
     }
 
     unsafe fn write_reg_32(&self, index: IoApic32BitRegisterIndex, value: u32) {
         core::ptr::write_volatile(self.io_reg_sel_mut(), index.as_u32());
         core::ptr::write_volatile(self.io_reg_win_mut(), value);
-        info!("[apic] write sel={:?} win={:?}", index.as_u32(), value);
+        trace!("[apic] write sel={:?} win={:?}", index.as_u32(), value);
     }
 
     unsafe fn read_reg_64(&self, index: IoApic64BitRegisterIndex) -> u64 {

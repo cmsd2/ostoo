@@ -111,6 +111,22 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
     libkernel::serial_println!("[execve] pid={} path={} entry={:#x} rsp={:#x} pml4={:#x}",
         pid.as_u64(), resolved, info.entry, user_rsp, new_pml4_phys.as_u64());
 
+    // Extract the last scalar we need from heap-allocated structures.
+    let entry_point = info.entry;
+
+    // Explicitly free all heap allocations before the diverging
+    // jump_to_userspace (-> !), which prevents automatic Drop from running.
+    drop(argv_refs);
+    drop(envp_refs);
+    drop(argv_slices);
+    drop(envp_slices);
+    drop(argv);
+    drop(envp);
+    drop(path);
+    drop(resolved);
+    drop(elf_data);
+    drop(info);
+
     // 10. Jump to new userspace — never returns.
     let user_cs = libkernel::gdt::user_code_selector().0 as u64;
     let user_ss = libkernel::gdt::user_data_selector().0 as u64;
@@ -127,7 +143,7 @@ pub fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
 
     unsafe {
         scheduler::jump_to_userspace(
-            info.entry, user_rsp, new_pml4_phys.as_u64(),
+            entry_point, user_rsp, new_pml4_phys.as_u64(),
             user_cs, user_ss, per_cpu, 0, 0,
         );
     }

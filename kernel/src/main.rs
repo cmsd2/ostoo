@@ -395,7 +395,10 @@ fn init_actors() {
 async fn timer_task() {
     loop {
         Delay::from_secs(1).await;
-        info!("[timer] tick: {}s elapsed", ticks() / libkernel::task::timer::TICKS_PER_SECOND);
+        let (used, free) = libkernel::allocator::heap_stats();
+        info!("[timer] tick: {}s elapsed | heap: {}K used, {}K free",
+            ticks() / libkernel::task::timer::TICKS_PER_SECOND,
+            used / 1024, free / 1024);
     }
 }
 

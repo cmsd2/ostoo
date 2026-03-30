@@ -112,6 +112,19 @@ impl Scheduler {
             ready_queue: VecDeque::new(),
         }
     }
+
+    /// Find a Dead slot to reuse, or push a new entry. Returns the index.
+    fn alloc_thread_slot(&mut self, thread: Thread) -> usize {
+        // Skip slot 0 (boot thread) — always kept.
+        if let Some(idx) = self.threads.iter().position(|t| t.state == ThreadState::Dead) {
+            self.threads[idx] = thread;
+            idx
+        } else {
+            let idx = self.threads.len();
+            self.threads.push(thread);
+            idx
+        }
+    }
 }
 
 static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
@@ -337,8 +350,7 @@ pub fn spawn_thread(entry: fn() -> !) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut sched = SCHEDULER.lock();
         let id = ThreadId::new();
-        let idx = sched.threads.len();
-        sched.threads.push(Thread {
+        let idx = sched.alloc_thread_slot(Thread {
             id,
             state: ThreadState::Ready,
             saved_rsp,
@@ -390,8 +402,7 @@ pub fn spawn_user_thread(pid: ProcessId, pml4_phys: x86_64::PhysAddr) -> usize {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut sched = SCHEDULER.lock();
         let id = ThreadId::new();
-        let idx = sched.threads.len();
-        sched.threads.push(Thread {
+        let idx = sched.alloc_thread_slot(Thread {
             id,
             state: ThreadState::Ready,
             saved_rsp,
@@ -449,8 +460,7 @@ pub fn spawn_clone_thread(
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut sched = SCHEDULER.lock();
         let id = ThreadId::new();
-        let idx = sched.threads.len();
-        sched.threads.push(Thread {
+        let idx = sched.alloc_thread_slot(Thread {
             id,
             state: ThreadState::Ready,
             saved_rsp,
