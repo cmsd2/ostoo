@@ -14,13 +14,15 @@ DEPLOY_DIR="$PROJECT_DIR/user/bin"
 cd "$USER_RS_DIR"
 
 # Build packages separately to avoid Cargo feature unification:
-# hello-rs uses ostoo-rt with no_std (default), hello-std uses it without.
-cargo build --release -p hello-rs "$@"
+# hello-rs/compositor/demo-client use ostoo-rt with no_std (default),
+# hello-std uses it without.
+cargo build --release -p hello-rs -p compositor -p demo-client "$@"
 cargo build --release -p hello-std "$@"
 
 # Deploy binaries (skip the runtime library).
 mkdir -p "$DEPLOY_DIR"
-for bin in "$TARGET_DIR"/hello-rs "$TARGET_DIR"/hello-std; do
+for bin in "$TARGET_DIR"/hello-rs "$TARGET_DIR"/hello-std \
+           "$TARGET_DIR"/compositor "$TARGET_DIR"/demo-client; do
     if [ -f "$bin" ] && file "$bin" | grep -q "ELF"; then
         name=$(basename "$bin")
         cp "$bin" "$DEPLOY_DIR/$name"

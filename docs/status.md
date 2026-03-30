@@ -145,7 +145,8 @@ are present, racing all event sources in a single future.
 
 ### User Space and Process Isolation
 - Full ring-3 process support with per-process page tables, SYSCALL/SYSRET,
-  and preemptive scheduling.
+  and preemptive scheduling.  Process exit and `execve` properly free user-half
+  page tables and data frames (with refcount-aware shared frame handling).
 - 35+ Linux-compatible syscalls in `osl/src/syscalls/`.
 - Per-process FD table, CWD tracking, parent/child relationships, zombie
   lifecycle with `wait4`/`reap`.
@@ -469,6 +470,19 @@ output but functionally harmless.
 
 7. **exFAT write support** — directory entry creation, FAT chain allocation,
    and sector writes to enable `touch`, `mkdir`, `cp`, `rm`.
+
+### Compositor
+
+10. **Userspace compositor** — Wayland-style display server that takes ownership
+    of the BGA framebuffer.  Three new syscalls: `svc_register` (513) and
+    `svc_lookup` (514) for kernel-global service discovery, and
+    `framebuffer_open` (515) to expose the LFB as a shared-memory fd.
+    Clients connect via IPC fd-passing on a well-known service name, receive
+    shared-memory pixel buffers, and signal damage via notification fds.
+    The compositor composites all windows to the LFB using a painter's
+    algorithm.  MVP: window creation, buffer alloc, damage, compositing.
+    No input routing or window management yet.
+    See [`docs/compositor-design.md`](compositor-design.md).
 
 ### Microkernel Path
 

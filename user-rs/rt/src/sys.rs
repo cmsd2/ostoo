@@ -22,6 +22,9 @@ pub const SYS_NOTIFY_CREATE: u64 = 509;
 pub const SYS_NOTIFY: u64 = 510;
 pub const SYS_IO_SETUP_RINGS: u64 = 511;
 pub const SYS_IO_RING_ENTER: u64 = 512;
+pub const SYS_SVC_REGISTER: u64 = 513;
+pub const SYS_SVC_LOOKUP: u64 = 514;
+pub const SYS_FRAMEBUFFER_OPEN: u64 = 515;
 
 // ---- Opcodes (must match libkernel/src/completion_port.rs) ----
 
@@ -239,4 +242,22 @@ pub fn io_ring_enter(port_fd: i32, to_submit: u32, min_complete: u32, flags: u32
             flags as u64,
         )
     }
+}
+
+pub fn svc_register(name: &[u8], fd: i32) -> i64 {
+    unsafe {
+        syscall::syscall2(
+            SYS_SVC_REGISTER,
+            name.as_ptr() as u64,
+            fd as u64,
+        )
+    }
+}
+
+pub fn svc_lookup(name: &[u8]) -> i64 {
+    unsafe { syscall::syscall1(SYS_SVC_LOOKUP, name.as_ptr() as u64) }
+}
+
+pub fn framebuffer_open(flags: u32) -> i64 {
+    unsafe { syscall::syscall1(SYS_FRAMEBUFFER_OPEN, flags as u64) }
 }

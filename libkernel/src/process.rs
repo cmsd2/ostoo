@@ -626,8 +626,21 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) -> ! {
     });
     if let Some((pml4_phys, shared)) = cleanup_info {
         if !shared && pml4_phys.as_u64() != 0 {
+            // Switch to the kernel PML4 BEFORE freeing the process's page
+            // table.  The frame allocator uses an intrusive free-list that
+            // overwrites freed frames immediately; if CR3 still references
+            // the freed PML4 when the scheduler reschedules this thread,
+            // the TLB refill would read garbage → triple fault.
+            let kernel_pml4 = crate::memory::kernel_pml4_phys();
+            crate::task::scheduler::set_current_cr3(kernel_pml4);
+            unsafe {
+                crate::memory::switch_address_space(
+                    x86_64::PhysAddr::new(kernel_pml4),
+                );
+            }
             crate::memory::with_memory(|mem| {
-                mem.cleanup_user_address_space(pml4_phys, true);
+                // flush_tlb=false: the CR3 write above already flushed.
+                mem.cleanup_user_address_space(pml4_phys, false);
             });
         }
     }

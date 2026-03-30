@@ -32,6 +32,9 @@
 #define SYS_NOTIFY          510
 #define SYS_IO_SETUP_RINGS  511
 #define SYS_IO_RING_ENTER   512
+#define SYS_SVC_REGISTER    513
+#define SYS_SVC_LOOKUP      514
+#define SYS_FRAMEBUFFER_OPEN 515
 
 /* ═══════════════════════════════════════════════════════════════════════
  * Completion port opcodes (must match libkernel/src/completion_port.rs)
@@ -135,6 +138,9 @@ long notify_signal(int fd);
 long io_setup_rings(int port_fd, struct io_ring_params *params);
 long io_ring_enter(int port_fd, unsigned int to_submit,
                    unsigned int min_complete, unsigned int flags);
+long svc_register(const char *name, int fd);
+long svc_lookup(const char *name);
+long framebuffer_open(unsigned int flags);
 
 /* ═══════════════════════════════════════════════════════════════════════
  * Output helpers

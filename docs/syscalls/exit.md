@@ -17,22 +17,32 @@ Both are handled identically in ostoo since each process currently has exactly o
 ## Current Implementation
 
 1. Looks up the current PID.
-2. If it's a user process (not `ProcessId::KERNEL`):
+2. If it's a user process (not `ProcessId::KERNEL`), calls `terminate_process`:
    - Logs `pid N exited with code C` to serial.
    - **Unblocks vfork parent:** If this process was created by `clone(CLONE_VFORK)` and has not yet called `execve`, unblocks the parent thread so it can resume. Clears `vfork_parent_thread`.
-   - Reads the process's `parent_pid` (separate lock acquisition).
-   - Marks the process as a zombie via `mark_zombie(pid, code)`.
-   - Checks if the parent process has a `wait_thread` set (meaning it's blocked in `waitpid`). If so, calls `scheduler::unblock()` to wake the parent.
-3. If it's a kernel thread: prints a halt message.
-4. Calls `kill_current_thread()`, which marks the scheduler thread as `Dead` and spins until the timer preempts it. The thread is never re-queued.
+   - **Closes all fds:** Releases IRQ handles, completion ports, pipes, channels, etc. while the process's page tables are still active.
+   - **Frees user address space:** Switches CR3 to the kernel boot PML4 and updates the scheduler's thread record, then frees all user-half page tables and data frames via `cleanup_user_address_space`. Skipped for `CLONE_VM` children (shared PML4 still used by parent).
+   - **Marks zombie:** Sets the process state to `Zombie` with the exit code.
+   - **Wakes parent:** Queues `SIGCHLD` and unblocks the parent's `wait_thread` if set.
+   - **Yields + dies:** Donates remaining quantum to the parent, calls `yield_now()`, then `kill_current_thread()` marks the thread as `Dead`.
+3. If it's a kernel thread: prints a halt message and calls `kill_current_thread()`.
 
 Zombie processes are reaped by `waitpid` (when a parent collects exit status) or lazily by `reap_zombies()` at the start of `spawn_process`.
 
-**Source:** `osl/src/syscalls/process.rs` — `sys_exit`
+**Source:** `osl/src/syscalls/process.rs` — `sys_exit`, `libkernel/src/process.rs` — `terminate_process`
+
+### CR3 safety on exit
+
+The process's PML4 frame must not be freed while CR3 still references it.
+The frame allocator uses an intrusive free-list that overwrites the first 8
+bytes of freed frames immediately; if the scheduler later reschedules the
+dying thread (before `kill_current_thread` runs), a TLB refill through the
+corrupted PML4 would triple-fault.  `terminate_process` therefore switches
+to the kernel boot PML4 (stored in `KERNEL_PML4_PHYS` during
+`memory::init_services`) and updates the scheduler via `set_current_cr3`
+before calling `cleanup_user_address_space`.
 
 ## Future Work
 
 - Properly distinguish `exit` (single thread) from `exit_group` (all threads) once multi-threaded processes are supported.
-- Free user-space page tables and physical frames on process exit (currently leaked).
-- Signal handling (SIGCHLD to parent).
-- Close all open file descriptors on exit.
+- Service auto-cleanup: remove service registry entries on process exit.

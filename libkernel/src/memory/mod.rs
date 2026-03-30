@@ -50,6 +50,17 @@ const MMIO_VIRT_SIZE: u64 = 0x0000_0080_0000_0000;
 
 static PHYS_MEM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
+/// Physical address of the kernel's boot PML4.
+///
+/// Set once during `init_services`.  Used by `terminate_process` to switch
+/// away from a dying process's page table before freeing it.
+static KERNEL_PML4_PHYS: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the physical address of the kernel's boot PML4.
+pub fn kernel_pml4_phys() -> u64 {
+    KERNEL_PML4_PHYS.load(Ordering::Acquire)
+}
+
 /// Returns the virtual address at which all physical memory is linearly mapped.
 /// Returns 0 if called before `init_services`.
 pub fn phys_mem_offset() -> u64 {
@@ -537,6 +548,13 @@ pub fn init_services(
     memory_map: &'static MemoryMap,
 ) {
     PHYS_MEM_OFFSET.store(phys_mem_offset.as_u64(), Ordering::Relaxed);
+
+    // Save the kernel boot PML4 physical address.
+    {
+        use x86_64::registers::control::Cr3;
+        let (frame, _) = Cr3::read();
+        KERNEL_PML4_PHYS.store(frame.start_address().as_u64(), Ordering::Release);
+    }
 
     // Copy the MemoryMap from its bootloader-provided location (which may be
     // in the lower-half virtual address space) onto the kernel heap (high-half).

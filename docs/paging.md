@@ -141,25 +141,34 @@ from the kernel PML4 — without `USER_ACCESSIBLE` — at process creation time.
 
 ---
 
-## Per-Process Page Tables (future)
+## Per-Process Page Tables
 
-Each process gets its own PML4 with:
+Each process gets its own PML4, created by `MemoryServices::create_user_page_table`:
 
 - **Slot 511**: self-referential entry pointing to the process's own PML4 physical
   frame (required for `RecursivePageTable` to work per-process).
-- **Slots 256–510**: shared kernel mappings (heap, APIC, MMIO window), copied
-  from the kernel PML4 without `USER_ACCESSIBLE`.  These are high-half addresses,
-  never accessible from ring-3.
+- **Slots 256–510**: shared kernel mappings (heap, APIC, MMIO window, physical
+  memory direct map), copied verbatim from the active PML4.  These are high-half
+  addresses, never accessible from ring-3.  Because the PML4 entries point to the
+  same PDPT/PD/PT frames, changes to kernel page tables at levels below PML4 are
+  automatically visible in all address spaces.
 - **Slots 0–255**: process-private user-space mappings.  The process's code,
   stack, heap, and memory-mapped files live here.
-
-The bootloader identity-map entries (slots 0–255 of the kernel PML4, wherever
-`phys_mem_offset` places them) are copied into each process PML4 as well, but
-without `USER_ACCESSIBLE`, so they are kernel-only.
 
 Switching between processes requires only a `mov cr3, new_pml4_phys` — the
 kernel's high-half mappings are identical in every page table so no TLB flush is
 needed for kernel entries (on CPUs with PCID support).
+
+### PML4 lifecycle
+
+User PML4s and their lower-half page table frames are freed when a process
+exits (`terminate_process`) or replaces its address space (`execve`).  The
+kernel boot PML4 physical address is stored in `KERNEL_PML4_PHYS` (set during
+`init_services`).  Before freeing a user PML4, the dying/exec'ing code
+switches CR3 and the scheduler's thread record to the kernel PML4.  This is
+critical because the frame allocator uses an intrusive free-list that
+overwrites freed frames immediately — leaving CR3 pointing at a freed PML4
+would cause a triple fault on the next TLB refill.
 
 ---
 

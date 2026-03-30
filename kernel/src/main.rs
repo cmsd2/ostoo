@@ -148,6 +148,7 @@ fn run_kernel() -> ! {
     executor::spawn(Task::new(timer_task()));
     executor::spawn(Task::new(status_task()));
     executor::spawn(Task::new(launch_userspace_shell()));
+    executor::spawn(Task::new(launch_compositor()));
 
     scheduler::init();
     scheduler::spawn_thread(|| executor::run_worker());
@@ -224,6 +225,9 @@ fn init_bga_framebuffer() {
         "[kernel] BGA LFB at phys {:#x}, mapping {} bytes",
         lfb_phys, lfb_size
     );
+
+    // Store LFB physical address for the framebuffer_open syscall.
+    framebuffer::set_lfb_phys(lfb_phys, lfb_size as u64);
 
     // Map the LFB into kernel virtual address space.
     let lfb_virt = libkernel::memory::with_memory(|mem| {
@@ -445,6 +449,33 @@ async fn launch_userspace_shell() {
     >("shell") {
         use libkernel::task::mailbox::ActorMsg;
         inbox.send(ActorMsg::Inner(shell::ShellMsg::Reprompt));
+    }
+}
+
+/// Launch the userspace compositor (if present at /bin/compositor).
+async fn launch_compositor() {
+    Delay::from_millis(200).await; // let VFS and shell settle
+
+    let data = match devices::vfs::read_file("/bin/compositor", libkernel::process::ProcessId::KERNEL).await {
+        Ok(d) => d,
+        Err(_) => {
+            info!("[kernel] /bin/compositor not found, skipping");
+            return;
+        }
+    };
+
+    let env: &[&[u8]] = &[
+        b"PATH=/host/bin",
+        b"HOME=/",
+        b"TERM=dumb",
+    ];
+    match ring3::spawn_process_with_env(&data, env) {
+        Ok(pid) => {
+            info!("[kernel] launched compositor as pid {}", pid.as_u64());
+        }
+        Err(e) => {
+            warn!("[kernel] failed to spawn compositor: {}", e);
+        }
     }
 }
 

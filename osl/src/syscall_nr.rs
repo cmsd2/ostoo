@@ -50,3 +50,6 @@ pub const SYS_NOTIFY_CREATE: u64 = 509;
 pub const SYS_NOTIFY: u64 = 510;
 pub const SYS_IO_SETUP_RINGS: u64 = 511;
 pub const SYS_IO_RING_ENTER: u64 = 512;
+pub const SYS_SVC_REGISTER: u64 = 513;
+pub const SYS_SVC_LOOKUP: u64 = 514;
+pub const SYS_FRAMEBUFFER_OPEN: u64 = 515;

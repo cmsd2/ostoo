@@ -98,6 +98,11 @@ impl IpcSend {
         self.fd
     }
 
+    /// Wrap a raw fd received via IPC fd-passing.
+    pub fn from_raw_fd(fd: i32) -> Self {
+        IpcSend { fd }
+    }
+
     pub fn send(&self, msg: &sys::IpcMessage, flags: u32) -> Result<(), OsError> {
         check(sys::ipc_send(self.fd, msg, flags))?;
         Ok(())
@@ -113,6 +118,11 @@ impl Drop for IpcSend {
 impl IpcRecv {
     pub fn fd(&self) -> i32 {
         self.fd
+    }
+
+    /// Wrap a raw fd received via IPC fd-passing.
+    pub fn from_raw_fd(fd: i32) -> Self {
+        IpcRecv { fd }
     }
 
     pub fn recv(&self, flags: u32) -> Result<sys::IpcMessage, OsError> {
@@ -201,6 +211,11 @@ impl NotifyFd {
     pub fn new(flags: u32) -> Result<Self, OsError> {
         let fd = check(sys::notify_create(flags))? as i32;
         Ok(NotifyFd { fd })
+    }
+
+    /// Wrap a raw fd received via IPC fd-passing.
+    pub fn from_raw_fd(fd: i32) -> Self {
+        NotifyFd { fd }
     }
 
     pub fn fd(&self) -> i32 {
@@ -412,6 +427,90 @@ impl Drop for IoRing {
         syscall::close(self.sq_fd as u32);
         syscall::close(self.cq_fd as u32);
         // port dropped automatically via CompletionPort::drop
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Service Registry
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Register a file descriptor under a well-known service name.
+///
+/// `name` must be a null-terminated byte string (e.g. `b"compositor\0"`).
+pub fn service_register(name: &[u8], fd: i32) -> Result<(), OsError> {
+    check(sys::svc_register(name, fd))?;
+    Ok(())
+}
+
+/// Look up a service by name and get a file descriptor to it.
+///
+/// `name` must be a null-terminated byte string.
+pub fn service_lookup(name: &[u8]) -> Result<i32, OsError> {
+    let fd = check(sys::svc_lookup(name))? as i32;
+    Ok(fd)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// FramebufferMem
+// ═══════════════════════════════════════════════════════════════════════
+
+/// RAII wrapper for the framebuffer shared-memory fd.
+pub struct FramebufferMem {
+    fd: i32,
+    size: usize,
+}
+
+impl FramebufferMem {
+    /// Open the BGA linear framebuffer as a shared-memory fd.
+    pub fn open() -> Result<Self, OsError> {
+        let fd = check(sys::framebuffer_open(0))? as i32;
+        // 1024 * 768 * 4 = 3145728
+        let size = 1024 * 768 * 4;
+        Ok(FramebufferMem { fd, size })
+    }
+
+    pub fn fd(&self) -> i32 {
+        self.fd
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Map the framebuffer into the address space.
+    pub fn mmap(&self) -> Result<*mut u8, OsError> {
+        const SYS_MMAP: u64 = 9;
+        const PROT_READ: u64 = 1;
+        const PROT_WRITE: u64 = 2;
+        const MAP_SHARED: u64 = 0x01;
+        let ret = unsafe {
+            syscall::syscall6(
+                SYS_MMAP,
+                0,
+                self.size as u64,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED,
+                self.fd as u64,
+                0,
+            )
+        };
+        if ret < 0 {
+            return Err(OsError(ret));
+        }
+        Ok(ret as *mut u8)
+    }
+}
+
+impl Drop for FramebufferMem {
+    fn drop(&mut self) {
+        syscall::close(self.fd as u32);
+    }
+}
+
+impl SharedMem {
+    /// Wrap an existing fd as a SharedMem (e.g. one received via IPC fd-passing).
+    pub fn from_fd(fd: i32, size: usize) -> Self {
+        SharedMem { fd, size }
     }
 }
 

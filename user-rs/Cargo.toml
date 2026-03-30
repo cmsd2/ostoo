@@ -1,5 +1,5 @@
 [workspace]
-members = ["rt", "hello-rs", "hello-std"]
+members = ["rt", "hello-rs", "hello-std", "compositor", "demo-client"]
 resolver = "2"
 
 [profile.release]

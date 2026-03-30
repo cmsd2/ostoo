@@ -9,7 +9,27 @@
 //! by the caller in `kernel/src/main.rs` via `devices::pci`, keeping `libkernel`
 //! free of a `devices` dependency.
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::port::Port;
+
+// ---------------------------------------------------------------------------
+// LFB physical address (set during boot, read by framebuffer_open syscall)
+
+static LFB_PHYS_ADDR: AtomicU64 = AtomicU64::new(0);
+static LFB_PHYS_SIZE: AtomicU64 = AtomicU64::new(0);
+
+/// Store the LFB physical address and size. Called once during BGA init.
+pub fn set_lfb_phys(addr: u64, size: u64) {
+    LFB_PHYS_ADDR.store(addr, Ordering::Release);
+    LFB_PHYS_SIZE.store(size, Ordering::Release);
+}
+
+/// Retrieve the LFB physical address and size, or `None` if BGA not initialized.
+pub fn get_lfb_phys() -> Option<(u64, u64)> {
+    let addr = LFB_PHYS_ADDR.load(Ordering::Acquire);
+    let size = LFB_PHYS_SIZE.load(Ordering::Acquire);
+    if addr == 0 { None } else { Some((addr, size)) }
+}
 
 // ---------------------------------------------------------------------------
 // BGA I/O ports

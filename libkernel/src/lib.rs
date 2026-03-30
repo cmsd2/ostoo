@@ -49,6 +49,7 @@ pub mod framebuffer;
 pub mod font;
 pub mod shmem;
 pub mod notify;
+pub mod service;
 
 pub fn init() {
     cpuid::init();

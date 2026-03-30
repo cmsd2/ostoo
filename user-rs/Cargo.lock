@@ -3,6 +3,20 @@
 version = 4
 
 [[package]]
+name = "compositor"
+version = "0.1.0"
+dependencies = [
+ "ostoo-rt",
+]
+
+[[package]]
+name = "demo-client"
+version = "0.1.0"
+dependencies = [
+ "ostoo-rt",
+]
+
+[[package]]
 name = "hello-rs"
 version = "0.1.0"
 dependencies = [

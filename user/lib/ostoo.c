@@ -62,6 +62,18 @@ long io_ring_enter(int port_fd, unsigned int to_submit,
     return syscall(SYS_IO_RING_ENTER, port_fd, to_submit, min_complete, flags);
 }
 
+long svc_register(const char *name, int fd) {
+    return syscall(SYS_SVC_REGISTER, name, fd);
+}
+
+long svc_lookup(const char *name) {
+    return syscall(SYS_SVC_LOOKUP, name);
+}
+
+long framebuffer_open(unsigned int flags) {
+    return syscall(SYS_FRAMEBUFFER_OPEN, flags);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
  * Output helpers
  * ═══════════════════════════════════════════════════════════════════════ */
