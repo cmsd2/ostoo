@@ -10,6 +10,7 @@ use libkernel::file::{FileHandle, FdObject};
 use libkernel::irq_handle::IrqInner;
 use libkernel::irq_mutex::IrqMutex;
 use libkernel::process;
+use libkernel::notify::NotifyInner;
 use libkernel::shmem::SharedMemInner;
 
 use crate::errno;
@@ -65,6 +66,20 @@ pub fn get_fd_shmem(fd: usize) -> Result<Arc<SharedMemInner>, i64> {
     match process::with_process_ref(pid, |p| p.get_fd(fd)) {
         Some(Ok(obj)) => match obj.as_shmem() {
             Some(s) => Ok(s.clone()),
+            None => Err(-errno::EBADF),
+        },
+        _ => Err(-errno::EBADF),
+    }
+}
+
+/// Get a `NotifyInner` handle from the current process's fd table.
+///
+/// Returns `-EBADF` if the fd is invalid or refers to a non-notify object.
+pub fn get_fd_notify(fd: usize) -> Result<Arc<IrqMutex<NotifyInner>>, i64> {
+    let pid = process::current_pid();
+    match process::with_process_ref(pid, |p| p.get_fd(fd)) {
+        Some(Ok(obj)) => match obj.as_notify() {
+            Some(n) => Ok(n.clone()),
             None => Err(-errno::EBADF),
         },
         _ => Err(-errno::EBADF),

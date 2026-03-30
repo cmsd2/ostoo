@@ -85,6 +85,8 @@
 - [ipc_send (506)](syscalls/ipc_send.md)
 - [ipc_recv (507)](syscalls/ipc_recv.md)
 - [shmem_create (508)](syscalls/shmem_create.md)
+- [notify_create (509)](syscalls/notify_create.md)
+- [notify (510)](syscalls/notify.md)
 
 # Userspace
 

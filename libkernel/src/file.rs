@@ -9,6 +9,7 @@ use crate::channel::{ChannelInner, CloseRecvAction, CloseSendAction, PendingPort
 use crate::completion_port::CompletionPort;
 use crate::irq_handle::IrqInner;
 use crate::irq_mutex::IrqMutex;
+use crate::notify::NotifyInner;
 use crate::shmem::SharedMemInner;
 
 // ---------------------------------------------------------------------------
@@ -51,6 +52,8 @@ pub enum FdObject {
     Channel(ChannelFd),
     /// A shared memory object (for MAP_SHARED anonymous mappings).
     SharedMem(Arc<SharedMemInner>),
+    /// A notification fd for inter-process signaling (OP_RING_WAIT).
+    Notify(Arc<IrqMutex<NotifyInner>>),
 }
 
 impl Clone for FdObject {
@@ -61,6 +64,7 @@ impl Clone for FdObject {
             FdObject::Irq(i) => FdObject::Irq(i.clone()),
             FdObject::Channel(c) => FdObject::Channel(c.clone()),
             FdObject::SharedMem(s) => FdObject::SharedMem(s.clone()),
+            FdObject::Notify(n) => FdObject::Notify(n.clone()),
         }
     }
 }
@@ -76,7 +80,7 @@ impl FdObject {
                 ChannelFd::Send(inner) => inner.lock().dup_send(),
                 ChannelFd::Recv(inner) => inner.lock().dup_recv(),
             },
-            // SharedMem: Arc clone is sufficient, no extra bookkeeping.
+            // SharedMem, Notify: Arc clone is sufficient, no extra bookkeeping.
             _ => {}
         }
     }
@@ -108,6 +112,8 @@ impl FdObject {
             },
             // SharedMem: closing drops Arc ref; Drop impl handles frame release.
             FdObject::SharedMem(_) => CloseResult::None,
+            // Notify: pending registration dropped with the Arc.
+            FdObject::Notify(_) => CloseResult::None,
         }
     }
 
@@ -147,6 +153,14 @@ impl FdObject {
     pub fn as_shmem(&self) -> Option<&Arc<SharedMemInner>> {
         match self {
             FdObject::SharedMem(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Get the notification inner, if this is a Notify.
+    pub fn as_notify(&self) -> Option<&Arc<IrqMutex<NotifyInner>>> {
+        match self {
+            FdObject::Notify(n) => Some(n),
             _ => None,
         }
     }

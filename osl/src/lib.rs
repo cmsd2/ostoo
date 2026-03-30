@@ -11,6 +11,7 @@ pub mod fd_helpers;
 pub mod file;
 pub mod io_port;
 pub mod ipc;
+pub mod notify;
 pub mod irq;
 pub mod signal;
 pub mod spawn;

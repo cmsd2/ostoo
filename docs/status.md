@@ -155,6 +155,9 @@ are present, racing all event sources in a single future.
 - Shared memory via `shmem_create` (syscall 508) + `mmap(MAP_SHARED)` —
   anonymous shared memory backed by reference-counted physical frames.
   See [`docs/mmap-design.md`](mmap-design.md) Phase 5b.
+- Notification fds via `notify_create` (509) + `notify` (510) — general-
+  purpose inter-process signaling through completion ports (`OP_RING_WAIT`).
+  See [`docs/completion-port-design.md`](completion-port-design.md) Phase 4.
 - Console input buffer with foreground PID routing and blocking `read(0)`.
 - Async-to-sync bridge (`osl/src/blocking.rs`) for VFS calls from syscall
   context.
@@ -407,11 +410,11 @@ output but functionally harmless.
 
 ### Completion Port Phases 4–5 (blocked on prerequisites)
 
-- Phase 3 (OP_IRQ_WAIT) is complete — see IRQ fd section above.
-- **Phase 4: OP_RING_WAIT** — shared-memory ring buffer wakeup notifications.
-  `MAP_SHARED` prerequisite is now complete via `shmem_create`.
+- Phases 3–4 (OP_IRQ_WAIT, OP_RING_WAIT) are complete — see IRQ fd and
+  notification fd sections above.
 - **Phase 5: Shared-memory SQ/CQ rings** — zero-syscall submission/completion
-  via userspace-mapped ring buffers.
+  via userspace-mapped ring buffers.  All prerequisites (MAP_SHARED,
+  notification fds) are now satisfied.
 
 ### Memory Management
 

@@ -46,3 +46,5 @@ pub const SYS_IPC_CREATE: u64 = 505;
 pub const SYS_IPC_SEND: u64 = 506;
 pub const SYS_IPC_RECV: u64 = 507;
 pub const SYS_SHMEM_CREATE: u64 = 508;
+pub const SYS_NOTIFY_CREATE: u64 = 509;
+pub const SYS_NOTIFY: u64 = 510;

@@ -11,6 +11,7 @@ use core::task::{Context, Poll};
 use libkernel::completion_port::{
     CompletionPort, Completion,
     OP_NOP, OP_TIMEOUT, OP_READ, OP_WRITE, OP_IRQ_WAIT, OP_IPC_RECV, OP_IPC_SEND,
+    OP_RING_WAIT,
 };
 use libkernel::irq_mutex::IrqMutex;
 use libkernel::channel::{ArmRecvAction, ArmSendAction, EnvelopedMessage, IpcMessage, PendingPortRecv, PendingPortSend};
@@ -586,6 +587,27 @@ pub fn sys_io_submit(port_fd: i32, entries_ptr: u64, count: u32) -> i64 {
                         });
                     }
                 }
+            }
+
+            OP_RING_WAIT => {
+                let notify = match fd_helpers::get_fd_notify(sub.fd as usize) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        port.lock().post(Completion {
+                            user_data: sub.user_data,
+                            result: -errno::EBADF,
+                            flags: 0,
+                            opcode: OP_RING_WAIT,
+                            read_buf: None,
+                            read_dest: 0,
+                            transfer_fds: None,
+                        });
+                        processed += 1;
+                        continue;
+                    }
+                };
+                // Arm: register port + user_data, or satisfy immediately if notified.
+                libkernel::notify::arm_notify(&notify, port.clone(), sub.user_data);
             }
 
             _ => {

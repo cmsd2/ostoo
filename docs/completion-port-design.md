@@ -249,7 +249,7 @@ Total size: 24 bytes.
 | 4 | `OP_IRQ_WAIT` | Wait for interrupt on IRQ fd. | Implemented |
 | 5 | `OP_IPC_SEND` | Send a message through an IPC channel. | Implemented |
 | 6 | `OP_IPC_RECV` | Receive a message from an IPC channel. | Implemented |
-| 7 | `OP_RING_WAIT` | Wait for shared-memory ring wakeup. | Future |
+| 7 | `OP_RING_WAIT` | Wait for notification fd signal. | Implemented |
 
 ### OP_NOP (0)
 
@@ -323,17 +323,25 @@ table) is copied to `buf_addr` during `io_wait`.
 
 See [ipc-channels.md](ipc-channels.md) for full details.
 
-### OP_RING_WAIT (7) — Future
+### OP_RING_WAIT (7) — **Implemented**
 
-Waits for a shared-memory ring buffer to transition from empty to non-empty.
+Waits for a notification fd to be signaled.
 
-- `fd` must be a shared-memory ring fd.
+- `fd` must be a notification fd (from `notify_create`, syscall 509).
 - `result` = 0 on wakeup, or negative errno.
 
-Implementation: the ring's producer-side syscall (`io_ring_notify` or a
-futex-like mechanism) calls `port.post()`.  No worker thread needed.
+Implementation: the consumer submits `OP_RING_WAIT` via `io_submit`.  The
+kernel stores the port + user_data on the `NotifyInner` object.  When the
+producer calls `notify(fd)` (syscall 510), the kernel posts a completion
+to the port.  No worker thread needed — the syscall posts directly.
 
-Requires shared memory support ([mmap-design.md](mmap-design.md), Phase 5).
+Edge-triggered, one-shot: one `notify()` → one completion.  Consumer must
+re-submit `OP_RING_WAIT` to rearm.  If `notify()` is called before
+`OP_RING_WAIT` is armed, the notification is buffered (coalesced).
+
+The notification fd is a general-purpose signaling primitive, not tied to
+any specific ring buffer format.  The kernel does not inspect ring buffer
+contents — it simply provides the signal/wait mechanism.
 
 ---
 
@@ -645,16 +653,17 @@ model.
 | **Delivers** | Submit OP_IPC_SEND/RECV on channel fds, completions posted when message delivered/received. Supports fd-passing: transferred fds installed in receiver during `io_wait`. |
 | **Test** | `user/ipc_port.c`: IPC send/recv multiplexed with timers via completion port. `user/ipc_fdpass.c`: fd-passing through IPC channels. |
 
-### Phase 4: OP_RING_WAIT
+### Phase 4: OP_RING_WAIT — **Implemented**
 
-**Goal:** Shared-memory ring buffer wakeup through the completion port.
+**Goal:** Inter-process signaling through the completion port via
+notification fds.
 
 | Item | Detail |
 |---|---|
-| **Files** | `osl/src/io_port.rs` (OP_RING_WAIT handler), new ring wakeup primitive |
-| **Dependencies** | Phase 1; shared memory ([mmap-design.md](mmap-design.md) Phase 5); ring buffer primitive |
-| **Delivers** | Submit OP_RING_WAIT, producer-side wakeup posts completion |
-| **Test** | Two processes sharing a ring buffer.  Producer writes + signals, consumer reaps OP_RING_WAIT completion. |
+| **Files** | `libkernel/src/notify.rs` (NotifyInner, arm/signal), `libkernel/src/file.rs` (FdObject::Notify), `osl/src/notify.rs` (sys_notify_create 509, sys_notify 510), `osl/src/io_port.rs` (OP_RING_WAIT handler) |
+| **Dependencies** | Phase 1 |
+| **Delivers** | `notify_create(flags)` syscall (509), `notify(fd)` syscall (510), submit OP_RING_WAIT on notification fd, producer-side `notify()` posts completion |
+| **Test** | `user/ring_test.c`: parent creates shmem + notify fd, spawns child, child writes to shmem and signals, parent reaps OP_RING_WAIT completion and verifies data. |
 
 ### Phase 5: Shared-Memory SQ/CQ Rings
 
@@ -694,28 +703,23 @@ model.
   │  IO APIC       │  │ IPC chans │   │  │
   └────────────────┘  └───────────┘   │  │
                                       │  │
+          ┌────────────────────┐      │  │
+          │  Phase 4  ✓        │      │  │
+          │  OP_RING_WAIT      │      │  │
+          │  (notify fds)      │      │  │
+          └────────────────────┘      │  │
+                                      │  │
                     ┌─────────────────▼──▼───────────────┐
                     │  Phase 5                           │
                     │  Shared-memory SQ/CQ rings         │
                     │                                    │
                     │  requires:                         │
-                    │  mmap Phase 5 (MAP_SHARED)         │
+                    │  mmap Phase 5 (MAP_SHARED)  ✓      │
                     └────────────────────────────────────┘
-                        ┌──────────────────────────────────┐
-                        │  Phase 4                         │
-                        │  OP_RING_WAIT                    │
-                        │                                  │
-                        │  requires:                       │
-                        │  mmap Phase 5 (MAP_SHARED)       │
-                        │  + ring buffer primitive          │
-                        └──────────────────────────────────┘
-
-Cross-dependencies:
-  mmap Phase 5 (MAP_SHARED) ──▶ CompletionPort Phases 4, 5
 ```
 
-Phases 1–3b are complete.  Phases 4 and 5 depend on `MAP_SHARED` from
-[mmap-design.md](mmap-design.md) and are independent of each other.
+Phases 1–4 are complete.  Phase 5 (shared-memory SQ/CQ rings) is the
+remaining work.  Its MAP_SHARED prerequisite is now satisfied.
 
 ---
 

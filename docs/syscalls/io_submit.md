@@ -43,6 +43,7 @@ struct IoSubmission {       // 48 bytes, repr(C)
 | 4 | OP_IRQ_WAIT | Wait for an interrupt on an IRQ fd |
 | 5 | OP_IPC_SEND | Send an IPC message on a channel send-end fd |
 | 6 | OP_IPC_RECV | Receive an IPC message on a channel recv-end fd |
+| 7 | OP_RING_WAIT | Wait for a notification fd signal |
 
 ## Return value
 
@@ -71,6 +72,10 @@ correct page tables).
 
 For **OP_IPC_SEND/RECV**, `buf_addr` points to an `IpcMessage` struct.
 File descriptors in `msg.fds` are transferred across the channel.
+
+For **OP_RING_WAIT**, `fd` must be a notification fd (from `notify_create`).
+The completion fires when another process calls `notify(fd)`.  Edge-
+triggered, one-shot: re-submit to rearm.
 
 ## Implementation
 
