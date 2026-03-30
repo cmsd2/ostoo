@@ -171,6 +171,27 @@ impl MemoryServices {
         VirtAddr::new(virt_base + page_off as u64)
     }
 
+    /// Allocate physical frames and map them at `virt_base` in the kernel page table.
+    ///
+    /// Used by the stack arena to map its pre-allocated region.
+    pub fn map_kernel_pages(&mut self, virt_base: u64, count: usize) -> Result<(), ()> {
+        let flags = PageTableFlags::PRESENT
+                  | PageTableFlags::WRITABLE
+                  | PageTableFlags::NO_EXECUTE;
+        for i in 0..count as u64 {
+            let vaddr = VirtAddr::new(virt_base + i * crate::consts::PAGE_SIZE);
+            let page = Page::<Size4KiB>::containing_address(vaddr);
+            let frame = self.frame_allocator.allocate_frame().ok_or(())?;
+            unsafe {
+                self.mapper
+                    .map_to(page, frame, flags, &mut self.frame_allocator)
+                    .map_err(|_| ())?
+                    .flush();
+            }
+        }
+        Ok(())
+    }
+
     /// Allocate `pages` physically-contiguous 4 KiB frames for DMA.
     ///
     /// Returns the base physical address, or `None` if frames are exhausted.

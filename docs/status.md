@@ -414,12 +414,13 @@ are present, racing all event sources in a single future.
 ## Known Issues / Technical Debt
 
 ### Heap Size
-The heap is a fixed 1 MiB at `0xFFFF_8000_0000_0000`. This accommodates two
-64 KiB thread stacks (threads 0 and 1), per-process 64 KiB kernel stacks, plus
-driver and task allocations. Zombie processes are reaped via `wait4` + `reap()`,
-but concurrent processes will still pressure the heap. The
-`DumbVmemAllocator` has no reclamation path, so virtual address space for
-MMIO/ACPI mappings is also consumed monotonically.
+The heap is a fixed 1 MiB at `0xFFFF_8000_0000_0000`. Kernel thread stacks are
+allocated from a separate stack arena (`libkernel/src/stack_arena.rs`) at
+`0xFFFF_8000_0010_0000` (16 × 64 KiB = 1 MiB), keeping large stack allocations
+off the general-purpose heap and eliminating fragmentation. The arena uses a
+bitmap for O(1) alloc/free with RAII slot handles. The heap is now used only for
+small driver/task allocations. The `DumbVmemAllocator` has no reclamation path,
+so virtual address space for MMIO/ACPI mappings is consumed monotonically.
 
 ### virtio-blk Single-sector I/O
 Block I/O uses IRQ-driven completion via `AtomicWaker`, but is still limited

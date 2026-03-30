@@ -4,6 +4,11 @@ pub const PAGE_SIZE: u64 = 0x1000;
 pub const PAGE_MASK: u64 = 0xFFF;
 pub const KERNEL_STACK_SIZE: usize = 64 * 1024;
 
+/// Base virtual address of the kernel stack arena (right after the 1 MiB heap).
+pub const STACK_ARENA_BASE: u64 = 0xFFFF_8000_0010_0000;
+/// Number of 64 KiB stack slots in the arena.
+pub const STACK_ARENA_CAPACITY: usize = 16;
+
 /// Zero a single page at the given virtual address.
 ///
 /// # Safety

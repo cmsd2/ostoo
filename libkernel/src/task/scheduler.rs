@@ -78,9 +78,9 @@ struct Thread {
     /// All kernel threads share the boot PML4; user processes each have their own.
     pml4_phys: u64,
     ticks_remaining: u32,
-    /// Owned stack backing. None for thread 0 (uses the boot stack) and for
+    /// Owned stack backing. None for thread 0 (permanent, forgotten) and for
     /// user process threads (kernel stack owned by Process).
-    _stack: Option<Vec<u8>>,
+    _stack: Option<crate::stack_arena::StackSlot>,
     /// What this thread represents.
     kind: SchedulableKind,
     /// For user process threads: the top of the process's kernel stack.
@@ -266,19 +266,17 @@ core::arch::global_asm!(
     "iretq",
 );
 
-/// Allocate a heap stack and switch RSP to it, then call `continuation`.
+/// Allocate an arena stack and switch RSP to it, then call `continuation`.
 ///
-/// This moves the boot thread off the bootloader's lower-half stack onto a
-/// heap-backed stack (PML4 entry 256, high canonical half).  The old stack is
+/// This moves the boot thread off the bootloader's lower-half stack onto an
+/// arena-backed stack (PML4 entry 256, high canonical half).  The old stack is
 /// abandoned — `continuation` must never return.
 ///
-/// Call once, after the heap allocator is initialised.
+/// Call once, after the stack arena is initialised.
 pub fn migrate_to_heap_stack(continuation: fn() -> !) -> ! {
-    const STACK_SIZE: usize = crate::consts::KERNEL_STACK_SIZE;
-    let mut stack: Vec<u8> = Vec::with_capacity(STACK_SIZE);
-    stack.resize(STACK_SIZE, 0u8);
-    let stack_top = (stack.as_ptr() as u64 + stack.len() as u64) & !0xF;
-    core::mem::forget(stack); // leaked — permanent stack for thread 0
+    let stack = crate::stack_arena::alloc().expect("stack arena exhausted");
+    let stack_top = stack.top();
+    core::mem::forget(stack); // permanent — never freed
     unsafe {
         core::arch::asm!(
             "mov rsp, {top}",
@@ -322,15 +320,8 @@ pub fn init() {
 /// The new thread is placed on the ready queue and will run at the next
 /// context switch.
 pub fn spawn_thread(entry: fn() -> !) {
-    const STACK_SIZE: usize = crate::consts::KERNEL_STACK_SIZE;
-
-    let mut stack: Vec<u8> = Vec::with_capacity(STACK_SIZE);
-    // Safety: we immediately zero-initialise via resize.
-    stack.resize(STACK_SIZE, 0u8);
-
-    // Round stack_top down to 16-byte boundary so saved_rsp is aligned.
-    let stack_top_raw = stack.as_ptr() as u64 + stack.len() as u64;
-    let stack_top = stack_top_raw & !0xF;
+    let stack = crate::stack_arena::alloc().expect("stack arena exhausted");
+    let stack_top = stack.top();
 
     let frame = SwitchFrame::new_kernel(entry, stack_top);
     // saved_rsp points to the base of the FXSAVE area; the SwitchFrame sits above it.

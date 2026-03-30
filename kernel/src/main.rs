@@ -96,7 +96,9 @@ pub fn libkernel_main(boot_info: &'static BootInfo) -> ! {
 
     memory::init_services(mapper, frame_allocator, phys_mem_offset, &boot_info.memory_map);
 
-    // Migrate thread 0 to a heap-allocated stack (high half) so it
+    libkernel::stack_arena::init();
+
+    // Migrate thread 0 to an arena-allocated stack (high half) so it
     // survives CR3 switches into user page tables.
     scheduler::migrate_to_heap_stack(run_kernel);
 }

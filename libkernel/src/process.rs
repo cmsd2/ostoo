@@ -8,6 +8,7 @@ use x86_64::structures::paging::PageTableFlags;
 
 use crate::file::{CloseResult, FileError, FdEntry, FdObject, FD_CLOEXEC};
 use crate::signal::SignalState;
+use crate::stack_arena::StackSlot;
 
 // ---------------------------------------------------------------------------
 // VMA (Virtual Memory Area)
@@ -93,10 +94,9 @@ pub struct Process {
     pub pid: ProcessId,
     pub state: ProcessState,
     pub pml4_phys: PhysAddr,
-    /// Heap-allocated kernel stack (64 KiB). Owned here, not by the scheduler.
-    /// Kept alive so the memory isn't freed; the stack is accessed via raw pointer.
+    /// Kernel stack from the stack arena. Kept for Drop (returns slot to arena).
     #[allow(dead_code)]
-    kernel_stack: Vec<u8>,
+    kernel_stack: StackSlot,
     /// Cached top of `kernel_stack`, 16-byte aligned.
     pub kernel_stack_top: u64,
     pub entry_point: u64,
@@ -131,8 +131,6 @@ pub struct Process {
     pub signal_thread: Option<usize>,
 }
 
-const PROCESS_KERNEL_STACK_SIZE: usize = crate::consts::KERNEL_STACK_SIZE;
-
 /// Top of the mmap search range (exclusive). Allocations are placed below this.
 pub const MMAP_CEILING: u64 = 0x0000_4000_0000_0000;
 /// Bottom of the mmap search range (inclusive). Above any brk region.
@@ -141,10 +139,9 @@ pub const MMAP_FLOOR: u64 = 0x0000_0010_0000_0000;
 impl Process {
     pub fn new(pml4_phys: PhysAddr, entry_point: u64, user_stack_top: u64, brk_base: u64) -> Self {
         let pid = PROCESSES.alloc_pid();
-        let mut kernel_stack = Vec::with_capacity(PROCESS_KERNEL_STACK_SIZE);
-        kernel_stack.resize(PROCESS_KERNEL_STACK_SIZE, 0u8);
-        let stack_top =
-            (kernel_stack.as_ptr() as u64 + kernel_stack.len() as u64) & !0xF;
+        let kernel_stack = crate::stack_arena::alloc()
+            .expect("stack arena exhausted");
+        let stack_top = kernel_stack.top();
         Process {
             pid,
             state: ProcessState::Running,
