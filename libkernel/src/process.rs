@@ -125,6 +125,10 @@ pub struct Process {
     pub pml4_shared: bool,
     /// Signal state (dispositions, pending mask, blocked mask).
     pub signal: SignalState,
+    /// Thread index of an interruptible blocking syscall (pipe read, waitpid).
+    /// Set before blocking, cleared after waking. `sys_kill` uses this to
+    /// unblock the thread so the syscall can return EINTR.
+    pub signal_thread: Option<usize>,
 }
 
 const PROCESS_KERNEL_STACK_SIZE: usize = crate::consts::KERNEL_STACK_SIZE;
@@ -161,6 +165,7 @@ impl Process {
             vfork_parent_thread: None,
             pml4_shared: false,
             signal: SignalState::new(),
+            signal_thread: None,
         }
     }
 

@@ -347,6 +347,7 @@ pub fn make_pipe() -> (PipeReader, PipeWriter) {
 
 impl FileHandle for PipeReader {
     fn read(&self, buf: &mut [u8]) -> Result<usize, FileError> {
+        let pid = crate::process::current_pid();
         loop {
             let mut inner = self.0.lock();
             if !inner.buffer.is_empty() {
@@ -359,11 +360,34 @@ impl FileHandle for PipeReader {
             if inner.write_closed {
                 return Ok(0); // EOF
             }
+
+            // Check for pending signals before blocking.
+            if pid != crate::process::ProcessId::KERNEL {
+                let has_signal = crate::process::with_process_ref(pid, |p| {
+                    (p.signal.pending & !p.signal.blocked) != 0
+                }).unwrap_or(false);
+                if has_signal {
+                    return Err(FileError::Interrupted);
+                }
+            }
+
             // Register as blocked reader and wait.
             let thread_idx = crate::task::scheduler::current_thread_idx();
             inner.reader_thread = Some(thread_idx);
+            // Mark as interruptible so sys_kill can wake us.
+            if pid != crate::process::ProcessId::KERNEL {
+                crate::process::with_process(pid, |p| {
+                    p.signal_thread = Some(thread_idx);
+                });
+            }
             drop(inner);
             crate::task::scheduler::block_current_thread();
+            // Clear signal_thread after waking.
+            if pid != crate::process::ProcessId::KERNEL {
+                crate::process::with_process(pid, |p| {
+                    p.signal_thread = None;
+                });
+            }
         }
     }
 

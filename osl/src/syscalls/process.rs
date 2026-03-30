@@ -42,11 +42,24 @@ pub(crate) fn sys_wait4(pid_arg: u64, status_ptr: u64, _options: u64) -> i64 {
             return -errno::ECHILD;
         }
 
+        // Check for pending signals before blocking.
+        let has_signal = process::with_process_ref(parent_pid, |p| {
+            (p.signal.pending & !p.signal.blocked) != 0
+        }).unwrap_or(false);
+        if has_signal {
+            return -errno::EINTR;
+        }
+
         let thread_idx = libkernel::task::scheduler::current_thread_idx();
         process::with_process(parent_pid, |p| {
             p.wait_thread = Some(thread_idx);
+            p.signal_thread = Some(thread_idx);
         });
         libkernel::task::scheduler::block_current_thread();
+        // Clear signal_thread after waking.
+        process::with_process(parent_pid, |p| {
+            p.signal_thread = None;
+        });
     }
 }
 

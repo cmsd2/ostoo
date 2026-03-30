@@ -356,19 +356,23 @@ are present, racing all event sources in a single future.
   lock, then panics.
 
 ### POSIX Signals (`libkernel/src/signal.rs`, `osl/src/signal.rs`)
-- Phases 1–2: signal infrastructure, delivery on SYSCALL return, Ctrl+C/SIGINT.
+- Phases 1–2: signal infrastructure, delivery on SYSCALL return, Ctrl+C/SIGINT,
+  signal-interrupted syscalls (EINTR).
 - `rt_sigaction` (13): install/query signal handlers (SA_SIGINFO, SA_RESTORER).
 - `rt_sigprocmask` (14): SIG_BLOCK/UNBLOCK/SETMASK for the signal mask.
-- `kill` (62): send a signal to a specific pid.
+- `kill` (62): send a signal to a specific pid; wakes interruptible blocks.
 - `rt_sigreturn` (15): restore context from rt_sigframe after handler returns.
 - Signal delivery via `check_pending_signals` in the SYSCALL return path:
   constructs a Linux-ABI-compatible `rt_sigframe` on the user stack, rewrites
   the saved register frame so `sysretq` "returns" into the handler.
 - Ctrl+C: keyboard actor queues SIGINT on `foreground_pid()`, wakes blocked
   console reader.
+- EINTR: blocking syscalls (`sys_wait4`, `PipeReader::read`) set a per-process
+  `signal_thread` field; `sys_kill` unblocks it so the syscall returns EINTR.
+  The shell forwards SIGINT to child processes on EINTR from `waitpid`.
 - Default actions: SIG_DFL terminate (SIGKILL, SIGTERM, etc.) or ignore (SIGCHLD).
-- Demos: `user/sig_demo.c` (SIGUSR1 self-signal), userspace shell handles
-  SIGINT via `sigaction`.
+- Demos: `user/sig_demo.c` (SIGUSR1 self-signal), `user/sig_int.c` (Ctrl+C
+  interrupt test), userspace shell handles SIGINT via `sigaction`.
 - See [`docs/signals.md`](signals.md) for full design.
 
 ### Dummy Driver (`devices/src/dummy.rs`)
@@ -458,11 +462,12 @@ output but functionally harmless.
 
 ### Process Model
 
-4. **Signals Phase 3+** — Phases 1–2 (basic signal delivery + Ctrl+C/SIGINT)
-   are complete: `rt_sigaction`, `rt_sigprocmask`, `kill`, signal delivery on
-   SYSCALL return, `rt_sigreturn`, Ctrl+C → SIGINT to foreground process.
-   Remaining: exception-generated signals (SIGSEGV, SIGILL), SIGCHLD on child
-   exit.  See [`docs/signals.md`](signals.md).
+4. **Signals Phase 3+** — Phases 1–2 (basic signal delivery + Ctrl+C/SIGINT +
+   EINTR) are complete: `rt_sigaction`, `rt_sigprocmask`, `kill`, signal
+   delivery on SYSCALL return, `rt_sigreturn`, Ctrl+C → SIGINT to foreground
+   process, signal-interrupted blocking syscalls (EINTR).  Remaining:
+   exception-generated signals (SIGSEGV, SIGILL), SIGCHLD on child exit.
+   See [`docs/signals.md`](signals.md).
 
 5. **`fork` + CoW page faults** — standard POSIX `fork`.  `clone(CLONE_VM|CLONE_VFORK)`
    and `execve` are now implemented, enabling unpatched musl `posix_spawn` and
@@ -486,8 +491,9 @@ with full input routing and window management.
   `framebuffer_open` (515). Double-buffered compositing with painter's
   algorithm. Cursor-only rendering optimization patches small rectangles
   for mouse movement instead of full recomposite.
-- **Input**: Connects to `/bin/kbd` (keyboard) and `/bin/mouse` (mouse)
-  services via the service registry (`svc_register` 513, `svc_lookup` 514).
+- **Input**: Connects to `/bin/kbd` (keyboard) service via the service
+  registry. Mouse input is integrated directly — the compositor claims
+  IRQ 12 and decodes PS/2 packets inline (no separate mouse driver process).
   Key events forwarded to focused window. Mouse events drive cursor, focus,
   drag, and resize.
 - **CDE-style decorations**: Server-side window decorations inspired by
@@ -504,7 +510,10 @@ with full input routing and window management.
   and redraws.
 - **Terminal emulator** (`/bin/term`): Compositor client that spawns
   `/bin/shell` with pipe-connected stdin/stdout. VT100 parser with
-  color support. Handles window resize.
+  color support. Character-level screen buffer (`Cell` array + per-row
+  `wrapped` flags) enables text reflow on resize: logical lines are
+  extracted, re-wrapped to the new width, and pixels regenerated from
+  the cell buffer. Cursor position is preserved across resize.
 - See [`docs/compositor-design.md`](compositor-design.md) and
   [`docs/display-input-ownership.md`](display-input-ownership.md).
 

@@ -183,10 +183,18 @@ pub fn sys_kill(pid_arg: u64, sig: u64) -> i64 {
 
     let target_pid = process::ProcessId::from_raw(pid_arg);
 
-    match process::with_process(target_pid, |p| {
+    let signal_thread = match process::with_process(target_pid, |p| {
         p.signal.queue(sig);
+        p.signal_thread
     }) {
-        Some(()) => 0,
-        None => -errno::ESRCH,
+        Some(t) => t,
+        None => return -errno::ESRCH,
+    };
+
+    // Wake the target only if it is in an interruptible block.
+    if let Some(idx) = signal_thread {
+        libkernel::task::scheduler::unblock(idx);
     }
+
+    0
 }

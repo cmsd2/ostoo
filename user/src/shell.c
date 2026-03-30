@@ -424,9 +424,20 @@ static void cmd_run(char *cmdline) {
         return;
     }
 
-    /* Wait for child to finish. */
+    /* Wait for child, forwarding SIGINT if interrupted. */
     int status = 0;
-    waitpid(child_pid, &status, 0);
+    for (;;) {
+        pid_t ret = waitpid(child_pid, &status, 0);
+        if (ret > 0) break;
+        if (ret < 0 && errno == EINTR) {
+            if (got_sigint) {
+                got_sigint = 0;
+                kill(child_pid, SIGINT);
+            }
+            continue;
+        }
+        break;
+    }
 }
 
 /* ── main loop ──────────────────────────────────────────────────────── */

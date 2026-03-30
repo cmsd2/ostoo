@@ -86,10 +86,30 @@ must be revisited — either by saving/restoring `saved_frame_ptr` per-thread in
 the scheduler, or by using a different mechanism to locate the interrupted
 frame (e.g. the interrupt stack frame pushed by the CPU).
 
+### Signal-interrupted syscalls (EINTR)
+
+Blocking syscalls (`sys_wait4`, `PipeReader::read`) can be interrupted by
+signals. The mechanism uses a per-process `signal_thread` field:
+
+1. Before blocking, the syscall stores its scheduler thread index in
+   `process.signal_thread`.
+2. `sys_kill`, after queuing a signal, reads `signal_thread` and calls
+   `scheduler::unblock()` on it if set.
+3. When the blocked thread wakes, it checks for pending signals. If any
+   are deliverable (`pending & !blocked != 0`), it returns EINTR instead
+   of re-blocking.
+4. The field is cleared on any exit path (data available, EOF, or signal).
+
+Only interruptible blocking sites set `signal_thread`. Non-interruptible
+blocks (vfork parent in `sys_clone`, `blocking()` async bridge) never set
+it, so they remain unaffected.
+
+The shell's `cmd_run` handles EINTR from `waitpid` by forwarding SIGINT
+to the child process and re-waiting, enabling Ctrl+C to reach child
+processes running in the terminal.
+
 ## Future work
 
-- **Phase 2**: Exception-generated signals (SIGSEGV, SIGILL, SIGFPE from ring-3 faults)
-- **Phase 3**: SIGINT from Ctrl+C (keyboard handler → foreground process)
-- **Phase 4**: SIGCHLD (queued when child exits)
+- Exception-generated signals (SIGSEGV, SIGILL, SIGFPE from ring-3 faults)
 - FPU state save/restore in signal frames
 - Signal queuing (currently only one instance per signal — standard signals)
