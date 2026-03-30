@@ -67,6 +67,9 @@ pub fn timeline_append(thread_idx: usize) {
 /// Called by the timeline actor from normal (non-ISR) context while holding
 /// the `WRITER` lock.
 pub fn timeline_flush_one(thread_idx: usize) {
+    if super::DISPLAY_SUPPRESSED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     const THREAD_BG: [Color; 6] = [
         Color::LightGreen, Color::LightCyan, Color::LightRed,
         Color::Pink,       Color::Yellow,    Color::LightGray,

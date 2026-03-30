@@ -606,6 +606,11 @@ pub fn has_children(parent_pid: ProcessId) -> bool {
 ///
 /// Shared by `sys_exit` and signal default-terminate. Does not return.
 pub fn terminate_process(pid: ProcessId, exit_code: i32) -> ! {
+    // Restore kernel display output if this process owned the framebuffer.
+    if crate::vga_buffer::is_display_owner(pid) {
+        crate::vga_buffer::unsuppress_display();
+    }
+
     // Unblock vfork parent if this is a vfork child.
     let vfork_parent_thread = with_process(pid, |p| p.vfork_parent_thread.take());
     if let Some(Some(thread_idx)) = vfork_parent_thread {

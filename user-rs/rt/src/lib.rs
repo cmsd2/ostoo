@@ -18,6 +18,7 @@ pub mod io;
 pub mod sys;
 pub mod ostoo;
 pub mod compositor_proto;
+pub mod kbd_proto;
 
 #[cfg(feature = "no_std")]
 mod alloc_impl;

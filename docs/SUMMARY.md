@@ -105,6 +105,8 @@
 # Design Documents
 
 - [Microkernel Design](microkernel-design.md)
+- [Compositor Design](compositor-design.md)
+- [Display & Input Ownership](display-input-ownership.md)
 - [Networking Design](networking-design.md)
 
 # Audits

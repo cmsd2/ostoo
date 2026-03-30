@@ -1,6 +1,6 @@
 use volatile::Volatile;
 use core::fmt;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use crate::irq_mutex::IrqMutex;
 use crate::framebuffer::Framebuffer;
@@ -8,6 +8,34 @@ use crate::font;
 
 pub mod capture;
 pub mod timeline;
+
+// ---------------------------------------------------------------------------
+// Display ownership — suppression when userspace owns the framebuffer
+
+/// When true, kernel display output is redirected to serial.
+pub static DISPLAY_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+
+/// PID of the process that owns the display (called framebuffer_open).
+static DISPLAY_OWNER_PID: AtomicU64 = AtomicU64::new(0);
+
+/// Suppress kernel display output and record the owning process.
+/// Called when a process opens the framebuffer via `framebuffer_open`.
+pub fn suppress_display(pid: crate::process::ProcessId) {
+    DISPLAY_OWNER_PID.store(pid.as_u64(), Ordering::Release);
+    DISPLAY_SUPPRESSED.store(true, Ordering::Release);
+}
+
+/// Restore kernel display output. Called when the display owner exits.
+pub fn unsuppress_display() {
+    DISPLAY_SUPPRESSED.store(false, Ordering::Release);
+    DISPLAY_OWNER_PID.store(0, Ordering::Release);
+    WRITER.lock().repaint_all();
+}
+
+/// Check whether `pid` is the current display owner.
+pub fn is_display_owner(pid: crate::process::ProcessId) -> bool {
+    DISPLAY_OWNER_PID.load(Ordering::Acquire) == pid.as_u64()
+}
 
 // Re-export public items from submodules at the old paths.
 pub use capture::{
@@ -159,6 +187,8 @@ pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
     if capture::CAPTURE_ACTIVE.load(Ordering::Relaxed) {
         capture::CAPTURE.lock().write_fmt(args).unwrap();
+    } else if DISPLAY_SUPPRESSED.load(Ordering::Relaxed) {
+        crate::serial::_print(args);
     } else {
         WRITER.lock().write_fmt(args).unwrap();
     }
@@ -560,6 +590,9 @@ pub fn init_display() {
 /// Safe to call from any kernel thread (acquires `WRITER` lock).
 #[doc(hidden)]
 pub fn print_status_bar(args: fmt::Arguments) {
+    if DISPLAY_SUPPRESSED.load(Ordering::Relaxed) {
+        return;
+    }
     use core::fmt::Write;
     let mut buf = FixedBuf::new();
     let _ = buf.write_fmt(args);

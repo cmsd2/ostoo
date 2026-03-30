@@ -17,9 +17,13 @@ pub fn sys_clone(flags: u64, child_stack: u64, _ptid: u64, _ctid: u64, _tls: u64
         return -errno::ENOSYS;
     }
 
-    if child_stack == 0 {
-        return -errno::EINVAL;
-    }
+    // CLONE_VFORK: child_stack == 0 means "share parent's stack".
+    // This is safe because the parent is blocked until the child calls execve/_exit.
+    let child_stack = if child_stack == 0 {
+        libkernel::syscall::get_user_rsp()
+    } else {
+        child_stack
+    };
 
     let parent_pid = process::current_pid();
     let parent_thread_idx = scheduler::current_thread_idx();

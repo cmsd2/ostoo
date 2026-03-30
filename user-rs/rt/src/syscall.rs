@@ -175,3 +175,39 @@ pub fn getdents64(fd: u32, buf: &mut [u8]) -> i64 {
 pub fn wait4(pid: i64, status: *mut u32, options: u64) -> i64 {
     unsafe { syscall3(SYS_WAIT4, pid as u64, status as u64, options) }
 }
+
+// Additional syscall numbers
+pub const SYS_MMAP: u64 = 9;
+pub const SYS_DUP2: u64 = 33;
+pub const SYS_CLONE: u64 = 56;
+pub const SYS_EXECVE: u64 = 59;
+pub const SYS_GETPID: u64 = 39;
+pub const SYS_PIPE2: u64 = 293;
+pub const SYS_KILL: u64 = 62;
+
+pub fn pipe2(fds: &mut [i32; 2], flags: u32) -> i64 {
+    unsafe { syscall2(SYS_PIPE2, fds.as_mut_ptr() as u64, flags as u64) }
+}
+
+pub fn dup2(oldfd: i32, newfd: i32) -> i64 {
+    unsafe { syscall2(SYS_DUP2, oldfd as u64, newfd as u64) }
+}
+
+/// `clone(flags, child_stack, ...)` — we use the CLONE_VM|CLONE_VFORK|SIGCHLD
+/// calling convention.  `child_stack` = 0 means share parent's stack.
+pub fn clone(flags: u64) -> i64 {
+    unsafe { syscall5(SYS_CLONE, flags, 0, 0, 0, 0) }
+}
+
+/// `execve(path, argv, envp)` — all pointers must be in user memory.
+pub fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> i64 {
+    unsafe { syscall3(SYS_EXECVE, path as u64, argv as u64, envp as u64) }
+}
+
+pub fn getpid() -> i64 {
+    unsafe { syscall0(SYS_GETPID) }
+}
+
+pub fn kill(pid: i64, sig: i32) -> i64 {
+    unsafe { syscall2(SYS_KILL, pid as u64, sig as u64) }
+}

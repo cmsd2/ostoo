@@ -41,7 +41,12 @@ pub(crate) fn sys_framebuffer_open(flags: u32) -> i64 {
     let obj = FdObject::SharedMem(Arc::new(inner));
 
     match fd_helpers::alloc_fd(obj) {
-        Ok(fd) => fd as i64,
+        Ok(fd) => {
+            // Suppress kernel display output — the calling process now owns the LFB.
+            let pid = libkernel::process::current_pid();
+            libkernel::vga_buffer::suppress_display(pid);
+            fd as i64
+        }
         Err(e) => e,
     }
 }

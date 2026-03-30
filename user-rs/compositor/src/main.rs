@@ -4,8 +4,10 @@
 extern crate alloc;
 extern crate ostoo_rt;
 
+use alloc::vec;
 use alloc::vec::Vec;
 use ostoo_rt::compositor_proto::*;
+use ostoo_rt::kbd_proto;
 use ostoo_rt::ostoo::{
     self, CompletionPort, FramebufferMem, IpcRecv, IpcSend, NotifyFd, OsError, SharedMem,
 };
@@ -27,9 +29,11 @@ const MAX_COMPLETIONS: usize = 16;
 //   0x1000          = new client on registration channel
 //   0x2000 + wid    = damage notification for window `wid`
 //   0x3000 + wid    = command message on per-client channel for `wid`
+//   0x4000          = keyboard event from keyboard service
 const TAG_NEW_CLIENT: u64 = 0x1000;
 const TAG_DAMAGE_BASE: u64 = 0x2000;
 const TAG_CMD_BASE: u64 = 0x3000;
+const TAG_KEYBOARD: u64 = 0x4000;
 
 // ── Window state ─────────────────────────────────────────────────────
 
@@ -47,7 +51,7 @@ struct Window {
     _buf: SharedMem,
     _notify: NotifyFd,
     _c2s_recv: IpcRecv,
-    _s2c_send: IpcSend,
+    s2c_send: IpcSend,
     // IPC message buffer for re-arming OP_IPC_RECV (must live at stable address).
     cmd_msg: IpcMessage,
 }
@@ -73,6 +77,10 @@ fn run() -> Result<(), OsError> {
     let fb_ptr = fb_mem.mmap()?;
     println!("compositor: framebuffer {}x{}", FB_WIDTH, FB_HEIGHT);
 
+    // Allocate back buffer for flicker-free compositing.
+    let mut back_buf = vec![0u8; FB_WIDTH * FB_HEIGHT * 4];
+    let back_ptr = back_buf.as_mut_ptr();
+
     // Clear to background color.
     fill_rect(fb_ptr, 0, 0, FB_WIDTH, FB_HEIGHT, BG_COLOR);
 
@@ -84,7 +92,17 @@ fn run() -> Result<(), OsError> {
     ostoo::service_register(SERVICE_NAME, reg_send.fd())?;
     println!("compositor: registered as 'compositor'");
 
-    // 4. Arm OP_IPC_RECV on the registration channel.
+    // 4. Connect to keyboard service (if available).
+    let mut kbd_msg = IpcMessage::default();
+    let _kbd_recv: Option<IpcRecv> = match connect_keyboard(&port, &mut kbd_msg) {
+        Ok(recv) => Some(recv),
+        Err(_) => {
+            println!("compositor: keyboard service not found, no key input");
+            None
+        }
+    };
+
+    // 5. Arm OP_IPC_RECV on the registration channel.
     let mut reg_msg = IpcMessage::default();
     port.submit(&[IoSubmission::ipc_recv(
         TAG_NEW_CLIENT,
@@ -92,7 +110,7 @@ fn run() -> Result<(), OsError> {
         &mut reg_msg,
     )])?;
 
-    // 5. Event loop.
+    // 6. Event loop.
     let mut windows: Vec<Window> = Vec::new();
     let mut next_wid: u64 = 1;
     let mut completions = [IoCompletion::default(); MAX_COMPLETIONS];
@@ -135,6 +153,31 @@ fn run() -> Result<(), OsError> {
                         win._notify.fd(),
                     )])?;
                 }
+            } else if ud == TAG_KEYBOARD {
+                // Key event from keyboard service.
+                if cqe.result >= 0 && kbd_msg.tag == kbd_proto::MSG_KB_KEY {
+                    let byte = kbd_msg.data[0];
+                    let modifiers = kbd_msg.data[1];
+                    let key_type = kbd_msg.data[2];
+                    // Forward to the first (focused) window.
+                    if let Some(win) = windows.first() {
+                        let key_msg = IpcMessage {
+                            tag: MSG_KEY_EVENT,
+                            data: [byte, modifiers, key_type],
+                            fds: [-1; 4],
+                        };
+                        let _ = sys::ipc_send(win.s2c_send.fd(), &key_msg, sys::IPC_NONBLOCK);
+                    }
+                }
+                // Re-arm keyboard recv.
+                kbd_msg = IpcMessage::default();
+                if let Some(ref recv) = _kbd_recv {
+                    port.submit(&[IoSubmission::ipc_recv(
+                        TAG_KEYBOARD,
+                        recv.fd(),
+                        &mut kbd_msg,
+                    )])?;
+                }
             } else if ud >= TAG_CMD_BASE {
                 // Per-client command.
                 let wid = ud - TAG_CMD_BASE;
@@ -153,7 +196,7 @@ fn run() -> Result<(), OsError> {
                             MSG_CLOSE => {
                                 println!("compositor: window {} closed", wid);
                                 windows.retain(|w| w.id != wid);
-                                composite(fb_ptr, &mut windows);
+                                composite(fb_ptr, back_ptr, &mut windows);
                             }
                             _ => {}
                         }
@@ -172,7 +215,7 @@ fn run() -> Result<(), OsError> {
         }
 
         if any_dirty {
-            composite(fb_ptr, &mut windows);
+            composite(fb_ptr, back_ptr, &mut windows);
         }
     }
 }
@@ -286,21 +329,27 @@ fn handle_connect(
         _buf: buf,
         _notify: notify,
         _c2s_recv: c2s_recv,
-        _s2c_send: s2c_send,
+        s2c_send: s2c_send,
         cmd_msg,
     });
 }
 
 // ── Compositing ──────────────────────────────────────────────────────
 
-fn composite(fb_ptr: *mut u8, windows: &mut Vec<Window>) {
-    // Clear background.
-    fill_rect(fb_ptr, 0, 0, FB_WIDTH, FB_HEIGHT, BG_COLOR);
+fn composite(fb_ptr: *mut u8, back_ptr: *mut u8, windows: &mut Vec<Window>) {
+    // Composite into back buffer to avoid flicker.
+    fill_rect(back_ptr, 0, 0, FB_WIDTH, FB_HEIGHT, BG_COLOR);
 
     // Painter's algorithm — back to front (first connected = bottom).
     for win in windows.iter_mut() {
-        blit_window(fb_ptr, win);
+        blit_window(back_ptr, win);
         win.dirty = false;
+    }
+
+    // Copy back buffer to framebuffer in one pass.
+    let total = FB_WIDTH * FB_HEIGHT * 4;
+    unsafe {
+        core::ptr::copy_nonoverlapping(back_ptr, fb_ptr, total);
     }
 }
 
@@ -343,6 +392,44 @@ fn fill_rect(fb_ptr: *mut u8, x: usize, y: usize, w: usize, h: usize, color: u32
             }
         }
     }
+}
+
+// ── Keyboard service connection ──────────────────────────────────────
+
+/// Connect to the userspace keyboard service.  Returns the IpcRecv end
+/// for receiving key events.  The completion port is armed with TAG_KEYBOARD.
+fn connect_keyboard(
+    port: &CompletionPort,
+    kbd_msg: &mut IpcMessage,
+) -> Result<IpcRecv, OsError> {
+    // Retry lookup — the keyboard driver may still be starting up.
+    let reg_send_fd = ostoo::service_lookup_retry(kbd_proto::SERVICE_NAME, 10)?;
+
+    // Create channel pair for key events: keyboard → compositor.
+    let (evt_send, evt_recv) = ostoo::ipc_channel(4, 0)?;
+
+    // Send MSG_KB_CONNECT with our send-end so the keyboard driver can push events.
+    let connect_msg = IpcMessage {
+        tag: kbd_proto::MSG_KB_CONNECT,
+        data: [0; 3],
+        fds: [evt_send.fd(), -1, -1, -1],
+    };
+    if sys::ipc_send(reg_send_fd, &connect_msg, 0) < 0 {
+        return Err(OsError(-1));
+    }
+    // Close fds we no longer need.
+    ostoo_rt::syscall::close(reg_send_fd as u32);
+    drop(evt_send);
+
+    // Arm OP_IPC_RECV on the event channel.
+    port.submit(&[IoSubmission::ipc_recv(
+        TAG_KEYBOARD,
+        evt_recv.fd(),
+        kbd_msg,
+    )])?;
+
+    println!("compositor: connected to keyboard service");
+    Ok(evt_recv)
 }
 
 fn tile_position(idx: usize, _w: usize, _h: usize) -> (usize, usize) {

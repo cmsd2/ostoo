@@ -1,6 +1,7 @@
 /target
 /user-rs/target
 /user/bin/
+/user/lib/
 **/*.rs.bk
 disk.img
 .config.old

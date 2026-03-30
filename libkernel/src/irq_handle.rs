@@ -95,8 +95,9 @@ pub fn irq_fd_dispatch(slot: usize) {
 
     let mut inner = inner_arc.lock();
 
-    // Mask the GSI immediately to prevent interrupt storms.
-    crate::apic::mask_gsi(inner.gsi);
+    // Do NOT mask the GSI — keyboard IRQ is edge-triggered, and masking
+    // would lose edges that arrive between here and the next arm_irq().
+    // Instead, we buffer scancodes when no pending wait is registered.
 
     // For keyboard (GSI 1): read the scancode to deassert the IRQ.
     let scancode = if inner.gsi == 1 {
@@ -147,6 +148,8 @@ pub fn arm_irq(inner: &Arc<IrqMutex<IrqInner>>, port: Arc<IrqMutex<CompletionPor
             read_dest: 0,
             transfer_fds: None,
         });
+        // Must unmask so the next interrupt can arrive and be buffered.
+        crate::apic::unmask_gsi(guard.gsi);
         return;
     }
 

@@ -29,3 +29,9 @@ pub const MSG_PRESENT: u64 = 3;
 /// `data = [window_id, 0, 0]`
 /// `fds  = [-1, -1, -1, -1]`
 pub const MSG_CLOSE: u64 = 4;
+
+/// Compositor → client (per-client channel): key event.
+///
+/// `data = [byte, modifiers, key_type]`
+/// `fds  = [-1, -1, -1, -1]`
+pub const MSG_KEY_EVENT: u64 = 5;

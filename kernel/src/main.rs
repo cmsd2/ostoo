@@ -147,8 +147,9 @@ fn run_kernel() -> ! {
 
     executor::spawn(Task::new(timer_task()));
     executor::spawn(Task::new(status_task()));
-    executor::spawn(Task::new(launch_userspace_shell()));
+    executor::spawn(Task::new(launch_keyboard_driver()));
     executor::spawn(Task::new(launch_compositor()));
+    executor::spawn(Task::new(launch_userspace_shell()));
 
     scheduler::init();
     scheduler::spawn_thread(|| executor::run_worker());
@@ -410,8 +411,98 @@ async fn status_task() {
     }
 }
 
-async fn launch_userspace_shell() {
+/// Launch the userspace keyboard driver (if present at /bin/kbd).
+async fn launch_keyboard_driver() {
     Delay::from_millis(100).await; // let VFS settle
+
+    let data = match devices::vfs::read_file("/bin/kbd", libkernel::process::ProcessId::KERNEL).await {
+        Ok(d) => d,
+        Err(_) => {
+            info!("[kernel] /bin/kbd not found, skipping keyboard driver");
+            return;
+        }
+    };
+
+    let env: &[&[u8]] = &[
+        b"PATH=/host/bin",
+        b"HOME=/",
+    ];
+    match ring3::spawn_process_with_env(&data, env) {
+        Ok(pid) => {
+            info!("[kernel] launched kbd driver as pid {}", pid.as_u64());
+        }
+        Err(e) => {
+            warn!("[kernel] failed to spawn kbd: {}", e);
+        }
+    }
+}
+
+/// Launch the userspace compositor (if present at /bin/compositor).
+/// After compositor is up, also launch /bin/term if available.
+async fn launch_compositor() {
+    Delay::from_millis(100).await; // let VFS settle
+
+    let data = match devices::vfs::read_file("/bin/compositor", libkernel::process::ProcessId::KERNEL).await {
+        Ok(d) => d,
+        Err(_) => {
+            info!("[kernel] /bin/compositor not found, skipping");
+            return;
+        }
+    };
+
+    let env: &[&[u8]] = &[
+        b"PATH=/host/bin",
+        b"HOME=/",
+        b"TERM=dumb",
+    ];
+    match ring3::spawn_process_with_env(&data, env) {
+        Ok(pid) => {
+            info!("[kernel] launched compositor as pid {}", pid.as_u64());
+        }
+        Err(e) => {
+            warn!("[kernel] failed to spawn compositor: {}", e);
+            return;
+        }
+    }
+
+    // Launch terminal emulator — it uses svc_lookup_retry to wait for compositor.
+    Delay::from_millis(50).await; // brief yield
+
+    let term_data = match devices::vfs::read_file("/bin/term", libkernel::process::ProcessId::KERNEL).await {
+        Ok(d) => d,
+        Err(_) => {
+            info!("[kernel] /bin/term not found, no terminal emulator");
+            return;
+        }
+    };
+
+    let term_env: &[&[u8]] = &[
+        b"PATH=/host/bin",
+        b"HOME=/",
+        b"TERM=dumb",
+        b"SHELL=/bin/shell",
+    ];
+    match ring3::spawn_process_with_env(&term_data, term_env) {
+        Ok(pid) => {
+            info!("[kernel] launched terminal emulator as pid {}", pid.as_u64());
+        }
+        Err(e) => {
+            warn!("[kernel] failed to spawn term: {}", e);
+        }
+    }
+}
+
+async fn launch_userspace_shell() {
+    // Poll for compositor to claim the display instead of a fixed delay.
+    // Check every 50ms for up to 1 second — gives compositor time to start
+    // and call framebuffer_open, but doesn't block indefinitely.
+    for _ in 0..20 {
+        Delay::from_millis(50).await;
+        if libkernel::vga_buffer::DISPLAY_SUPPRESSED.load(core::sync::atomic::Ordering::Relaxed) {
+            info!("[kernel] display owned by compositor, skipping standalone shell");
+            return;
+        }
+    }
 
     let data = match devices::vfs::read_file("/bin/shell", libkernel::process::ProcessId::KERNEL).await {
         Ok(d) => d,
@@ -449,33 +540,6 @@ async fn launch_userspace_shell() {
     >("shell") {
         use libkernel::task::mailbox::ActorMsg;
         inbox.send(ActorMsg::Inner(shell::ShellMsg::Reprompt));
-    }
-}
-
-/// Launch the userspace compositor (if present at /bin/compositor).
-async fn launch_compositor() {
-    Delay::from_millis(200).await; // let VFS and shell settle
-
-    let data = match devices::vfs::read_file("/bin/compositor", libkernel::process::ProcessId::KERNEL).await {
-        Ok(d) => d,
-        Err(_) => {
-            info!("[kernel] /bin/compositor not found, skipping");
-            return;
-        }
-    };
-
-    let env: &[&[u8]] = &[
-        b"PATH=/host/bin",
-        b"HOME=/",
-        b"TERM=dumb",
-    ];
-    match ring3::spawn_process_with_env(&data, env) {
-        Ok(pid) => {
-            info!("[kernel] launched compositor as pid {}", pid.as_u64());
-        }
-        Err(e) => {
-            warn!("[kernel] failed to spawn compositor: {}", e);
-        }
     }
 }
 

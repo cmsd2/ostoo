@@ -450,6 +450,25 @@ pub fn service_lookup(name: &[u8]) -> Result<i32, OsError> {
     Ok(fd)
 }
 
+/// Look up a service by name, retrying up to `retries` times with a short
+/// timeout between each attempt.  Returns the service fd on success.
+///
+/// This replaces fixed sleep-based startup ordering — the caller can wait
+/// for a service to become available.
+pub fn service_lookup_retry(name: &[u8], retries: u32) -> Result<i32, OsError> {
+    for _ in 0..retries {
+        match service_lookup(name) {
+            Ok(fd) => return Ok(fd),
+            Err(_) => {
+                // Brief yield via a zero-length read on fd -1 (returns immediately).
+                // This gives the scheduler a chance to run the service process.
+                let _ = crate::sys::io_wait(-1, &mut [], 0, 50_000_000); // 50ms
+            }
+        }
+    }
+    service_lookup(name)
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // FramebufferMem
 // ═══════════════════════════════════════════════════════════════════════
