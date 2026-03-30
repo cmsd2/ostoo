@@ -15,32 +15,9 @@
  *   (page fault / process killed — no further output)
  */
 
-#include <unistd.h>
 #include <sys/mman.h>
 #include <string.h>
-
-/* ── helpers ─────────────────────────────────────────────────────────── */
-
-static void puts_stdout(const char *s) {
-    write(1, s, strlen(s));
-}
-
-static void put_char(char c) {
-    write(1, &c, 1);
-}
-
-static void put_hex(unsigned long n) {
-    char buf[17];
-    int i = 0;
-    if (n == 0) { puts_stdout("0x0"); return; }
-    while (n > 0) {
-        int d = n & 0xF;
-        buf[i++] = d < 10 ? '0' + d : 'a' + d - 10;
-        n >>= 4;
-    }
-    puts_stdout("0x");
-    while (--i >= 0) put_char(buf[i]);
-}
+#include "ostoo.h"
 
 /* ── main ────────────────────────────────────────────────────────────── */
 

@@ -94,6 +94,45 @@ pub unsafe fn syscall4(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
     ret
 }
 
+#[inline(always)]
+pub unsafe fn syscall5(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
+    let ret: i64;
+    asm!(
+        "syscall",
+        in("rax") nr,
+        in("rdi") a1,
+        in("rsi") a2,
+        in("rdx") a3,
+        in("r10") a4,
+        in("r8") a5,
+        out("rcx") _,
+        out("r11") _,
+        lateout("rax") ret,
+        options(nostack),
+    );
+    ret
+}
+
+#[inline(always)]
+pub unsafe fn syscall6(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i64 {
+    let ret: i64;
+    asm!(
+        "syscall",
+        in("rax") nr,
+        in("rdi") a1,
+        in("rsi") a2,
+        in("rdx") a3,
+        in("r10") a4,
+        in("r8") a5,
+        in("r9") a6,
+        out("rcx") _,
+        out("r11") _,
+        lateout("rax") ret,
+        options(nostack),
+    );
+    ret
+}
+
 // ---- Typed wrappers ----
 
 pub fn write(fd: u32, buf: &[u8]) -> i64 {

@@ -6,96 +6,11 @@
  * for each round.
  */
 
-#include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
-#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <spawn.h>
-
-/* ── helpers ─────────────────────────────────────────────────────────── */
-
-static void puts_stdout(const char *s) {
-    write(1, s, strlen(s));
-}
-
-static void put_char(char c) {
-    write(1, &c, 1);
-}
-
-static void put_num(long n) {
-    char buf[20];
-    int i = 0;
-    int neg = 0;
-    if (n < 0) { neg = 1; n = -n; }
-    if (n == 0) { put_char('0'); return; }
-    while (n > 0) {
-        buf[i++] = '0' + (n % 10);
-        n /= 10;
-    }
-    if (neg) put_char('-');
-    while (--i >= 0) put_char(buf[i]);
-}
-
-/* int-to-string for fd args */
-static void itoa_buf(int val, char *buf, int bufsz) {
-    int i = 0;
-    int neg = 0;
-    if (val < 0) { neg = 1; val = -val; }
-    char tmp[20];
-    if (val == 0) { tmp[i++] = '0'; }
-    while (val > 0 && i < 18) {
-        tmp[i++] = '0' + (val % 10);
-        val /= 10;
-    }
-    int pos = 0;
-    if (neg && pos < bufsz - 1) buf[pos++] = '-';
-    while (--i >= 0 && pos < bufsz - 1) buf[pos++] = tmp[i];
-    buf[pos] = '\0';
-}
-
-/* ── syscall wrappers ────────────────────────────────────────────────── */
-
-#define SYS_IO_CREATE 501
-#define SYS_IO_SUBMIT 502
-#define SYS_IO_WAIT   503
-
-#define OP_NOP     0
-#define OP_TIMEOUT 1
-#define OP_READ    2
-#define OP_WRITE   3
-
-struct io_submission {
-    unsigned long user_data;
-    unsigned int  opcode;
-    unsigned int  flags;
-    int           fd;
-    int           _pad;
-    unsigned long buf_addr;
-    unsigned int  buf_len;
-    unsigned int  offset;
-    unsigned long timeout_ns;
-};
-
-struct io_completion {
-    unsigned long user_data;
-    long          result;
-    unsigned int  flags;
-    unsigned int  opcode;
-};
-
-static long io_create(unsigned int flags) {
-    return syscall(SYS_IO_CREATE, flags);
-}
-
-static long io_submit(int port_fd, struct io_submission *entries, unsigned int count) {
-    return syscall(SYS_IO_SUBMIT, port_fd, entries, count);
-}
-
-static long io_wait(int port_fd, struct io_completion *comps, unsigned int max,
-                    unsigned int min, unsigned long timeout_ns) {
-    return syscall(SYS_IO_WAIT, port_fd, comps, max, min, timeout_ns);
-}
+#include "ostoo.h"
 
 /* ── main ────────────────────────────────────────────────────────────── */
 

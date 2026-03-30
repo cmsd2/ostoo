@@ -16,44 +16,10 @@
  *   mmap_file: all tests passed
  */
 
-#include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <string.h>
-
-/* ── helpers ─────────────────────────────────────────────────────────── */
-
-static void puts_stdout(const char *s) {
-    write(1, s, strlen(s));
-}
-
-static void put_char(char c) {
-    write(1, &c, 1);
-}
-
-static void put_hex(unsigned long n) {
-    char buf[17];
-    int i = 0;
-    if (n == 0) { puts_stdout("0x0"); return; }
-    while (n > 0) {
-        int d = n & 0xF;
-        buf[i++] = d < 10 ? '0' + d : 'a' + d - 10;
-        n >>= 4;
-    }
-    puts_stdout("0x");
-    while (--i >= 0) put_char(buf[i]);
-}
-
-static void put_dec(unsigned long n) {
-    char buf[21];
-    int i = 0;
-    if (n == 0) { put_char('0'); return; }
-    while (n > 0) {
-        buf[i++] = '0' + (n % 10);
-        n /= 10;
-    }
-    while (--i >= 0) put_char(buf[i]);
-}
+#include "ostoo.h"
 
 /* ── main ────────────────────────────────────────────────────────────── */
 
@@ -76,9 +42,9 @@ int main(void) {
     }
 
     puts_stdout("mmap_file: opened fd=");
-    put_dec((unsigned long)fd);
+    put_num((long)fd);
     puts_stdout(", read ");
-    put_dec((unsigned long)nread);
+    put_num(nread);
     puts_stdout(" bytes via read()\n");
 
     /* Step 2: mmap the file — need to reopen since read() advanced the pos. */
@@ -105,7 +71,7 @@ int main(void) {
     for (long i = 0; i < nread; i++) {
         if (mp[i] != read_buf[i]) {
             puts_stdout("mmap_file: MISMATCH at byte ");
-            put_dec((unsigned long)i);
+            put_num(i);
             puts_stdout(": read=");
             put_hex(read_buf[i]);
             puts_stdout(" mmap=");
@@ -120,7 +86,7 @@ int main(void) {
         _exit(1);
     }
     puts_stdout("mmap_file: first ");
-    put_dec((unsigned long)nread);
+    put_num(nread);
     puts_stdout(" bytes match read() — OK\n");
 
     /* Step 4: munmap */

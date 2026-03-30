@@ -23,58 +23,9 @@
  *   PASS
  */
 
-#include <unistd.h>
 #include <string.h>
 #include <errno.h>
-#include <sys/syscall.h>
-
-/* ── helpers ─────────────────────────────────────────────────────────── */
-
-static void print(const char *s) {
-    write(1, s, strlen(s));
-}
-
-static void put_char(char c) {
-    write(1, &c, 1);
-}
-
-static void put_num(long n) {
-    char buf[20];
-    int i = 0;
-    int neg = 0;
-    if (n < 0) { neg = 1; n = -n; }
-    if (n == 0) { put_char('0'); return; }
-    while (n > 0) {
-        buf[i++] = '0' + (n % 10);
-        n /= 10;
-    }
-    if (neg) put_char('-');
-    while (--i >= 0) put_char(buf[i]);
-}
-
-/* ── IPC channel syscall wrappers ────────────────────────────────────── */
-
-#define SYS_IPC_CREATE 505
-#define SYS_IPC_SEND   506
-#define SYS_IPC_RECV   507
-
-struct ipc_message {
-    unsigned long tag;
-    unsigned long data[3];
-    int           fds[4];
-};
-
-static long ipc_create(int fds[2], unsigned capacity, unsigned flags) {
-    return syscall(SYS_IPC_CREATE, fds, capacity, flags);
-}
-
-static long ipc_send(int fd, const struct ipc_message *msg, unsigned flags) {
-    return syscall(SYS_IPC_SEND, fd, msg, flags);
-}
-
-static long ipc_recv(int fd, struct ipc_message *msg, unsigned flags) {
-    return syscall(SYS_IPC_RECV, fd, msg, flags);
-}
+#include "ostoo.h"
 
 /* ── main ────────────────────────────────────────────────────────────── */
 
@@ -85,30 +36,30 @@ int main(void) {
     /* Create a pipe */
     int pipe_fds[2];
     if (pipe(pipe_fds) < 0) {
-        print("ipc_fdpass: pipe failed\n");
+        puts_stdout("ipc_fdpass: pipe failed\n");
         _exit(1);
     }
     int pipe_read = pipe_fds[0];
     int pipe_write = pipe_fds[1];
 
-    print("ipc_fdpass: created pipe read_fd=");
+    puts_stdout("ipc_fdpass: created pipe read_fd=");
     put_num(pipe_read);
-    print(" write_fd=");
+    puts_stdout(" write_fd=");
     put_num(pipe_write);
     put_char('\n');
 
     /* Create an async IPC channel */
     int ch_fds[2];
     if (ipc_create(ch_fds, 4, 0) < 0) {
-        print("ipc_fdpass: ipc_create failed\n");
+        puts_stdout("ipc_fdpass: ipc_create failed\n");
         _exit(1);
     }
     int send_fd = ch_fds[0];
     int recv_fd = ch_fds[1];
 
-    print("ipc_fdpass: created channel send_fd=");
+    puts_stdout("ipc_fdpass: created channel send_fd=");
     put_num(send_fd);
-    print(" recv_fd=");
+    puts_stdout(" recv_fd=");
     put_num(recv_fd);
     put_char('\n');
 
@@ -122,54 +73,54 @@ int main(void) {
 
         rc = ipc_send(send_fd, &msg, 0);
         if (rc < 0) {
-            print("ipc_fdpass: send failed: ");
+            puts_stdout("ipc_fdpass: send failed: ");
             put_num(rc);
             put_char('\n');
             pass = 0;
         } else {
-            print("ipc_fdpass: sent write_fd=");
+            puts_stdout("ipc_fdpass: sent write_fd=");
             put_num(pipe_write);
-            print(" through channel\n");
+            puts_stdout(" through channel\n");
         }
 
         /* Receive — should get a NEW fd number for the pipe write-end */
         struct ipc_message recv_msg;
         rc = ipc_recv(recv_fd, &recv_msg, 0);
         if (rc < 0) {
-            print("ipc_fdpass: recv failed: ");
+            puts_stdout("ipc_fdpass: recv failed: ");
             put_num(rc);
             put_char('\n');
             pass = 0;
         } else {
             int new_fd = recv_msg.fds[0];
-            print("ipc_fdpass: received new_fd=");
+            puts_stdout("ipc_fdpass: received new_fd=");
             put_num(new_fd);
             put_char('\n');
 
             if (new_fd < 0 || new_fd == pipe_write) {
-                print("test1: bad fd -- FAIL\n");
+                puts_stdout("test1: bad fd -- FAIL\n");
                 pass = 0;
             } else {
                 /* Write through the received fd */
                 const char *hello = "hello";
                 long written = write(new_fd, hello, 5);
-                print("ipc_fdpass: wrote ");
+                puts_stdout("ipc_fdpass: wrote ");
                 put_num(written);
-                print(" bytes through new_fd\n");
+                puts_stdout(" bytes through new_fd\n");
 
                 /* Read from pipe read-end */
                 char buf[16];
                 long nread = read(pipe_read, buf, sizeof(buf));
-                print("ipc_fdpass: read ");
+                puts_stdout("ipc_fdpass: read ");
                 put_num(nread);
-                print(" bytes from pipe: ");
+                puts_stdout(" bytes from pipe: ");
                 if (nread > 0) write(1, buf, nread);
                 put_char('\n');
 
                 if (nread == 5 && buf[0] == 'h' && buf[4] == 'o') {
-                    print("test1: fd transfer -- correct\n");
+                    puts_stdout("test1: fd transfer -- correct\n");
                 } else {
-                    print("test1: data mismatch -- FAIL\n");
+                    puts_stdout("test1: data mismatch -- FAIL\n");
                     pass = 0;
                 }
 
@@ -188,24 +139,24 @@ int main(void) {
 
         rc = ipc_send(send_fd, &msg, 0);
         if (rc < 0) {
-            print("ipc_fdpass: send stdout failed: ");
+            puts_stdout("ipc_fdpass: send stdout failed: ");
             put_num(rc);
             put_char('\n');
             pass = 0;
         } else {
-            print("ipc_fdpass: sent stdout through channel\n");
+            puts_stdout("ipc_fdpass: sent stdout through channel\n");
         }
 
         struct ipc_message recv_msg;
         rc = ipc_recv(recv_fd, &recv_msg, 0);
         if (rc < 0) {
-            print("ipc_fdpass: recv stdout failed: ");
+            puts_stdout("ipc_fdpass: recv stdout failed: ");
             put_num(rc);
             put_char('\n');
             pass = 0;
         } else {
             int new_stdout = recv_msg.fds[0];
-            print("ipc_fdpass: received new_stdout=");
+            puts_stdout("ipc_fdpass: received new_stdout=");
             put_num(new_stdout);
             put_char('\n');
 
@@ -215,7 +166,7 @@ int main(void) {
                 write(new_stdout, test_msg, strlen(test_msg));
                 close(new_stdout);
             } else {
-                print("test2: bad stdout fd -- FAIL\n");
+                puts_stdout("test2: bad stdout fd -- FAIL\n");
                 pass = 0;
             }
         }
@@ -227,9 +178,9 @@ int main(void) {
     close(recv_fd);
 
     if (pass) {
-        print("PASS\n");
+        puts_stdout("PASS\n");
     } else {
-        print("FAIL\n");
+        puts_stdout("FAIL\n");
         _exit(1);
     }
 

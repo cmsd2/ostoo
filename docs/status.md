@@ -164,6 +164,21 @@ are present, racing all event sources in a single future.
 - See [`docs/userspace-plan.md`](userspace-plan.md) for the full roadmap
   (Phases 0–6 complete; Phase 7 signals not yet started).
 
+### Userspace Libraries (`user/include/ostoo.h`, `user-rs/rt/`)
+- **C library** (`libostoo.a`): shared header `user/include/ostoo.h` with struct
+  definitions, syscall numbers, opcodes, and flags.  Static library
+  `user/lib/libostoo.a` provides typed syscall wrappers for all 12 custom
+  syscalls (501–512), output helpers (`puts_stdout`, `put_num`, `put_hex`),
+  conversion helpers (`itoa_buf`, `simple_atoi`), and ring buffer access
+  helpers (`sq_entry`, `cq_entry`).  All 21 demo programs have been migrated
+  to use the shared library, eliminating per-file boilerplate.
+- **Rust library** (`ostoo-rt` crate): two modules added to the existing
+  `user-rs/rt/` runtime crate.  `sys` module provides raw syscall wrappers
+  and `repr(C)` struct definitions matching the kernel ABI.  `ostoo` module
+  provides safe RAII types (`CompletionPort`, `IpcSend`/`IpcRecv`,
+  `SharedMem`, `NotifyFd`, `IrqFd`, `IoRing`) with automatic fd cleanup on
+  drop, plus builder methods on `IoSubmission` for each opcode.
+
 ### Userspace Shell (`user/src/shell.c`)
 - Primary user interface: musl-linked C binary, auto-launched on boot from
   `/bin/shell` via `kernel/src/main.rs`.

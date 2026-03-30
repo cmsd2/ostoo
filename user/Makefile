@@ -1,17 +1,27 @@
 CC      = x86_64-unknown-linux-musl-gcc
-CFLAGS  = -static -Os -Wall -Wextra
+AR      = x86_64-unknown-linux-musl-ar
+CFLAGS  = -static -Os -Wall -Wextra -Iinclude
 SOURCES = $(wildcard src/*.c)
 BINS    = $(patsubst src/%.c,bin/%,$(SOURCES))
 
-all: bin $(BINS)
+all: bin lib/libostoo.a $(BINS)
 
 bin:
 	mkdir -p bin
 
-bin/%: src/%.c | bin
-	$(CC) $(CFLAGS) -o $@ $<
+lib:
+	mkdir -p lib
+
+lib/libostoo.a: lib/ostoo.o | lib
+	$(AR) rcs $@ $<
+
+lib/ostoo.o: lib/ostoo.c include/ostoo.h | lib
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+bin/%: src/%.c lib/libostoo.a | bin
+	$(CC) $(CFLAGS) -o $@ $< -Llib -lostoo
 
 clean:
-	rm -rf bin
+	rm -rf bin lib/libostoo.a lib/ostoo.o
 
 .PHONY: all clean

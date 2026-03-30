@@ -21,78 +21,11 @@
  *   shmem_test: all tests passed
  */
 
-#include <unistd.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <spawn.h>
 #include <string.h>
-
-/* Custom syscall: shmem_create(size, flags) -> fd */
-#define SYS_SHMEM_CREATE 508
-#define SHM_CLOEXEC 0x01
-
-static long shmem_create(unsigned long size, unsigned int flags) {
-    return syscall(SYS_SHMEM_CREATE, size, flags);
-}
-
-/* -- helpers ------------------------------------------------------------ */
-
-static void puts_stdout(const char *s) {
-    write(1, s, strlen(s));
-}
-
-static void put_char(char c) {
-    write(1, &c, 1);
-}
-
-static void put_hex(unsigned long n) {
-    char buf[17];
-    int i = 0;
-    if (n == 0) { puts_stdout("0x0"); return; }
-    while (n > 0) {
-        int d = n & 0xF;
-        buf[i++] = d < 10 ? '0' + d : 'a' + d - 10;
-        n >>= 4;
-    }
-    puts_stdout("0x");
-    while (--i >= 0) put_char(buf[i]);
-}
-
-static void put_dec(long n) {
-    char buf[21];
-    int i = 0;
-    if (n < 0) { put_char('-'); n = -n; }
-    if (n == 0) { put_char('0'); return; }
-    while (n > 0) {
-        buf[i++] = '0' + (n % 10);
-        n /= 10;
-    }
-    while (--i >= 0) put_char(buf[i]);
-}
-
-static int simple_atoi(const char *s) {
-    int n = 0;
-    while (*s >= '0' && *s <= '9') {
-        n = n * 10 + (*s - '0');
-        s++;
-    }
-    return n;
-}
-
-static void itoa_buf(int n, char *buf, int bufsz) {
-    int i = 0;
-    if (n == 0) { buf[0] = '0'; buf[1] = '\0'; return; }
-    char tmp[16];
-    while (n > 0 && i < 15) {
-        tmp[i++] = '0' + (n % 10);
-        n /= 10;
-    }
-    int j = 0;
-    while (--i >= 0 && j < bufsz - 1) {
-        buf[j++] = tmp[i];
-    }
-    buf[j] = '\0';
-}
+#include "ostoo.h"
 
 /* Magic patterns */
 #define PARENT_MAGIC 0xDEADBEEF

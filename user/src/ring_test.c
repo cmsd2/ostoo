@@ -14,7 +14,7 @@
  * Child (producer):
  *   1. mmaps inherited shmem fd
  *   2. Writes magic pattern to shared memory
- *   3. Calls notify(notify_fd) to wake parent
+ *   3. Calls notify_signal(notify_fd) to wake parent
  *   4. Exits
  *
  * Expected output:
@@ -30,135 +30,14 @@
  *   ring_test: all tests passed
  */
 
-#include <unistd.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <spawn.h>
 #include <string.h>
-
-/* Custom syscalls */
-#define SYS_SHMEM_CREATE  508
-#define SYS_NOTIFY_CREATE 509
-#define SYS_NOTIFY        510
-#define SYS_IO_CREATE     501
-#define SYS_IO_SUBMIT     502
-#define SYS_IO_WAIT       503
-
-/* Opcodes */
-#define OP_RING_WAIT 7
-
-/* Flags */
-#define NOTIFY_CLOEXEC 0x01
+#include "ostoo.h"
 
 /* Magic pattern */
 #define MAGIC 0xDEADBEEF
-
-/* -- syscall wrappers --------------------------------------------------- */
-
-static long shmem_create(unsigned long size, unsigned int flags) {
-    return syscall(SYS_SHMEM_CREATE, size, flags);
-}
-
-static long notify_create(unsigned int flags) {
-    return syscall(SYS_NOTIFY_CREATE, flags);
-}
-
-static long notify(int fd) {
-    return syscall(SYS_NOTIFY, fd);
-}
-
-static long io_create(unsigned int flags) {
-    return syscall(SYS_IO_CREATE, flags);
-}
-
-/* IoSubmission: matches kernel repr(C) layout (48 bytes) */
-struct io_submission {
-    unsigned long user_data;
-    unsigned int  opcode;
-    unsigned int  flags;
-    int           fd;
-    int           _pad;
-    unsigned long buf_addr;
-    unsigned int  buf_len;
-    unsigned int  offset;
-    unsigned long timeout_ns;
-};
-
-/* IoCompletion: matches kernel repr(C) layout (24 bytes) */
-struct io_completion {
-    unsigned long user_data;
-    long          result;
-    unsigned int  flags;
-    unsigned int  opcode;
-};
-
-static long io_submit(int port_fd, const struct io_submission *entries, unsigned int count) {
-    return syscall(SYS_IO_SUBMIT, port_fd, entries, count);
-}
-
-static long io_wait(int port_fd, struct io_completion *completions,
-                    unsigned int max, unsigned int min, unsigned long timeout_ns) {
-    return syscall(SYS_IO_WAIT, port_fd, completions, max, min, timeout_ns);
-}
-
-/* -- helpers ------------------------------------------------------------ */
-
-static void puts_stdout(const char *s) {
-    write(1, s, strlen(s));
-}
-
-static void put_char(char c) {
-    write(1, &c, 1);
-}
-
-static void put_hex(unsigned long n) {
-    char buf[17];
-    int i = 0;
-    if (n == 0) { puts_stdout("0x0"); return; }
-    while (n > 0) {
-        int d = n & 0xF;
-        buf[i++] = d < 10 ? '0' + d : 'a' + d - 10;
-        n >>= 4;
-    }
-    puts_stdout("0x");
-    while (--i >= 0) put_char(buf[i]);
-}
-
-static void put_dec(long n) {
-    char buf[21];
-    int i = 0;
-    if (n < 0) { put_char('-'); n = -n; }
-    if (n == 0) { put_char('0'); return; }
-    while (n > 0) {
-        buf[i++] = '0' + (n % 10);
-        n /= 10;
-    }
-    while (--i >= 0) put_char(buf[i]);
-}
-
-static int simple_atoi(const char *s) {
-    int n = 0;
-    while (*s >= '0' && *s <= '9') {
-        n = n * 10 + (*s - '0');
-        s++;
-    }
-    return n;
-}
-
-static void itoa_buf(int n, char *buf, int bufsz) {
-    int i = 0;
-    if (n == 0) { buf[0] = '0'; buf[1] = '\0'; return; }
-    char tmp[16];
-    while (n > 0 && i < 15) {
-        tmp[i++] = '0' + (n % 10);
-        n /= 10;
-    }
-    int j = 0;
-    while (--i >= 0 && j < bufsz - 1) {
-        buf[j++] = tmp[i];
-    }
-    buf[j] = '\0';
-}
 
 /* -- child mode --------------------------------------------------------- */
 
@@ -180,7 +59,7 @@ static int child_main(int shmem_fd, int notify_fd) {
     puts_stdout("ring_test: child: wrote DEADBEEF\n");
 
     /* Signal the notify fd */
-    long ret = notify(notify_fd);
+    long ret = notify_signal(notify_fd);
     if (ret < 0) {
         puts_stdout("ring_test: child: notify failed: ");
         put_dec(ret);

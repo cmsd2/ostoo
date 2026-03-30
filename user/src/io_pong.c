@@ -7,31 +7,17 @@
  * Usage: io_pong <read_fd> <write_fd>
  */
 
-#include <unistd.h>
 #include <string.h>
-
-static void puts_stderr(const char *s) {
-    write(2, s, strlen(s));
-}
-
-/* Simple atoi (positive only) */
-static int my_atoi(const char *s) {
-    int n = 0;
-    while (*s >= '0' && *s <= '9') {
-        n = n * 10 + (*s - '0');
-        s++;
-    }
-    return n;
-}
+#include "ostoo.h"
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {
-        puts_stderr("io_pong: usage: io_pong <read_fd> <write_fd>\n");
+        puts_fd(2, "io_pong: usage: io_pong <read_fd> <write_fd>\n");
         _exit(1);
     }
 
-    int rd_fd = my_atoi(argv[1]);
-    int wr_fd = my_atoi(argv[2]);
+    int rd_fd = simple_atoi(argv[1]);
+    int wr_fd = simple_atoi(argv[2]);
 
     char buf[256];
 

@@ -12,82 +12,8 @@
  *   All 5 completions received!
  */
 
-#include <unistd.h>
 #include <string.h>
-
-/* ── helpers ─────────────────────────────────────────────────────────── */
-
-static void puts_fd(int fd, const char *s) {
-    write(fd, s, strlen(s));
-}
-
-static void puts_stdout(const char *s) {
-    puts_fd(1, s);
-}
-
-static void put_char(char c) {
-    write(1, &c, 1);
-}
-
-static void put_num(long n) {
-    char buf[20];
-    int i = 0;
-    int neg = 0;
-    if (n < 0) { neg = 1; n = -n; }
-    if (n == 0) { put_char('0'); return; }
-    while (n > 0) {
-        buf[i++] = '0' + (n % 10);
-        n /= 10;
-    }
-    if (neg) put_char('-');
-    while (--i >= 0) put_char(buf[i]);
-}
-
-/* ── syscall wrappers for custom ostoo syscalls ──────────────────────── */
-
-#define SYS_IO_CREATE 501
-#define SYS_IO_SUBMIT 502
-#define SYS_IO_WAIT   503
-
-/* Opcodes (must match kernel) */
-#define OP_NOP     0
-#define OP_TIMEOUT 1
-#define OP_READ    2
-#define OP_WRITE   3
-
-/* IoSubmission: matches the kernel's repr(C) layout (48 bytes) */
-struct io_submission {
-    unsigned long user_data;     /* 8 */
-    unsigned int  opcode;        /* 4 */
-    unsigned int  flags;         /* 4 */
-    int           fd;            /* 4 */
-    int           _pad;          /* 4 */
-    unsigned long buf_addr;      /* 8 */
-    unsigned int  buf_len;       /* 4 */
-    unsigned int  offset;        /* 4 */
-    unsigned long timeout_ns;    /* 8 */
-};
-
-/* IoCompletion: matches the kernel's repr(C) layout (24 bytes) */
-struct io_completion {
-    unsigned long user_data;     /* 8 */
-    long          result;        /* 8 */
-    unsigned int  flags;         /* 4 */
-    unsigned int  opcode;        /* 4 */
-};
-
-static long io_create(unsigned int flags) {
-    return syscall(SYS_IO_CREATE, flags);
-}
-
-static long io_submit(int port_fd, struct io_submission *entries, unsigned int count) {
-    return syscall(SYS_IO_SUBMIT, port_fd, entries, count);
-}
-
-static long io_wait(int port_fd, struct io_completion *comps, unsigned int max,
-                    unsigned int min, unsigned long timeout_ns) {
-    return syscall(SYS_IO_WAIT, port_fd, comps, max, min, timeout_ns);
-}
+#include "ostoo.h"
 
 /* ── opcode name ─────────────────────────────────────────────────────── */
 
