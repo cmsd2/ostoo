@@ -71,7 +71,7 @@ How it works:
    `irq_fd_dispatch`, which reads port 0x60 and delivers the scancode
    in `completion.result`. The GSI is kept unmasked between interrupts
    so that edge-triggered IRQ edges are never lost; scancodes that
-   arrive between OP_IRQ_WAIT re-arms are buffered in a 16-entry ring.
+   arrive between OP_IRQ_WAIT re-arms are buffered in a 64-entry ring.
 2. Creates a registration channel and calls `svc_register("keyboard")`.
 3. Event loop on CompletionPort:
    - `OP_IRQ_WAIT` → receives scancode → decodes via scancode set 1
@@ -118,12 +118,17 @@ How it works:
 
 1. `/bin/mouse` calls `irq_create(12)` — claims mouse IRQ via the
    existing IRQ fd mechanism. The kernel automatically initializes
-   the PS/2 auxiliary port (i8042 controller) when GSI 12 is claimed,
-   enabling mouse data reporting and IRQ 12 delivery.
+   the PS/2 auxiliary port (i8042 controller) when GSI 12 is claimed:
+   enables the auxiliary port, sets sample rate to 20/sec (reduces
+   data rate from default 100), enables data reporting, and turns on
+   the auxiliary interrupt in the i8042 command byte.
 2. Creates a registration channel and calls `svc_register("mouse")`.
 3. Event loop: collects 3-byte PS/2 packets (sync on byte 0 bit 3),
-   decodes deltas and buttons, tracks absolute cursor position
-   (clamped to screen bounds), broadcasts to connected clients.
+   decodes signed deltas using the OSDev wiki formula
+   (`dx = d - ((state << 4) & 0x100)`), tracks absolute cursor
+   position (clamped to screen bounds), broadcasts batched updates
+   to connected clients (one IPC send per io_wait round, collapsing
+   intermediate positions).
 
 ### Mouse Protocol
 
@@ -147,24 +152,35 @@ using `svc_lookup_retry()`. Key events are forwarded to the focused
 window's client via `MSG_KEY_EVENT` (tag 5). Mouse events drive the
 cursor, focus, window movement, and resizing.
 
-### Window Decorations (Server-Side)
+### Window Decorations (Server-Side, CDE Style)
 
-The compositor draws server-side decorations around each client window:
+The compositor draws server-side decorations inspired by the Common Desktop
+Environment (CDE) / Motif toolkit, with 3D beveled borders:
 
 ```
-┌─────────────────────────────┐ ─┐
-│ [X] Win 1                   │  │ TITLE_H = 20px
-├─────────────────────────────┤ ─┘
-│                             │
-│       Client Content        │  client buffer (w × h)
-│                             │
-└─────────────────────────────┘
-  BORDER_W = 2px on all sides
+╔═══════════════════════════════╗ ─┐
+║ ┌──┐                          ║  │
+║ │▪▪│    Win 1 (centered)      ║  │ TITLE_H = 24px
+║ └──┘                          ║  │
+╠═══════════════════════════════╣ ─┘
+║ ┌───────────────────────────┐ ║
+║ │                           │ ║
+║ │     Client Content        │ ║  client buffer (w × h)
+║ │                           │ ║  (sunken inner bevel)
+║ └───────────────────────────┘ ║
+╚═══════════════════════════════╝
+  BORDER_W = 4px, BEVEL = 2px
 ```
 
-- Title bar: highlighted when focused, dimmed when unfocused
-- Close button: `[X]` in top-right of title bar
-- Window title: "Win N" rendered with 8×16 CP437 font
+- **3D bevels**: `draw_bevel()` renders light/dark edge pairs on all four
+  sides to create a raised or sunken look (2px bevel width)
+- **Title bar** (24px): raised bevel, blue when focused, grey when unfocused
+- **Close button**: raised square with inner square motif (CDE style),
+  positioned in the top-left of the title bar
+- **Window title**: centered text rendered with 8×16 CP437 font
+- **Client area**: surrounded by a sunken inner bevel
+- **Color palette**: blue-grey CDE theme (slate blue desktop, cool grey-blue
+  window frames, blue active title bars)
 
 ### Window Management
 
@@ -174,18 +190,29 @@ moves to the top of the Z-order and receives keyboard input.
 **Move**: Drag the title bar to move a window.
 
 **Resize**: Drag the bottom edge, right edge, or bottom-right corner
-to resize. On mouse-up, the compositor allocates a new shared buffer
-and sends `MSG_WINDOW_RESIZED` to the client. The terminal emulator
-recalculates cols/rows and clears the screen.
+to resize. The cursor changes to indicate the resize direction:
+diagonal double-arrow for corners, horizontal for right edge, vertical
+for bottom edge. During drag, the window frame updates live. On
+mouse-up, the compositor allocates a new shared buffer and sends
+`MSG_WINDOW_RESIZED` to the client. The terminal emulator remaps the
+new buffer, recalculates cols/rows, clears the screen, and nudges the
+shell to redraw its prompt.
 
-**Close**: Click the `[X]` button to close a window.
+**Close**: Click the close button to close a window.
 
-### Compositor Double Buffering
+### Compositor Double Buffering & Cursor-Only Rendering
 
 The compositor uses an offscreen back buffer (heap-allocated, same
-size as the framebuffer) to eliminate flicker. Each composite pass
-clears and draws windows into the back buffer, then copies the
-finished frame to the LFB in a single `memcpy`.
+size as the framebuffer) to eliminate flicker. Full composite passes
+clear and draw all windows (with decorations) into the back buffer,
+then copy the finished frame to the LFB in a single `memcpy`.
+
+**Cursor-only optimization**: Mouse movement that doesn't change the
+scene (no window drag, no focus change) takes a fast path: restore
+the old cursor rectangle from the back buffer (~12x8 pixels), draw
+the cursor at the new position, and patch only those two small
+rectangles on the LFB. This avoids the full 3 MB recomposite on
+every mouse event.
 
 ### Terminal Emulator and Shell
 

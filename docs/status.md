@@ -280,6 +280,7 @@ are present, racing all event sources in a single future.
   - `/proc/pci` — enumerated PCI devices.
   - `/proc/lapic` — Local APIC state and timer configuration.
   - `/proc/ioapic` — I/O APIC redirection table entries.
+  - `/proc/irq_stats` — per-slot IRQ counters (total, delivered, buffered, spurious).
 - Shell commands: `ls`, `cat`, `cd` use the VFS API; `mount` manages the
   mount table at runtime (`mount`, `mount proc <mp>`, `mount blk <mp>`).
 - `/proc` is always mounted at boot; exFAT `/` is mounted if virtio-blk is
@@ -319,8 +320,13 @@ are present, racing all event sources in a single future.
 - Userspace interrupt delivery via `irq_create(gsi)` syscall (504).
 - `IrqInner` tracks GSI, vector, slot, and saved IO APIC redirection entry.
 - ISR handler (`irq_fd_dispatch`) masks the GSI via `libkernel::apic::mask_gsi`
-  and posts a completion to the associated `CompletionPort`.
-- Keyboard (GSI 1) scancode ring buffer prevents lost scancodes between rearms.
+  and posts a completion to the associated `CompletionPort`. For keyboard
+  (GSI 1) and mouse (GSI 12), the ISR reads port 0x60 and drains all
+  available bytes per interrupt (up to 16 per ISR invocation).
+- 64-entry scancode ring buffer per slot prevents lost scancodes between
+  rearms. `arm_irq` bulk-drains the entire buffer into completions.
+- Per-slot atomic IRQ counters (total, delivered, buffered, spurious,
+  wrong_source) visible via `/proc/irq_stats`.
 - On close, the original IO APIC entry is restored.
 - Demo: `user/irq_demo.c` — keyboard scancode display via OP_IRQ_WAIT.
 
@@ -471,18 +477,36 @@ output but functionally harmless.
 7. **exFAT write support** — directory entry creation, FAT chain allocation,
    and sector writes to enable `touch`, `mkdir`, `cp`, `rm`.
 
-### Compositor
+### Compositor & Window Management
 
-10. **Userspace compositor** — Wayland-style display server that takes ownership
-    of the BGA framebuffer.  Three new syscalls: `svc_register` (513) and
-    `svc_lookup` (514) for kernel-global service discovery, and
-    `framebuffer_open` (515) to expose the LFB as a shared-memory fd.
-    Clients connect via IPC fd-passing on a well-known service name, receive
-    shared-memory pixel buffers, and signal damage via notification fds.
-    The compositor composites all windows to the LFB using a painter's
-    algorithm.  MVP: window creation, buffer alloc, damage, compositing.
-    No input routing or window management yet.
-    See [`docs/compositor-design.md`](compositor-design.md).
+The userspace compositor (`/bin/compositor`) is a Wayland-style display server
+with full input routing and window management.
+
+- **Display**: Takes exclusive ownership of the BGA framebuffer via
+  `framebuffer_open` (515). Double-buffered compositing with painter's
+  algorithm. Cursor-only rendering optimization patches small rectangles
+  for mouse movement instead of full recomposite.
+- **Input**: Connects to `/bin/kbd` (keyboard) and `/bin/mouse` (mouse)
+  services via the service registry (`svc_register` 513, `svc_lookup` 514).
+  Key events forwarded to focused window. Mouse events drive cursor, focus,
+  drag, and resize.
+- **CDE-style decorations**: Server-side window decorations inspired by
+  CDE/Motif — 3D beveled borders (BORDER_W=4, BEVEL=2), 24px title bar
+  with centered title, CDE-style close button, sunken inner bevel around
+  client area. Blue-grey color palette.
+- **Window management**: Click-to-focus with Z-order raise. Title bar drag
+  to move. Edge/corner drag to resize with context-sensitive cursor icons
+  (diagonal, horizontal, vertical double-arrows). Close button removes
+  window.
+- **Resize protocol**: On resize completion, compositor allocates a new
+  shared buffer and sends `MSG_WINDOW_RESIZED` (tag 7) with the new
+  buffer fd. Terminal emulator remaps buffer, recalculates dimensions,
+  and redraws.
+- **Terminal emulator** (`/bin/term`): Compositor client that spawns
+  `/bin/shell` with pipe-connected stdin/stdout. VT100 parser with
+  color support. Handles window resize.
+- See [`docs/compositor-design.md`](compositor-design.md) and
+  [`docs/display-input-ownership.md`](display-input-ownership.md).
 
 ### Microkernel Path
 

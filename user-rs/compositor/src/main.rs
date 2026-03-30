@@ -23,20 +23,23 @@ const FB_WIDTH: usize = 1024;
 const FB_HEIGHT: usize = 768;
 const FB_STRIDE: usize = FB_WIDTH * 4;
 
-const BG_COLOR: u32 = 0x00282828; // dark grey background
+const BG_COLOR: u32 = 0x00385070; // muted slate blue desktop
 
-// Window decoration dimensions
-const TITLE_H: usize = 20;
-const BORDER_W: usize = 2;
+// Window decoration dimensions (CDE/Motif style)
+const TITLE_H: usize = 24;
+const BORDER_W: usize = 4;
+const BEVEL: usize = 2; // 3D bevel thickness
 
-// Colors (BGRA)
-const TITLE_FOCUSED: u32 = 0x00505080; // blueish
-const TITLE_UNFOCUSED: u32 = 0x00404040; // dim grey
-const TITLE_TEXT: u32 = 0x00FFFFFF; // white
-const BORDER_COLOR: u32 = 0x00606060; // medium grey
-const CLOSE_BG: u32 = 0x00404060; // close button bg
-#[allow(dead_code)]
-const CLOSE_HOVER: u32 = 0x000000CC; // red-ish close button (reserved for hover)
+// CDE palette (0x00RRGGBB — standard XRGB as u32 little-endian)
+const CDE_BG: u32 = 0x007088A0;           // cool grey-blue base
+const CDE_BG_LIGHT: u32 = 0x00A0B8C8;     // bevel highlight (top/left)
+const CDE_BG_DARK: u32 = 0x00506070;      // bevel shadow (bottom/right)
+const CDE_ACTIVE_TITLE: u32 = 0x004060B0;  // active title bar (blue)
+const CDE_ACTIVE_LIGHT: u32 = 0x006888D0;  // active highlight
+const CDE_ACTIVE_DARK: u32 = 0x00283880;   // active shadow
+const CDE_INACTIVE_TITLE: u32 = CDE_BG;    // inactive = base grey-blue
+const TITLE_TEXT: u32 = 0x00FFFFFF;         // white text
+const TITLE_TEXT_INACTIVE: u32 = 0x00A0B8C8; // dimmed text
 
 const MAX_WINDOWS: usize = 4;
 const MAX_COMPLETIONS: usize = 16;
@@ -48,13 +51,25 @@ const TAG_CMD_BASE: u64 = 0x3000;
 const TAG_KEYBOARD: u64 = 0x4000;
 const TAG_MOUSE: u64 = 0x5000;
 
-// Close button dimensions (top-right of title bar)
-const CLOSE_W: usize = 20;
-const CLOSE_H: usize = TITLE_H;
+// CDE-style window button dimensions (square, inset in title bar)
+const BTN_SIZE: usize = 18;
+const BTN_MARGIN: usize = (TITLE_H - BTN_SIZE) / 2;
 
-// Cursor bitmap (12x16, 1-bit)
+// Cursor bitmaps (16-bit wide rows, 1-bit per pixel)
+const CURSOR_W: usize = 12;
+const CURSOR_H: usize = 16;
+
+#[derive(Clone, Copy, PartialEq)]
+enum CursorStyle {
+    Arrow,
+    ResizeDiag,    // bottom-right / top-left diagonal
+    ResizeHoriz,   // left-right horizontal
+    ResizeVert,    // up-down vertical
+}
+
+// Arrow pointer
 #[rustfmt::skip]
-static CURSOR_BITMAP: [u16; 16] = [
+static CURSOR_ARROW: [u16; 16] = [
     0b1000_0000_0000_0000,
     0b1100_0000_0000_0000,
     0b1110_0000_0000_0000,
@@ -72,8 +87,69 @@ static CURSOR_BITMAP: [u16; 16] = [
     0b0000_0110_0000_0000,
     0b0000_0000_0000_0000,
 ];
-const CURSOR_W: usize = 12;
-const CURSOR_H: usize = 16;
+
+// Diagonal resize (NW-SE double arrow, 12x12 centered in 16-bit rows)
+#[rustfmt::skip]
+static CURSOR_RESIZE_DIAG: [u16; 16] = [
+    0b1111_1000_0000_0000,
+    0b1100_0000_0000_0000,
+    0b1010_0000_0000_0000,
+    0b1001_0000_0000_0000,
+    0b1000_1000_0000_0000,
+    0b0000_0100_0000_0000,
+    0b0000_0010_0000_0000,
+    0b0000_0001_0000_0000,
+    0b0000_0000_1000_0000,
+    0b0000_0100_0100_0000,
+    0b0000_0010_0100_0000,
+    0b0000_0001_0100_0000,
+    0b0000_0000_1100_0000,
+    0b0000_0011_1110_0000,
+    0b0000_0000_0000_0000,
+    0b0000_0000_0000_0000,
+];
+
+// Horizontal resize (left-right double arrow)
+#[rustfmt::skip]
+static CURSOR_RESIZE_HORIZ: [u16; 16] = [
+    0b0000_0000_0000_0000,
+    0b0000_0000_0000_0000,
+    0b0000_0000_0000_0000,
+    0b0000_0000_0000_0000,
+    0b0001_0000_0100_0000,
+    0b0011_0000_0110_0000,
+    0b0111_1111_1110_0000,
+    0b1111_1111_1111_0000,
+    0b0111_1111_1110_0000,
+    0b0011_0000_0110_0000,
+    0b0001_0000_0100_0000,
+    0b0000_0000_0000_0000,
+    0b0000_0000_0000_0000,
+    0b0000_0000_0000_0000,
+    0b0000_0000_0000_0000,
+    0b0000_0000_0000_0000,
+];
+
+// Vertical resize (up-down double arrow)
+#[rustfmt::skip]
+static CURSOR_RESIZE_VERT: [u16; 16] = [
+    0b0000_0100_0000_0000,
+    0b0000_1110_0000_0000,
+    0b0001_1111_0000_0000,
+    0b0011_1111_1000_0000,
+    0b0000_0100_0000_0000,
+    0b0000_0100_0000_0000,
+    0b0000_0100_0000_0000,
+    0b0000_0100_0000_0000,
+    0b0000_0100_0000_0000,
+    0b0000_0100_0000_0000,
+    0b0000_0100_0000_0000,
+    0b0000_0100_0000_0000,
+    0b0011_1111_1000_0000,
+    0b0001_1111_0000_0000,
+    0b0000_1110_0000_0000,
+    0b0000_0100_0000_0000,
+];
 
 // ── Window state ─────────────────────────────────────────────────────
 
@@ -155,10 +231,12 @@ fn hit_test(windows: &[Window], mx: usize, my: usize) -> (Option<usize>, HitZone
                 return (Some(idx), HitZone::ResizeBottom);
             }
 
-            // Close button: top-right of title bar.
-            let close_x1 = x2.saturating_sub(CLOSE_W);
-            let close_y2 = y1 + TITLE_H;
-            if mx >= close_x1 && mx < x2 && my >= y1 && my < close_y2 {
+            // Close button: right side of title bar (CDE-style square button).
+            let close_x1 = x2 - BORDER_W - BTN_MARGIN - BTN_SIZE;
+            let close_y1 = y1 + BTN_MARGIN;
+            if mx >= close_x1 && mx < close_x1 + BTN_SIZE
+                && my >= close_y1 && my < close_y1 + BTN_SIZE
+            {
                 return (Some(idx), HitZone::CloseButton);
             }
 
@@ -274,10 +352,11 @@ fn run() -> Result<(), OsError> {
     let mut buttons: u8 = 0;
     let mut focused_wid: Option<u64> = None;
     let mut drag = DragMode::None;
+    let mut cursor_style = CursorStyle::Arrow;
 
     // Initial paint.
     composite(fb_ptr, back_ptr, &windows, focused_wid);
-    draw_cursor(fb_ptr, cursor_x, cursor_y);
+    draw_cursor(fb_ptr, cursor_x, cursor_y, cursor_style);
 
     // 8. Event loop.
     loop {
@@ -456,9 +535,18 @@ fn run() -> Result<(), OsError> {
                             scene_dirty = true;
                         }
                         DragMode::None => {
+                            let (hit_idx, zone) =
+                                hit_test(&windows, cursor_x, cursor_y);
+
+                            // Update cursor style based on hover zone.
+                            cursor_style = match zone {
+                                HitZone::ResizeBottomRight => CursorStyle::ResizeDiag,
+                                HitZone::ResizeRight => CursorStyle::ResizeHoriz,
+                                HitZone::ResizeBottom => CursorStyle::ResizeVert,
+                                _ => CursorStyle::Arrow,
+                            };
+
                             if left_down {
-                                let (hit_idx, zone) =
-                                    hit_test(&windows, cursor_x, cursor_y);
                                 if let Some(idx) = hit_idx {
                                     let wid = windows[idx].id;
                                     // Focus + raise to top.
@@ -569,13 +657,13 @@ fn run() -> Result<(), OsError> {
         if scene_dirty {
             // Full recomposite: redraw scene to back buffer, copy to LFB, draw cursor.
             composite(fb_ptr, back_ptr, &windows, focused_wid);
-            draw_cursor(fb_ptr, cursor_x, cursor_y);
+            draw_cursor(fb_ptr, cursor_x, cursor_y, cursor_style);
             prev_cursor_x = cursor_x;
             prev_cursor_y = cursor_y;
         } else if cursor_moved {
             // Cursor-only: restore old cursor rect from back buffer, draw at new pos.
             restore_rect(fb_ptr, back_ptr, prev_cursor_x, prev_cursor_y, CURSOR_W, CURSOR_H);
-            draw_cursor(fb_ptr, cursor_x, cursor_y);
+            draw_cursor(fb_ptr, cursor_x, cursor_y, cursor_style);
             prev_cursor_x = cursor_x;
             prev_cursor_y = cursor_y;
         }
@@ -768,35 +856,75 @@ fn draw_decorations(fb_ptr: *mut u8, win: &Window, focused: bool) {
     let dw = win.dec_w();
     let dh = win.dec_h();
 
-    // Border.
-    fill_rect(fb_ptr, x, y, dw, dh, BORDER_COLOR);
+    let (base, light, dark) = if focused {
+        (CDE_ACTIVE_TITLE, CDE_ACTIVE_LIGHT, CDE_ACTIVE_DARK)
+    } else {
+        (CDE_INACTIVE_TITLE, CDE_BG_LIGHT, CDE_BG_DARK)
+    };
+    let text_color = if focused { TITLE_TEXT } else { TITLE_TEXT_INACTIVE };
 
-    // Title bar.
-    let title_color = if focused { TITLE_FOCUSED } else { TITLE_UNFOCUSED };
-    fill_rect(fb_ptr, x + BORDER_W, y, dw - 2 * BORDER_W, TITLE_H, title_color);
+    // Fill entire decoration area with base color.
+    fill_rect(fb_ptr, x, y, dw, dh, base);
 
-    // Close button.
-    let close_x = x + dw - CLOSE_W;
-    fill_rect(fb_ptr, close_x, y, CLOSE_W, CLOSE_H, CLOSE_BG);
+    // Outer bevel: light top/left, dark bottom/right.
+    draw_bevel(fb_ptr, x, y, dw, dh, BEVEL, light, dark);
 
-    // Draw "X" text in close button.
-    let cx = close_x + (CLOSE_W - font::FONT_WIDTH) / 2;
-    let cy = y + (TITLE_H - font::FONT_HEIGHT) / 2;
-    font::draw_char(fb_ptr, FB_STRIDE, FB_WIDTH, FB_HEIGHT, b'X', cx, cy, TITLE_TEXT, CLOSE_BG);
+    // Inner bevel around client area (sunken).
+    let cx = x + BORDER_W;
+    let cy = y + TITLE_H;
+    let cw = dw - 2 * BORDER_W;
+    let ch = dh - TITLE_H - BORDER_W;
+    draw_bevel(fb_ptr, cx - 1, cy - 1, cw + 2, ch + 2, 1, dark, light);
 
-    // Draw window title: "Win N".
-    let title_x = x + BORDER_W + 4;
-    let title_y = y + (TITLE_H - font::FONT_HEIGHT) / 2;
+    // Close button (right side, CDE-style raised square).
+    let btn_x = x + dw - BORDER_W - BTN_MARGIN - BTN_SIZE;
+    let btn_y = y + BTN_MARGIN;
+    fill_rect(fb_ptr, btn_x, btn_y, BTN_SIZE, BTN_SIZE, base);
+    draw_bevel(fb_ptr, btn_x, btn_y, BTN_SIZE, BTN_SIZE, 1, light, dark);
+    // Small inner square (CDE close button motif).
+    let inner = 4;
+    let ix = btn_x + (BTN_SIZE - inner * 2) / 2;
+    let iy = btn_y + (BTN_SIZE - inner * 2) / 2;
+    fill_rect(fb_ptr, ix, iy, inner * 2, inner * 2, dark);
+    draw_bevel(fb_ptr, ix, iy, inner * 2, inner * 2, 1, light, dark);
+
+    // Window title text — centered in title bar.
     let title = window_title(win.id);
+    let mut title_len = 0;
+    for &ch in title.iter() {
+        if ch == 0 { break; }
+        title_len += 1;
+    }
+    let text_w = title_len * font::FONT_WIDTH;
+    let title_x = x + (dw - text_w) / 2;
+    let title_y = y + (TITLE_H - font::FONT_HEIGHT) / 2;
     for (i, &ch) in title.iter().enumerate() {
-        if ch == 0 {
-            break;
-        }
+        if ch == 0 { break; }
         let px = title_x + i * font::FONT_WIDTH;
-        if px + font::FONT_WIDTH > close_x {
+        if px + font::FONT_WIDTH > btn_x {
             break;
         }
-        font::draw_char(fb_ptr, FB_STRIDE, FB_WIDTH, FB_HEIGHT, ch, px, title_y, TITLE_TEXT, title_color);
+        font::draw_char(fb_ptr, FB_STRIDE, FB_WIDTH, FB_HEIGHT, ch, px, title_y, text_color, base);
+    }
+}
+
+/// Draw a 3D bevel (raised): light on top/left edges, dark on bottom/right.
+fn draw_bevel(fb_ptr: *mut u8, x: usize, y: usize, w: usize, h: usize, thickness: usize, light: u32, dark: u32) {
+    // Top edge (light).
+    for t in 0..thickness {
+        fill_rect(fb_ptr, x + t, y + t, w - 2 * t, 1, light);
+    }
+    // Left edge (light).
+    for t in 0..thickness {
+        fill_rect(fb_ptr, x + t, y + t, 1, h - 2 * t, light);
+    }
+    // Bottom edge (dark).
+    for t in 0..thickness {
+        fill_rect(fb_ptr, x + t, y + h - 1 - t, w - 2 * t, 1, dark);
+    }
+    // Right edge (dark).
+    for t in 0..thickness {
+        fill_rect(fb_ptr, x + w - 1 - t, y + t, 1, h - 2 * t, dark);
     }
 }
 
@@ -868,7 +996,13 @@ fn fill_rect(fb_ptr: *mut u8, x: usize, y: usize, w: usize, h: usize, color: u32
     }
 }
 
-fn draw_cursor(fb_ptr: *mut u8, cx: usize, cy: usize) {
+fn draw_cursor(fb_ptr: *mut u8, cx: usize, cy: usize, style: CursorStyle) {
+    let bitmap = match style {
+        CursorStyle::Arrow => &CURSOR_ARROW,
+        CursorStyle::ResizeDiag => &CURSOR_RESIZE_DIAG,
+        CursorStyle::ResizeHoriz => &CURSOR_RESIZE_HORIZ,
+        CursorStyle::ResizeVert => &CURSOR_RESIZE_VERT,
+    };
     let white = 0x00FFFFFFu32.to_le_bytes();
     let black = 0x00000000u32.to_le_bytes();
 
@@ -877,7 +1011,7 @@ fn draw_cursor(fb_ptr: *mut u8, cx: usize, cy: usize) {
         if dy >= FB_HEIGHT {
             break;
         }
-        let bits = CURSOR_BITMAP[row];
+        let bits = bitmap[row];
         for col in 0..CURSOR_W {
             let dx = cx + col;
             if dx >= FB_WIDTH {
@@ -885,14 +1019,12 @@ fn draw_cursor(fb_ptr: *mut u8, cx: usize, cy: usize) {
             }
             if bits & (1 << (15 - col)) != 0 {
                 let off = dy * FB_STRIDE + dx * 4;
-                // Draw white pixel with black outline (simple: just white for now).
                 unsafe {
-                    // Black outline: check if this is an edge pixel.
                     let is_edge = col == 0
                         || row == 0
                         || (bits & (1 << (15 - col + 1)) == 0)
                         || (row + 1 < CURSOR_H
-                            && CURSOR_BITMAP[row + 1] & (1 << (15 - col)) == 0);
+                            && bitmap[row + 1] & (1 << (15 - col)) == 0);
                     let color = if is_edge { &black } else { &white };
                     core::ptr::copy_nonoverlapping(color.as_ptr(), fb_ptr.add(off), 4);
                 }

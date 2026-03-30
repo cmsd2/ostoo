@@ -7,6 +7,8 @@ layer, and virtio drivers.
 
 ![Boot and shell demo](media/console.gif)
 
+![Compositor with CDE-style window decorations](media/Screenshot%202026-03-30%20at%2019.08.55.png)
+
 ## Requirements
 
 - Rust nightly (rustc, cargo, rustup)
@@ -125,6 +127,7 @@ vs `$` for the userspace shell).
 | [`docs/cross-compiling-c.md`](docs/cross-compiling-c.md) | Cross-compiling C for the kernel |
 | [`docs/testing.md`](docs/testing.md) | Testing strategy and infrastructure |
 | [`docs/code-audit.md`](docs/code-audit.md) | Code quality audit and improvement tracking |
+| [`docs/display-input-ownership.md`](docs/display-input-ownership.md) | Display & input handoff, compositor, window management |
 
 ## License
 
