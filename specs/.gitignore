@@ -1,0 +1,6 @@
+# pcal.trans backup files
+*.old
+
+# TLC model checker output
+states/
+*.dump
