@@ -11,7 +11,8 @@ use alloc::vec::Vec;
 use ostoo_rt::compositor_proto::*;
 use ostoo_rt::kbd_proto;
 use ostoo_rt::ostoo::{
-    self, FramebufferMem, IoRing, IpcRecv, IpcSend, IrqFd, NotifyFd, OsError, SharedMem,
+    self, unpack_mouse_event, FramebufferMem, IoRing, IpcRecv, IpcSend, IrqFd, NotifyFd, OsError,
+    SharedMem,
 };
 use ostoo_rt::sys::{self, IoSubmission, IpcMessage};
 use ostoo_rt::{eprintln, println};
@@ -147,65 +148,6 @@ static CURSOR_RESIZE_VERT: [u16; 16] = [
     0b0000_1110_0000_0000,
     0b0000_0100_0000_0000,
 ];
-
-// ── PS/2 mouse packet decoder ────────────────────────────────────────
-
-struct MouseDecoder {
-    buf: [u8; 3],
-    idx: usize,
-}
-
-struct MouseEvent {
-    dx: i32,
-    dy: i32,
-    buttons: u8,
-}
-
-impl MouseDecoder {
-    fn new() -> Self {
-        MouseDecoder {
-            buf: [0; 3],
-            idx: 0,
-        }
-    }
-
-    fn feed(&mut self, byte: u8) -> Option<MouseEvent> {
-        if self.idx == 0 {
-            // Byte 0: bit 3 must always be 1 (sync bit).
-            if byte & 0x08 == 0 {
-                return None;
-            }
-        }
-
-        self.buf[self.idx] = byte;
-        self.idx += 1;
-
-        if self.idx < 3 {
-            return None;
-        }
-
-        // Complete 3-byte packet.
-        self.idx = 0;
-
-        let state = self.buf[0] as i32;
-        let buttons = state as u8 & 0x07;
-
-        // Check overflow bits — discard if set.
-        if state & 0xC0 != 0 {
-            return None;
-        }
-
-        // Signed deltas per OSDev wiki formula.
-        let dx = self.buf[1] as i32 - ((state << 4) & 0x100);
-        let dy = self.buf[2] as i32 - ((state << 3) & 0x100);
-
-        Some(MouseEvent {
-            dx,
-            dy: -dy, // flip Y: PS/2 up = positive, screen down = positive
-            buttons,
-        })
-    }
-}
 
 // ── Window state ─────────────────────────────────────────────────────
 
@@ -395,8 +337,6 @@ fn run() -> Result<(), OsError> {
             None
         }
     };
-    let mut decoder = MouseDecoder::new();
-
     // 6. Arm OP_IPC_RECV on the registration channel.
     let mut reg_msg = IpcMessage::default();
     ring.submit(&[IoSubmission::ipc_recv(
@@ -489,187 +429,184 @@ fn run() -> Result<(), OsError> {
                 }
             } else if ud == TAG_MOUSE {
                 if cqe.result >= 0 {
-                    let byte = cqe.result as u8;
-                    if let Some(event) = decoder.feed(byte) {
-                        // Update absolute cursor position from deltas.
-                        cursor_x = (cursor_x as i32 + event.dx)
-                            .max(0).min(FB_WIDTH as i32 - 1) as usize;
-                        cursor_y = (cursor_y as i32 + event.dy)
-                            .max(0).min(FB_HEIGHT as i32 - 1) as usize;
-                        let new_buttons = event.buttons;
+                    // Kernel delivers decoded mouse events (dx, dy, buttons).
+                    let event = unpack_mouse_event(cqe.result);
 
-                        let left_down = new_buttons & 1 != 0 && buttons & 1 == 0;
-                        let left_up = new_buttons & 1 == 0 && buttons & 1 != 0;
+                    cursor_x = (cursor_x as i32 + event.dx)
+                        .max(0).min(FB_WIDTH as i32 - 1) as usize;
+                    cursor_y = (cursor_y as i32 + event.dy)
+                        .max(0).min(FB_HEIGHT as i32 - 1) as usize;
+                    let new_buttons = event.buttons;
 
-                        buttons = new_buttons;
+                    let left_down = new_buttons & 1 != 0 && buttons & 1 == 0;
+                    let left_up = new_buttons & 1 == 0 && buttons & 1 != 0;
 
-                        cursor_moved = true;
+                    buttons = new_buttons;
+                    cursor_moved = true;
 
-                        // Handle drag.
-                        match &drag {
-                            DragMode::Move { wid, off_x, off_y } => {
-                                if left_up {
-                                    drag = DragMode::None;
-                                } else {
-                                    let wid = *wid;
-                                    let off_x = *off_x;
-                                    let off_y = *off_y;
-                                    if let Some(win) =
-                                        windows.iter_mut().find(|w| w.id == wid)
-                                    {
-                                        let new_x =
-                                            (cursor_x as i32 + off_x).max(0) as usize;
-                                        let new_y =
-                                            (cursor_y as i32 + off_y).max(0) as usize;
-                                        win.x = new_x;
-                                        win.y = new_y;
-                                    }
-                                }
-                                scene_dirty = true;
-                            }
-                            DragMode::Resize {
-                                wid,
-                                start_w,
-                                start_h,
-                                start_mx,
-                                start_my,
-                                resize_x,
-                                resize_y,
-                            } => {
+                    // Handle drag.
+                    match &drag {
+                        DragMode::Move { wid, off_x, off_y } => {
+                            if left_up {
+                                drag = DragMode::None;
+                            } else {
                                 let wid = *wid;
-                                let start_w = *start_w;
-                                let start_h = *start_h;
-                                let start_mx = *start_mx;
-                                let start_my = *start_my;
-                                let rx = *resize_x;
-                                let ry = *resize_y;
-
-                                if left_up {
-                                    // Finalize resize: allocate new buffer.
-                                    if let Some(win) =
-                                        windows.iter_mut().find(|w| w.id == wid)
-                                    {
-                                        let new_w = if rx {
-                                            ((start_w as i32
-                                                + cursor_x as i32
-                                                - start_mx as i32)
-                                                .max(MIN_WIN_W as i32)
-                                                as usize)
-                                                .min(FB_WIDTH)
-                                        } else {
-                                            win.w
-                                        };
-                                        let new_h = if ry {
-                                            ((start_h as i32
-                                                + cursor_y as i32
-                                                - start_my as i32)
-                                                .max(MIN_WIN_H as i32)
-                                                as usize)
-                                                .min(FB_HEIGHT)
-                                        } else {
-                                            win.h
-                                        };
-
-                                        if new_w != win.buf_w || new_h != win.buf_h {
-                                            finalize_resize(win, new_w, new_h);
-                                        } else {
-                                            // Drag ended at original size — reset visual w/h.
-                                            win.w = win.buf_w;
-                                            win.h = win.buf_h;
-                                        }
-                                    }
-                                    drag = DragMode::None;
-                                } else if let Some(win) =
+                                let off_x = *off_x;
+                                let off_y = *off_y;
+                                if let Some(win) =
                                     windows.iter_mut().find(|w| w.id == wid)
                                 {
-                                    // Live preview: update visual size during drag.
-                                    if rx {
-                                        let nw = (start_w as i32
+                                    let new_x =
+                                        (cursor_x as i32 + off_x).max(0) as usize;
+                                    let new_y =
+                                        (cursor_y as i32 + off_y).max(0) as usize;
+                                    win.x = new_x;
+                                    win.y = new_y;
+                                }
+                            }
+                            scene_dirty = true;
+                        }
+                        DragMode::Resize {
+                            wid,
+                            start_w,
+                            start_h,
+                            start_mx,
+                            start_my,
+                            resize_x,
+                            resize_y,
+                        } => {
+                            let wid = *wid;
+                            let start_w = *start_w;
+                            let start_h = *start_h;
+                            let start_mx = *start_mx;
+                            let start_my = *start_my;
+                            let rx = *resize_x;
+                            let ry = *resize_y;
+
+                            if left_up {
+                                // Finalize resize: allocate new buffer.
+                                if let Some(win) =
+                                    windows.iter_mut().find(|w| w.id == wid)
+                                {
+                                    let new_w = if rx {
+                                        ((start_w as i32
                                             + cursor_x as i32
                                             - start_mx as i32)
                                             .max(MIN_WIN_W as i32)
-                                            as usize;
-                                        win.w = nw.min(FB_WIDTH);
-                                    }
-                                    if ry {
-                                        let nh = (start_h as i32
+                                            as usize)
+                                            .min(FB_WIDTH)
+                                    } else {
+                                        win.w
+                                    };
+                                    let new_h = if ry {
+                                        ((start_h as i32
                                             + cursor_y as i32
                                             - start_my as i32)
                                             .max(MIN_WIN_H as i32)
-                                            as usize;
-                                        win.h = nh.min(FB_HEIGHT);
+                                            as usize)
+                                            .min(FB_HEIGHT)
+                                    } else {
+                                        win.h
+                                    };
+
+                                    if new_w != win.buf_w || new_h != win.buf_h {
+                                        finalize_resize(win, new_w, new_h);
+                                    } else {
+                                        // Drag ended at original size — reset visual w/h.
+                                        win.w = win.buf_w;
+                                        win.h = win.buf_h;
                                     }
                                 }
-                                scene_dirty = true;
+                                drag = DragMode::None;
+                            } else if let Some(win) =
+                                windows.iter_mut().find(|w| w.id == wid)
+                            {
+                                // Live preview: update visual size during drag.
+                                if rx {
+                                    let nw = (start_w as i32
+                                        + cursor_x as i32
+                                        - start_mx as i32)
+                                        .max(MIN_WIN_W as i32)
+                                        as usize;
+                                    win.w = nw.min(FB_WIDTH);
+                                }
+                                if ry {
+                                    let nh = (start_h as i32
+                                        + cursor_y as i32
+                                        - start_my as i32)
+                                        .max(MIN_WIN_H as i32)
+                                        as usize;
+                                    win.h = nh.min(FB_HEIGHT);
+                                }
                             }
-                            DragMode::None => {
-                                let (hit_idx, zone) =
-                                    hit_test(&windows, cursor_x, cursor_y);
+                            scene_dirty = true;
+                        }
+                        DragMode::None => {
+                            let (hit_idx, zone) =
+                                hit_test(&windows, cursor_x, cursor_y);
 
-                                // Update cursor style based on hover zone.
-                                cursor_style = match zone {
-                                    HitZone::ResizeBottomRight => CursorStyle::ResizeDiag,
-                                    HitZone::ResizeRight => CursorStyle::ResizeHoriz,
-                                    HitZone::ResizeBottom => CursorStyle::ResizeVert,
-                                    _ => CursorStyle::Arrow,
-                                };
+                            // Update cursor style based on hover zone.
+                            cursor_style = match zone {
+                                HitZone::ResizeBottomRight => CursorStyle::ResizeDiag,
+                                HitZone::ResizeRight => CursorStyle::ResizeHoriz,
+                                HitZone::ResizeBottom => CursorStyle::ResizeVert,
+                                _ => CursorStyle::Arrow,
+                            };
 
-                                if left_down {
-                                    if let Some(idx) = hit_idx {
-                                        let wid = windows[idx].id;
-                                        // Focus + raise to top.
-                                        focused_wid = Some(wid);
-                                        let win = windows.remove(idx);
-                                        windows.push(win);
+                            if left_down {
+                                if let Some(idx) = hit_idx {
+                                    let wid = windows[idx].id;
+                                    // Focus + raise to top.
+                                    focused_wid = Some(wid);
+                                    let win = windows.remove(idx);
+                                    windows.push(win);
 
-                                        match zone {
-                                            HitZone::TitleBar => {
-                                                let win = windows.last().unwrap();
-                                                let off_x =
-                                                    win.x as i32 - cursor_x as i32;
-                                                let off_y =
-                                                    win.y as i32 - cursor_y as i32;
-                                                drag = DragMode::Move {
-                                                    wid,
-                                                    off_x,
-                                                    off_y,
-                                                };
-                                            }
-                                            HitZone::CloseButton => {
-                                                println!(
-                                                    "compositor: window {} closed",
-                                                    wid
-                                                );
-                                                windows.retain(|w| w.id != wid);
-                                                if focused_wid == Some(wid) {
-                                                    focused_wid = windows
-                                                        .last()
-                                                        .map(|w| w.id);
-                                                }
-                                            }
-                                            HitZone::ResizeBottomRight
-                                            | HitZone::ResizeRight
-                                            | HitZone::ResizeBottom => {
-                                                let win = windows.last().unwrap();
-                                                drag = DragMode::Resize {
-                                                    wid,
-                                                    start_w: win.w,
-                                                    start_h: win.h,
-                                                    start_mx: cursor_x,
-                                                    start_my: cursor_y,
-                                                    resize_x: zone
-                                                        != HitZone::ResizeBottom,
-                                                    resize_y: zone
-                                                        != HitZone::ResizeRight,
-                                                };
-                                            }
-                                            HitZone::Content => {
-                                                // Focus only, no drag.
-                                            }
-                                            HitZone::None => {}
+                                    match zone {
+                                        HitZone::TitleBar => {
+                                            let win = windows.last().unwrap();
+                                            let off_x =
+                                                win.x as i32 - cursor_x as i32;
+                                            let off_y =
+                                                win.y as i32 - cursor_y as i32;
+                                            drag = DragMode::Move {
+                                                wid,
+                                                off_x,
+                                                off_y,
+                                            };
                                         }
-                                        scene_dirty = true;
+                                        HitZone::CloseButton => {
+                                            println!(
+                                                "compositor: window {} closed",
+                                                wid
+                                            );
+                                            windows.retain(|w| w.id != wid);
+                                            if focused_wid == Some(wid) {
+                                                focused_wid =
+                                                    windows.last().map(|w| w.id);
+                                            }
+                                        }
+                                        HitZone::ResizeBottomRight
+                                        | HitZone::ResizeRight
+                                        | HitZone::ResizeBottom => {
+                                            let win = windows.last().unwrap();
+                                            drag = DragMode::Resize {
+                                                wid,
+                                                start_w: win.w,
+                                                start_h: win.h,
+                                                start_mx: cursor_x,
+                                                start_my: cursor_y,
+                                                resize_x: zone
+                                                    != HitZone::ResizeBottom,
+                                                resize_y: zone
+                                                    != HitZone::ResizeRight,
+                                            };
+                                        }
+                                        HitZone::Content => {
+                                            // Focus only, no drag.
+                                        }
+                                        HitZone::None => {}
                                     }
+                                    scene_dirty = true;
                                 }
                             }
                         }

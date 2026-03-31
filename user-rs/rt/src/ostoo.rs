@@ -431,6 +431,30 @@ impl Drop for IoRing {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Mouse event decoding
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Decoded mouse event from an OP_IRQ_WAIT completion on GSI 12.
+pub struct MouseEvent {
+    pub dx: i32,
+    pub dy: i32,
+    pub buttons: u8,
+}
+
+/// Unpack a mouse event from the `result` field of an OP_IRQ_WAIT completion.
+///
+/// The kernel's PS/2 decoder packs events as:
+/// bits 0-15 = dx (i16), bits 16-31 = dy (i16), bits 32-39 = buttons (u8).
+pub fn unpack_mouse_event(result: i64) -> MouseEvent {
+    let raw = result as u64;
+    MouseEvent {
+        dx: raw as u16 as i16 as i32,
+        dy: (raw >> 16) as u16 as i16 as i32,
+        buttons: (raw >> 32) as u8,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Service Registry
 // ═══════════════════════════════════════════════════════════════════════
 
