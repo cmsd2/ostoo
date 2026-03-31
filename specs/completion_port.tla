@@ -1,19 +1,14 @@
 -------------------------- MODULE completion_port --------------------------
 (*
- * PlusCal model of ostoo's CompletionPort kernel object.
+ * PlusCal model of ostoo's CompletionPort blocking protocol.
  *
- * FINDING: This spec exposes a lost-wakeup race in the real code.
+ * Models multiple producers posting completions and a single consumer
+ * that blocks via WaitCondition (check + set_waiter + mark_blocked as
+ * one atomic step under the port lock).
  *
- * The race (confirmed by reading scheduler.rs lines 640-676):
- *   1. Consumer: lock, check, set_waiter(self), unlock
- *   2. Producer: lock, post(), sees waiter, calls unblock(consumer)
- *      -> BUT consumer thread state is still Running, not Blocked
- *      -> unblock() checks "if state == Blocked" -- it's not -- NO-OP
- *   3. Consumer: block_current_thread() sets state = Blocked, spins forever
- *      -> waiter slot was cleared in step 2 -- no future post will wake us
- *      -> DEADLOCK
- *
- * The fix: see completion_port_fixed.tla
+ * Key property: the consumer sets thread_state to "blocked" WHILE STILL
+ * HOLDING the port lock, so any producer that sees the waiter slot will
+ * always find thread_state = "blocked" and successfully unblock.
  *)
 
 EXTENDS Integers, Sequences, FiniteSets, TLC
@@ -70,7 +65,6 @@ ProdLoop:
             with s \in {TRUE, FALSE} do
                 p_simple := s;
             end with;
-        \* Atomic: port.lock().post(completion)
         Post:
             if p_simple then
                 cq_count := cq_count + 1;
@@ -95,12 +89,14 @@ ProdLoop:
         producer_done[self] := TRUE;
 end process;
 
+\* Consumer: FIXED — check + set_waiter + mark_blocked all in one lock
 fair process Consumer = CONSUMER_ID
 begin
 WaitLoop:
     while total_delivered < TotalExpected - total_dropped do
-        \* === Atomic: lock port, check, either drain or set_waiter, unlock ===
-        \* In the real code, check + drain/set_waiter are ONE lock acquisition.
+        \* === Single atomic step under IrqMutex ===
+        \* Check + drain OR check + set_waiter + mark_blocked.
+        \* thread_state is set to "blocked" BEFORE releasing the lock.
         CheckAndAct:
             if Len(queue) + cq_count >= MIN_COMPLETE then
                 total_delivered := total_delivered + Len(queue) + cq_count;
@@ -108,28 +104,20 @@ WaitLoop:
                 cq_count := 0;
             else
                 waiter := CONSUMER_ID;
-                \* Lock released here. block_current_thread() is AFTER unlock.
-            end if;
-        \* === After unlock: block_current_thread() ===
-        \* Only reached if we set waiter (else branch above goes to WaitLoop).
-        \* A producer may have run Post between CheckAndAct and here.
-        Block:
-            if waiter = -1 then
-                \* Waiter was cleared by a producer — we were woken in the gap.
-                \* But unblock was a no-op because we weren't blocked yet.
-                \* We must still block because block_current_thread() is unconditional.
                 thread_state := "blocked";
-                await thread_state = "running";
-            elsif waiter = CONSUMER_ID then
-                \* Normal case: waiter still set, block and wait for wakeup.
-                thread_state := "blocked";
-                await thread_state = "running";
             end if;
+        \* === After unlock: wait for unblock ===
+        \* Safe because thread_state is already "blocked" before any producer
+        \* can see the waiter slot. If a producer posts between lock release
+        \* and here, it will see waiter=CONSUMER_ID, call unblock, find
+        \* state=blocked, set state=running, and we proceed immediately.
+        WaitUnblocked:
+            await thread_state = "running";
     end while;
 end process;
 
 end algorithm; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "71abada3" /\ chksum(tla) = "5843f46d")
+\* BEGIN TRANSLATION (chksum(pcal) = "bbfdb9ea" /\ chksum(tla) = "87ba42a5")
 VARIABLES queue, waiter, cq_count, thread_state, total_posted, 
           total_delivered, total_dropped, producer_done, pc
 
@@ -239,28 +227,22 @@ CheckAndAct == /\ pc[CONSUMER_ID] = "CheckAndAct"
                      THEN /\ total_delivered' = total_delivered + Len(queue) + cq_count
                           /\ queue' = <<>>
                           /\ cq_count' = 0
-                          /\ UNCHANGED waiter
+                          /\ UNCHANGED << waiter, thread_state >>
                      ELSE /\ waiter' = CONSUMER_ID
+                          /\ thread_state' = "blocked"
                           /\ UNCHANGED << queue, cq_count, total_delivered >>
-               /\ pc' = [pc EXCEPT ![CONSUMER_ID] = "Block"]
-               /\ UNCHANGED << thread_state, total_posted, total_dropped, 
-                               producer_done, p_count, p_simple >>
+               /\ pc' = [pc EXCEPT ![CONSUMER_ID] = "WaitUnblocked"]
+               /\ UNCHANGED << total_posted, total_dropped, producer_done, 
+                               p_count, p_simple >>
 
-Block == /\ pc[CONSUMER_ID] = "Block"
-         /\ IF waiter = -1
-               THEN /\ thread_state' = "blocked"
-                    /\ thread_state' = "running"
-               ELSE /\ IF waiter = CONSUMER_ID
-                          THEN /\ thread_state' = "blocked"
-                               /\ thread_state' = "running"
-                          ELSE /\ TRUE
-                               /\ UNCHANGED thread_state
-         /\ pc' = [pc EXCEPT ![CONSUMER_ID] = "WaitLoop"]
-         /\ UNCHANGED << queue, waiter, cq_count, total_posted, 
-                         total_delivered, total_dropped, producer_done, 
-                         p_count, p_simple >>
+WaitUnblocked == /\ pc[CONSUMER_ID] = "WaitUnblocked"
+                 /\ thread_state = "running"
+                 /\ pc' = [pc EXCEPT ![CONSUMER_ID] = "WaitLoop"]
+                 /\ UNCHANGED << queue, waiter, cq_count, thread_state, 
+                                 total_posted, total_delivered, total_dropped, 
+                                 producer_done, p_count, p_simple >>
 
-Consumer == WaitLoop \/ CheckAndAct \/ Block
+Consumer == WaitLoop \/ CheckAndAct \/ WaitUnblocked
 
 (* Allow infinite stuttering to prevent deadlock on termination. *)
 Terminating == /\ \A self \in ProcSet: pc[self] = "Done"
@@ -278,7 +260,7 @@ Termination == <>(\A self \in ProcSet: pc[self] = "Done")
 
 \* END TRANSLATION 
 
-\* Liveness (TLC should find VIOLATED due to lost-wakeup bug)
+\* Liveness (should PASS with the fix)
 NoStarvation ==
     [](thread_state = "blocked" => <>(thread_state = "running"))
 

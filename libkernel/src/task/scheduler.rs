@@ -666,7 +666,7 @@ pub fn kill_current_thread() -> ! {
 /// }                                // lock released
 /// scheduler::yield_now();          // switch away
 /// ```
-// [spec: completion_port_fixed.tla MarkBlocked — sets thread_state := "blocked"
+// [spec: completion_port.tla MarkBlocked — sets thread_state := "blocked"
 //  while the port lock is still held, closing the lost-wakeup window.]
 pub fn mark_blocked() {
     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -679,12 +679,13 @@ pub fn mark_blocked() {
 /// Mark the current thread as blocked and yield.
 ///
 /// Convenience wrapper: `mark_blocked()` + `yield_now()`.
-/// Prefer calling `mark_blocked()` under the caller's lock and `yield_now()`
-/// after releasing it for new code — see [`mark_blocked`] doc comment.
-/// This function exists for backward compatibility with sites that cannot
-/// easily restructure their locking (e.g. `sys_wait4`, `blocking()`).
-// [spec: completion_port.tla Block — the split mark_blocked + yield_now avoids
-//  the lost-wakeup race documented in completion_port_fixed.tla.]
+///
+/// **Deprecated**: all blocking sites now use `WaitCondition` or the manual
+/// `mark_blocked()` / `yield_now()` split. This wrapper remains for any
+/// future one-off use but should not be the default pattern.
+// [spec: completion_port.tla CheckAndAct + WaitUnblocked —
+//  mark_blocked() corresponds to "thread_state := blocked" in CheckAndAct,
+//  yield_now() corresponds to "await thread_state = running" in WaitUnblocked.]
 pub fn block_current_thread() {
     mark_blocked();
     yield_now();
@@ -694,9 +695,9 @@ pub fn block_current_thread() {
 ///
 /// Safe to call from any context including ISR.
 // [spec: completion_port.tla Post — "if thread_state = blocked then
-//  thread_state := running".  The conditional is the root cause of the
-//  lost-wakeup bug: if called before block_current_thread(), state is
-//  Running and this is a no-op.]
+//  thread_state := running".  The conditional is safe because all callers
+//  now call mark_blocked() under their lock before releasing it, so
+//  unblock() always finds the thread in the Blocked state.]
 pub fn unblock(thread_idx: usize) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut sched = SCHEDULER.lock();

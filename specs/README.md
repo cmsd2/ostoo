@@ -27,48 +27,23 @@ SQ and CQ rings. Verifies that:
 Maps to: `IoRing::post_cqe()` and userspace consumption in
 `libkernel/src/completion_port.rs`.
 
-### `completion_port.tla` — CompletionPort (Buggy)
+### `completion_port.tla` — CompletionPort Blocking Protocol
 
 Models the completion port with multiple producers and a single consumer.
-**This spec intentionally models the current code, including a lost-wakeup
-race condition.** TLC will report a deadlock.
+The consumer uses the `WaitCondition` protocol: check + set_waiter +
+mark_blocked are a single atomic step (one PlusCal label) under the port
+lock. After releasing the lock, the consumer awaits unblock.
 
-The race:
-1. Consumer: `set_waiter(self)`, unlock port
-2. Producer: `post()` → sees waiter, calls `unblock(consumer)`
-   → thread state is `Running`, not `Blocked` → **unblock is a no-op**
-3. Consumer: `block_current_thread()` → sets `Blocked`, spins forever
-   → waiter slot was cleared → no future post will wake us → **deadlock**
+This ensures that any producer calling `unblock()` always finds
+`thread_state = "blocked"`, eliminating the lost-wakeup race.
 
-Confirmed by reading `scheduler.rs` lines 640-676: `unblock()` only acts
-when `state == Blocked`, and `block_current_thread()` sets `Blocked`
-unconditionally after releasing the port lock.
+TLC verifies all safety and liveness properties:
+- `SafetyInvariant` — single waiter, bounded queue, sound accounting
+- `NoStarvation` — a blocked thread is always eventually unblocked
+- `AllDelivered` — all posted completions are eventually consumed
 
-### `completion_port_fixed.tla` — CompletionPort (Fixed)
-
-Same model with the fix: set thread state to `Blocked` **while still
-holding the port lock**, before releasing it. This ensures `unblock()`
-always finds the thread in the `Blocked` state.
-
-The Rust fix requires splitting `block_current_thread()` into two parts:
-```rust
-// BEFORE (buggy — scheduler.rs + io_port.rs):
-{
-    let mut p = port.lock();
-    p.set_waiter(thread_idx);
-}                                    // unlock
-scheduler::block_current_thread();   // sets Blocked AFTER unlock — race!
-
-// AFTER (fixed):
-{
-    let mut p = port.lock();
-    p.set_waiter(thread_idx);
-    scheduler::mark_blocked();       // set Blocked BEFORE unlock
-}                                    // unlock
-scheduler::wait_until_unblocked();   // spin on state != Blocked
-```
-
-TLC should verify this version passes all safety and liveness properties.
+The same abstract protocol applies to all blocking sites in the kernel
+(completion ports, pipes, console, IPC channels, wait4, clone, blocking).
 
 ## Running
 
@@ -78,11 +53,12 @@ cd specs
 # Check the SPSC ring model (should pass)
 tlc spsc_ring.tla -config spsc_ring.cfg
 
-# Check the buggy completion port (should find deadlock)
+# Check the completion port model (should pass)
 tlc completion_port.tla -config completion_port.cfg
 
-# Check the fixed completion port (should pass)
-tlc completion_port_fixed.tla -config completion_port_fixed.cfg
+# Or use the helper script:
+./check.sh                    # run all specs
+./check.sh completion_port    # run one spec
 ```
 
 ### Tuning
@@ -104,9 +80,9 @@ more thorough verification at the cost of longer runtime:
 | Producer.Post (simple) | `IoRing::post_cqe()` |
 | Producer.Post (deferred) | `CompletionPort::post()` → queue.push_back |
 | Producer.Post wake | `self.waiter.take()` → `scheduler::unblock()` |
-| Consumer.Check | `p.pending()` / `ring.cq_available()` |
-| Consumer.Drain | Phase 2 drain in `sys_io_ring_enter()` |
-| Consumer.SetWaiter | `p.set_waiter(thread_idx)` |
-| Consumer.Block | `scheduler::block_current_thread()` |
+| Consumer.CheckAndAct (drain) | `p.pending()` / `ring.cq_available()` + `p.drain()` |
+| Consumer.CheckAndAct (block) | `WaitCondition::wait_while(Some(guard), \|g, idx\| g.set_waiter(idx))` |
+| Consumer.WaitUnblocked | `scheduler::yield_now()` (inside WaitCondition) |
+| `thread_state := "blocked"` | `scheduler::mark_blocked()` (inside WaitCondition, under caller's lock) |
 | Ring.WriteSlot + ReleaseTail | `*cqe_ptr = cqe` + `tail.store(Release)` |
 | Ring.AcquireTail + ReadSlot | `tail.load(Acquire)` + `*cqe_ptr` |

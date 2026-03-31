@@ -8,11 +8,13 @@ use libkernel::spin_mutex::SpinMutex as Mutex;
 use libkernel::task::scheduler;
 use libkernel::task::executor;
 use libkernel::task::Task;
+use libkernel::wait_condition::WaitCondition;
 
 /// Run an async future to completion, blocking the current scheduler thread.
 ///
 /// Spawns the future as a kernel async task. When it completes, the blocked
 /// thread is unblocked and the result is returned.
+// [spec: completion_port.tla — atomic check + mark_blocked]
 pub fn blocking<T: Send + 'static>(future: impl Future<Output = T> + Send + 'static) -> T {
     let result: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
     let thread_idx = scheduler::current_thread_idx();
@@ -24,7 +26,14 @@ pub fn blocking<T: Send + 'static>(future: impl Future<Output = T> + Send + 'sta
         scheduler::unblock(thread_idx);
     }));
 
-    scheduler::block_current_thread();
+    WaitCondition::wait_while(
+        {
+            let guard = result.lock();
+            if guard.is_some() { None } else { Some(guard) }
+        },
+        |_guard, _idx| {},
+    );
+
     let val = result.lock().take().expect("blocking: result missing after unblock");
     val
 }

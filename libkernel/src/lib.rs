@@ -52,6 +52,7 @@ pub mod shmem;
 pub mod notify;
 pub mod service;
 pub mod ps2;
+pub mod wait_condition;
 
 pub fn init() {
     cpuid::init();

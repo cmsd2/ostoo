@@ -7,7 +7,7 @@
 # Usage:
 #   ./check.sh                      # run all specs
 #   ./check.sh spsc_ring            # run one spec
-#   ./check.sh completion_port_fixed
+#   ./check.sh completion_port
 #
 
 set -euo pipefail
@@ -83,7 +83,7 @@ run_spec() {
 
 # ---- Main ----
 
-SPECS=("spsc_ring" "completion_port" "completion_port_fixed")
+SPECS=("spsc_ring" "completion_port")
 
 if [[ $# -gt 0 ]]; then
     for arg in "$@"; do

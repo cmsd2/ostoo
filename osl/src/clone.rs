@@ -3,6 +3,7 @@
 use crate::errno;
 use libkernel::process::{self, Process};
 use libkernel::task::scheduler;
+use libkernel::wait_condition::WaitCondition;
 
 /// Flags we accept from musl's posix_spawn: CLONE_VM | CLONE_VFORK | SIGCHLD.
 const CLONE_VM: u64    = 0x0000_0100;
@@ -76,7 +77,20 @@ pub fn sys_clone(flags: u64, child_stack: u64, _ptid: u64, _ctid: u64, _tls: u64
         parent_pid.as_u64(), child_pid.as_u64(), child_stack, user_rip);
 
     // CLONE_VFORK: block parent until child calls execve or _exit.
-    scheduler::block_current_thread();
+    // Check under the process table lock whether the child has already consumed
+    // the vfork_parent_thread field (via execve or _exit). If Some, the child
+    // hasn't run yet → block. If None, the child already exec'd/exited → skip.
+    // [spec: completion_port.tla — atomic check + mark_blocked]
+    WaitCondition::wait_while(
+        {
+            let table = process::lock_table();
+            match table.get(&child_pid) {
+                Some(p) if p.vfork_parent_thread.is_some() => Some(table),
+                _ => None,
+            }
+        },
+        |_table, _idx| {},  // no registration needed — field already set during Process construction
+    );
 
     child_pid.as_u64() as i64
 }

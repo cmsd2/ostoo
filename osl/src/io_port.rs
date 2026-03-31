@@ -13,6 +13,7 @@ use libkernel::completion_port::{
     OP_NOP, OP_TIMEOUT, OP_READ, OP_WRITE, OP_IRQ_WAIT, OP_IPC_RECV, OP_IPC_SEND,
     OP_RING_WAIT, MAX_SQ_ENTRIES, MAX_CQ_ENTRIES,
 };
+use libkernel::wait_condition::WaitCondition;
 use libkernel::shmem::SharedMemInner;
 use libkernel::irq_mutex::IrqMutex;
 use libkernel::channel::{ArmRecvAction, ArmSendAction, EnvelopedMessage, IpcMessage, PendingPortRecv, PendingPortSend};
@@ -649,71 +650,67 @@ pub fn sys_io_wait(port_fd: i32, completions_ptr: u64, max: u32, min: u32, timeo
 
     // [spec: completion_port.tla WaitLoop]
     loop {
-        // [spec: completion_port.tla CheckAndAct — lock, check, drain or set_waiter, unlock]
-        {
-            let mut p = port.lock();
-            let timed_out = deadline.is_some() && timer::ticks() >= deadline.unwrap();
+        // [spec: completion_port.tla CheckAndAct — WaitCondition]
+        let mut p = port.lock();
+        let timed_out = deadline.is_some() && timer::ticks() >= deadline.unwrap();
 
-            if p.pending() >= min || timed_out {
-                // Ready to return — drain and copy to user memory
-                let drained = p.drain(max);
-                drop(p);
+        if p.pending() >= min || timed_out {
+            // Ready to return — drain and copy to user memory
+            let drained = p.drain(max);
+            drop(p);
 
-                let count = drained.len().min(max);
-                let user_comps = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        completions_ptr as *mut IoCompletion,
-                        count,
-                    )
-                };
-                for (i, mut c) in drained.into_iter().enumerate().take(count) {
-                    // For OP_IPC_RECV: install transferred fds into receiver's
-                    // fd table and rewrite the serialized message bytes.
-                    if let Some(tfds) = c.transfer_fds.take() {
-                        if let Some(ref mut buf) = c.read_buf {
-                            if buf.len() == core::mem::size_of::<IpcMessage>() {
-                                let msg_ptr = buf.as_mut_ptr() as *mut IpcMessage;
-                                let msg = unsafe { &mut *msg_ptr };
-                                // Best-effort: if install fails, the fds field
-                                // keeps -1 values and the completion still posts.
-                                let _ = crate::ipc::install_transfer_fds(msg, tfds);
-                            }
+            let count = drained.len().min(max);
+            let user_comps = unsafe {
+                core::slice::from_raw_parts_mut(
+                    completions_ptr as *mut IoCompletion,
+                    count,
+                )
+            };
+            for (i, mut c) in drained.into_iter().enumerate().take(count) {
+                // For OP_IPC_RECV: install transferred fds into receiver's
+                // fd table and rewrite the serialized message bytes.
+                if let Some(tfds) = c.transfer_fds.take() {
+                    if let Some(ref mut buf) = c.read_buf {
+                        if buf.len() == core::mem::size_of::<IpcMessage>() {
+                            let msg_ptr = buf.as_mut_ptr() as *mut IpcMessage;
+                            let msg = unsafe { &mut *msg_ptr };
+                            // Best-effort: if install fails, the fds field
+                            // keeps -1 values and the completion still posts.
+                            let _ = crate::ipc::install_transfer_fds(msg, tfds);
                         }
                     }
-                    // For async OP_READ / OP_IPC_RECV: copy kernel buffer to user space.
-                    // We're in the process's syscall context so page tables are correct.
-                    if let Some(ref buf) = c.read_buf {
-                        if !buf.is_empty() && c.read_dest != 0
-                            && validate_user_buf(c.read_dest, buf.len() as u64)
-                        {
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(
-                                    buf.as_ptr(),
-                                    c.read_dest as *mut u8,
-                                    buf.len(),
-                                );
-                            }
-                        }
-                    }
-                    user_comps[i] = IoCompletion {
-                        user_data: c.user_data,
-                        result: c.result,
-                        flags: c.flags,
-                        opcode: c.opcode,
-                    };
                 }
-                // Cancel the timeout task so it stops occupying a WAKERS slot.
-                cancel.store(true, Ordering::Release);
-                return count as i64;
+                // For async OP_READ / OP_IPC_RECV: copy kernel buffer to user space.
+                // We're in the process's syscall context so page tables are correct.
+                if let Some(ref buf) = c.read_buf {
+                    if !buf.is_empty() && c.read_dest != 0
+                        && validate_user_buf(c.read_dest, buf.len() as u64)
+                    {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                buf.as_ptr(),
+                                c.read_dest as *mut u8,
+                                buf.len(),
+                            );
+                        }
+                    }
+                }
+                user_comps[i] = IoCompletion {
+                    user_data: c.user_data,
+                    result: c.result,
+                    flags: c.flags,
+                    opcode: c.opcode,
+                };
             }
+            // Cancel the timeout task so it stops occupying a WAKERS slot.
+            cancel.store(true, Ordering::Release);
+            return count as i64;
+        }
 
-            // Not enough completions yet — register as waiter and block.
-            // [spec: completion_port_fixed.tla CheckAndAct — set_waiter + mark_blocked
-            //  under the same lock acquisition, closing the lost-wakeup window.]
+        // Not enough completions yet — register as waiter and block.
+        WaitCondition::wait_while(Some(p), |p, thread_idx| {
             p.set_waiter(thread_idx);
-            scheduler::mark_blocked();
-        } // port lock released here
-        scheduler::yield_now();
+        });
         // Woken — either by post() or by timeout timer. Loop back to check.
     }
 }
@@ -900,29 +897,24 @@ pub fn sys_io_ring_enter(port_fd: i32, to_submit: u32, min_complete: u32, flags:
     }
 
     // Phase 3: Wait for min_complete CQ entries
-    // [spec: completion_port_fixed.tla WaitLoop — check + set_waiter + mark_blocked
-    //  under a single lock acquisition, closing both the split-lock and lost-wakeup bugs.]
+    // [spec: completion_port.tla WaitLoop — WaitCondition]
     if min_complete > 0 {
-        let thread_idx = scheduler::current_thread_idx();
         loop {
-            {
-                let mut p = port.lock();
-                if let Some(ring) = p.ring() {
-                    let avail = ring.cq_available();
-                    if avail >= min_complete {
-                        return avail as i64;
-                    }
+            let p = port.lock();
+            if let Some(ring) = p.ring() {
+                let avail = ring.cq_available();
+                if avail >= min_complete {
+                    return avail as i64;
                 }
+            }
+            WaitCondition::wait_while(Some(p), |p, thread_idx| {
                 p.set_waiter(thread_idx);
-                scheduler::mark_blocked();
-            } // port lock released
-            scheduler::yield_now();
-            // Woken by post() — loop back to check.
-            // Also flush any new deferred completions.
+            });
+            // Woken by post() — flush deferred completions before re-checking.
             {
                 let mut p = port.lock();
                 let n = p.pending();
-        let drained = p.drain(n);
+                let drained = p.drain(n);
                 let has_ring = p.has_ring();
                 drop(p);
 

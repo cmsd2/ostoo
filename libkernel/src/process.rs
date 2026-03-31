@@ -469,6 +469,14 @@ pub static PROCESSES: ProcessManager = ProcessManager {
 };
 
 impl ProcessManager {
+    /// Acquire the raw process table lock.
+    ///
+    /// Used by callers that need to perform an atomic check+register+mark_blocked
+    /// sequence under a single lock acquisition (e.g. `sys_wait4`).
+    pub fn lock_table(&self) -> spin::MutexGuard<'_, BTreeMap<ProcessId, Process>> {
+        self.table.lock()
+    }
+
     fn alloc_pid(&self) -> ProcessId {
         ProcessId(self.next_pid.fetch_add(1, Ordering::Relaxed))
     }
@@ -576,6 +584,7 @@ impl ProcessManager {
 // ---------------------------------------------------------------------------
 // Free-function wrappers — delegate to PROCESSES for backward compatibility
 
+pub fn lock_table() -> spin::MutexGuard<'static, BTreeMap<ProcessId, Process>> { PROCESSES.lock_table() }
 pub fn insert(proc: Process) -> ProcessId { PROCESSES.insert(proc) }
 pub fn current_pid() -> ProcessId { PROCESSES.current_pid() }
 pub fn set_current_pid(pid: ProcessId) { PROCESSES.set_current_pid(pid) }
@@ -601,6 +610,31 @@ pub fn find_zombie_child(parent_pid: ProcessId, target_pid: i64) -> Option<(Proc
 
 pub fn has_children(parent_pid: ProcessId) -> bool {
     PROCESSES.has_children(parent_pid)
+}
+
+/// Lock-free variant of `find_zombie_child` for use when the caller already holds the table lock.
+pub fn find_zombie_child_in(
+    table: &BTreeMap<ProcessId, Process>,
+    parent_pid: ProcessId,
+    target_pid: i64,
+) -> Option<(ProcessId, i32)> {
+    for p in table.values() {
+        if p.parent_pid != parent_pid || p.state != ProcessState::Zombie {
+            continue;
+        }
+        if target_pid == -1 || p.pid.as_u64() == target_pid as u64 {
+            return Some((p.pid, p.exit_code.unwrap_or(0)));
+        }
+    }
+    None
+}
+
+/// Lock-free variant of `has_children` for use when the caller already holds the table lock.
+pub fn has_children_in(
+    table: &BTreeMap<ProcessId, Process>,
+    parent_pid: ProcessId,
+) -> bool {
+    table.values().any(|p| p.parent_pid == parent_pid)
 }
 
 /// Terminate a process: unblock vfork parent, close fds, free address space,

@@ -6,6 +6,7 @@ use crate::spin_mutex::SpinMutex as Mutex;
 
 use crate::process::ProcessId;
 use crate::task::scheduler;
+use crate::wait_condition::WaitCondition;
 
 const INPUT_BUF_CAP: usize = 256;
 
@@ -58,6 +59,7 @@ pub enum ReadResult {
 /// If the buffer is empty, blocks the current thread until input arrives.
 /// Returns `Data(n)` on success or `Interrupted` if a signal is pending.
 pub fn read_input(buf: &mut [u8]) -> ReadResult {
+    let pid = crate::process::current_pid();
     loop {
         let mut inner = CONSOLE_INPUT.lock();
         if !inner.buf.is_empty() {
@@ -68,7 +70,6 @@ pub fn read_input(buf: &mut [u8]) -> ReadResult {
             return ReadResult::Data(count);
         }
         // Before blocking, check for pending deliverable signals.
-        let pid = crate::process::current_pid();
         if pid != ProcessId::KERNEL {
             let has_signal = crate::process::with_process_ref(pid, |p| {
                 let deliverable = p.signal.pending & !p.signal.blocked;
@@ -78,15 +79,12 @@ pub fn read_input(buf: &mut [u8]) -> ReadResult {
                 return ReadResult::Interrupted;
             }
         }
-        // Buffer empty — register ourselves as blocked reader and mark blocked
-        // under the console lock so that unblock() from push_input() is safe.
-        // [spec: completion_port_fixed.tla MarkBlocked — under caller's lock]
-        let thread_idx = scheduler::current_thread_idx();
-        inner.blocked_reader = Some(thread_idx);
-        inner.blocked_reader_pid = Some(pid);
-        scheduler::mark_blocked();
-        drop(inner); // release lock after mark_blocked
-        scheduler::yield_now();
+        // Buffer empty — register + mark blocked under the console lock.
+        // [spec: completion_port.tla CheckAndAct — WaitCondition]
+        WaitCondition::wait_while(Some(inner), |inner, thread_idx| {
+            inner.blocked_reader = Some(thread_idx);
+            inner.blocked_reader_pid = Some(pid);
+        });
         // Loop back to retry after being woken.
     }
 }

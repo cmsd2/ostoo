@@ -66,21 +66,29 @@ This race is confirmed by the PlusCal model in `specs/completion_port.tla`
 
 The race affects **every** blocking site, not just the completion port:
 
-| Site | File | Lock type |
-|---|---|---|
-| `sys_io_wait` | `osl/src/io_port.rs` | IrqMutex |
-| `sys_io_ring_enter` phase 3 | `osl/src/io_port.rs` | IrqMutex |
-| `PipeReader::read` | `libkernel/src/file.rs` | SpinMutex |
-| `read_input` (console) | `libkernel/src/console.rs` | SpinMutex |
-| `sys_ipc_send` | `osl/src/ipc.rs` | IrqMutex2 |
-| `sys_ipc_recv` | `osl/src/ipc.rs` | IrqMutex2 |
-| `sys_wait4` | `osl/src/syscalls/process.rs` | Mutex |
-| `sys_clone` (vfork parent) | `osl/src/clone.rs` | Mutex |
-| `blocking()` (async bridge) | `osl/src/blocking.rs` | SpinMutex |
+| Site | File | Lock type | Status |
+|---|---|---|---|
+| `sys_io_wait` | `osl/src/io_port.rs` | IrqMutex | **Fixed**: `WaitCondition` |
+| `sys_io_ring_enter` phase 3 | `osl/src/io_port.rs` | IrqMutex | **Fixed**: `WaitCondition` |
+| `PipeReader::read` | `libkernel/src/file.rs` | SpinMutex | **Fixed**: `WaitCondition` |
+| `read_input` (console) | `libkernel/src/console.rs` | SpinMutex | **Fixed**: `WaitCondition` |
+| `sys_ipc_send` | `osl/src/ipc.rs` | IrqMutex | `mark_blocked` under lock (action enum) |
+| `sys_ipc_recv` | `osl/src/ipc.rs` | IrqMutex | `mark_blocked` under lock (action enum) |
+| `sys_wait4` | `osl/src/syscalls/process.rs` | SpinMutex | **Fixed**: `WaitCondition` |
+| `sys_clone` (vfork parent) | `osl/src/clone.rs` | SpinMutex | **Fixed**: `WaitCondition` |
+| `blocking()` (async bridge) | `osl/src/blocking.rs` | SpinMutex | **Fixed**: `WaitCondition` |
 
-The `sys_io_ring_enter` variant has an additional bug: check and set_waiter
-are under **separate** lock acquisitions, so a completion can arrive between
-the check and the registration.
+The IPC channel sites (`sys_ipc_send`, `sys_ipc_recv`) use the split
+`mark_blocked()` / `yield_now()` pair. The `mark_blocked` is called inside
+`ChannelInner::try_send`/`try_recv` (under the IrqMutex), and the caller
+does `yield_now()` after the lock drops via the `SendAction`/`RecvAction`
+enum. These are already race-free; `WaitCondition` doesn't fit the
+action-enum pattern without a larger refactor.
+
+The `sys_io_ring_enter` variant previously had an additional bug: check and
+set_waiter were under **separate** lock acquisitions, so a completion could
+arrive between the check and the registration. `WaitCondition` fixes this by
+construction.
 
 ### Why Blocked threads spin today
 
@@ -151,7 +159,7 @@ context-switches away from it immediately and never schedules it again until
 /// The scheduler will context-switch away and never schedule this thread
 /// again until unblock() is called. Execution resumes at the instruction
 /// after this call.
-// [spec: completion_port_fixed.tla CheckAndAct — "thread_state := blocked"
+// [spec: completion_port.tla CheckAndAct — "thread_state := blocked"
 //        + WaitUnblocked — "await thread_state = running"]
 pub fn mark_blocked_and_yield() {
     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -201,7 +209,13 @@ scheduler::yield_now();                    // 5. context-switch away
 
 No loop, no spin, no HLT. The thread is off the CPU until explicitly woken.
 
-### Step 4: Introduce `WaitCondition` to enforce the pattern
+### Step 4: Introduce `WaitCondition` to enforce the pattern (DONE)
+
+Implemented in `libkernel/src/wait_condition.rs`. Seven sites now use
+`WaitCondition::wait_while()`: `sys_io_wait`, `sys_io_ring_enter`,
+`PipeReader::read`, `read_input` (console), `sys_wait4`, `sys_clone`
+(vfork parent), and `blocking()`. The two IPC channel sites use the split
+`mark_blocked()`/`yield_now()` pair via an action enum.
 
 A condvar-like wrapper that makes the ordering impossible to get wrong:
 
@@ -217,7 +231,7 @@ impl WaitCondition {
     /// the waiter, mark the thread Blocked, release the lock, and yield.
     /// Returns when unblocked and rescheduled.
     ///
-    // [spec: completion_port_fixed.tla
+    // [spec: completion_port.tla
     //   CheckAndAct (check + set_waiter + mark_blocked) = one label
     //   WaitUnblocked (await running) = next label]
     pub fn wait_while<T, L: Lock<T>>(
@@ -273,9 +287,10 @@ WaitCondition::wait_while(
 
 ### Step 5: Deprecate `block_current_thread`
 
-Once all sites are migrated, remove or `#[deprecated]` the old monolithic
-function. New blocking code must use `WaitCondition` or the
-`mark_blocked()` / `yield_now()` pair.
+All three remaining sites (`sys_wait4`, `sys_clone`, `blocking()`) have been
+migrated. `block_current_thread` is now unused and can be deprecated. New
+blocking code must use `WaitCondition` or the `mark_blocked()` /
+`yield_now()` pair.
 
 ## Lock ordering note
 

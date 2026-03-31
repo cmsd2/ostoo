@@ -349,15 +349,33 @@ impl FileHandle for PipeReader {
     fn read(&self, buf: &mut [u8]) -> Result<usize, FileError> {
         let pid = crate::process::current_pid();
         loop {
+            // Register signal_thread before acquiring the pipe lock to avoid
+            // lock ordering inversion (terminate_process: process_table → pipe).
+            // Best-effort: if a signal arrives before mark_blocked, unblock()
+            // is a no-op, but we'll catch it on the next signal check.
+            if pid != crate::process::ProcessId::KERNEL {
+                crate::process::with_process(pid, |p| {
+                    p.signal_thread = Some(crate::task::scheduler::current_thread_idx());
+                });
+            }
+
             let mut inner = self.0.lock();
             if !inner.buffer.is_empty() {
                 let count = buf.len().min(inner.buffer.len());
                 for i in 0..count {
                     buf[i] = inner.buffer.pop_front().unwrap();
                 }
+                drop(inner);
+                if pid != crate::process::ProcessId::KERNEL {
+                    crate::process::with_process(pid, |p| { p.signal_thread = None; });
+                }
                 return Ok(count);
             }
             if inner.write_closed {
+                drop(inner);
+                if pid != crate::process::ProcessId::KERNEL {
+                    crate::process::with_process(pid, |p| { p.signal_thread = None; });
+                }
                 return Ok(0); // EOF
             }
 
@@ -367,24 +385,16 @@ impl FileHandle for PipeReader {
                     (p.signal.pending & !p.signal.blocked) != 0
                 }).unwrap_or(false);
                 if has_signal {
+                    drop(inner);
+                    crate::process::with_process(pid, |p| { p.signal_thread = None; });
                     return Err(FileError::Interrupted);
                 }
             }
 
-            // Register as blocked reader and mark blocked under the pipe lock
-            // so that unblock() is guaranteed to find ThreadState::Blocked.
-            // [spec: completion_port_fixed.tla MarkBlocked — under caller's lock]
-            let thread_idx = crate::task::scheduler::current_thread_idx();
-            inner.reader_thread = Some(thread_idx);
-            crate::task::scheduler::mark_blocked();
-            drop(inner);
-            // Register signal_thread after mark_blocked (best-effort for Ctrl+C).
-            if pid != crate::process::ProcessId::KERNEL {
-                crate::process::with_process(pid, |p| {
-                    p.signal_thread = Some(thread_idx);
-                });
-            }
-            crate::task::scheduler::yield_now();
+            // [spec: completion_port.tla CheckAndAct — WaitCondition]
+            crate::wait_condition::WaitCondition::wait_while(Some(inner), |inner, thread_idx| {
+                inner.reader_thread = Some(thread_idx);
+            });
             // Clear signal_thread after waking.
             if pid != crate::process::ProcessId::KERNEL {
                 crate::process::with_process(pid, |p| {
