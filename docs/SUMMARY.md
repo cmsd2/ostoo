@@ -113,4 +113,5 @@
 
 - [Code Quality Audit](code-audit.md)
 - [Unsafe Code Audit](unsafe-audit.md)
+- [SMP Safety Audit](smp-audit.md)
 - [Testing](testing.md)
