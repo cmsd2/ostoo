@@ -238,6 +238,25 @@ Key things to map:
 
 See `README.md` for the existing correspondence tables.
 
+### Cross-referencing from Rust code
+
+Tag Rust code with `// [spec: file.tla Label]` comments to link back to the
+PlusCal spec. This makes the mapping greppable from both sides.
+
+```rust
+// [spec: spsc_ring.tla AcquireHead]
+let head = hdr.head.load(Ordering::Acquire);
+let tail = hdr.tail.load(Ordering::Relaxed);
+
+// [spec: spsc_ring.tla CheckFull]
+if tail.wrapping_sub(head) >= self.cq_entries {
+    return false;
+}
+```
+
+Use `grep -rn '\[spec:' .` to find all annotated sites. When updating a spec
+label name, update the Rust tags to match.
+
 ## Tips
 
 - **Start with safety**: get invariants passing before adding liveness

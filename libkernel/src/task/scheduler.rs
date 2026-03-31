@@ -637,6 +637,10 @@ pub fn kill_current_thread() -> ! {
 /// placed back on the ready queue and eventually rescheduled.
 ///
 /// Returns when the thread is unblocked and rescheduled.
+// [spec: completion_port.tla Block — sets thread_state := "blocked" then
+//  await thread_state = "running".  BUG: this runs AFTER the port lock is
+//  released, so a producer can call unblock() before state is Blocked.
+//  See completion_port_fixed.tla: the fix moves mark_blocked under the port lock.]
 pub fn block_current_thread() {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut sched = SCHEDULER.lock();
@@ -663,6 +667,10 @@ pub fn block_current_thread() {
 /// Unblock a previously blocked thread, placing it back on the ready queue.
 ///
 /// Safe to call from any context including ISR.
+// [spec: completion_port.tla Post — "if thread_state = blocked then
+//  thread_state := running".  The conditional is the root cause of the
+//  lost-wakeup bug: if called before block_current_thread(), state is
+//  Running and this is a no-op.]
 pub fn unblock(thread_idx: usize) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut sched = SCHEDULER.lock();

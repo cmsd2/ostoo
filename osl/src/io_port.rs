@@ -647,7 +647,9 @@ pub fn sys_io_wait(port_fd: i32, completions_ptr: u64, max: u32, min: u32, timeo
         }));
     }
 
+    // [spec: completion_port.tla WaitLoop]
     loop {
+        // [spec: completion_port.tla CheckAndAct — lock, check, drain or set_waiter, unlock]
         {
             let mut p = port.lock();
             let timed_out = deadline.is_some() && timer::ticks() >= deadline.unwrap();
@@ -707,7 +709,9 @@ pub fn sys_io_wait(port_fd: i32, completions_ptr: u64, max: u32, min: u32, timeo
 
             // Not enough completions yet — register as waiter and block
             p.set_waiter(thread_idx);
-        }
+        } // port lock released here
+        // [spec: completion_port.tla Block — BUG: thread_state set AFTER lock release]
+        // See completion_port_fixed.tla for the fix: mark blocked BEFORE unlock.
         scheduler::block_current_thread();
         // Woken — either by post() or by timeout timer. Loop back to check.
     }
@@ -895,9 +899,13 @@ pub fn sys_io_ring_enter(port_fd: i32, to_submit: u32, min_complete: u32, flags:
     }
 
     // Phase 3: Wait for min_complete CQ entries
+    // [spec: completion_port.tla WaitLoop — but NOTE: check and set_waiter are
+    //  under separate lock acquisitions here, unlike the spec's atomic CheckAndAct.
+    //  This is a second bug variant not yet modelled in the spec.]
     if min_complete > 0 {
         let thread_idx = scheduler::current_thread_idx();
         loop {
+            // [spec: completion_port.tla CheckAndAct (check half) — first lock]
             {
                 let p = port.lock();
                 if let Some(ring) = p.ring() {
@@ -906,13 +914,13 @@ pub fn sys_io_ring_enter(port_fd: i32, to_submit: u32, min_complete: u32, flags:
                         return avail as i64;
                     }
                 }
-                // Not enough yet — register waiter
-                // (need mutable access for set_waiter)
-            }
+            } // lock released — a producer can post here and the check above is stale
+            // [spec: completion_port.tla CheckAndAct (set_waiter half) — second lock]
             {
                 let mut p = port.lock();
                 p.set_waiter(thread_idx);
-            }
+            } // lock released
+            // [spec: completion_port.tla Block — same lost-wakeup bug as sys_io_wait]
             scheduler::block_current_thread();
             // Woken by post() — loop back to check.
             // Also flush any new deferred completions.

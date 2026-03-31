@@ -25,6 +25,7 @@
 
 - [IPC Channels](ipc-channels.md)
 - [Completion Port Design](completion-port-design.md)
+- [Blocking Protocol](blocking-protocol.md)
 - [Scheduler Donate](scheduler-donate.md)
 
 # Signals

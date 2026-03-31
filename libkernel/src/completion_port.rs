@@ -151,27 +151,29 @@ impl IoRing {
     /// Write a CQE to the CQ ring, advancing the tail.
     ///
     /// Returns `false` if the CQ is full.
+    // [spec: spsc_ring.tla Producer — AcquireHead through ReleaseTail]
     pub fn post_cqe(&self, cqe: IoCompletion) -> bool {
         let phys = self.cq_phys[0].as_u64();
         let virt = PHYS_MAP_BASE + phys;
         let hdr = unsafe { &*(virt as *const RingHeader) };
 
-        // Acquire head (written by userspace consumer)
+        // [spec: spsc_ring.tla AcquireHead]
         let head = hdr.head.load(Ordering::Acquire);
         let tail = hdr.tail.load(Ordering::Relaxed);
 
-        // Full when tail - head == capacity
+        // [spec: spsc_ring.tla CheckFull]
         if tail.wrapping_sub(head) >= self.cq_entries {
             return false;
         }
 
+        // [spec: spsc_ring.tla WriteSlot]
         let entry_offset = RING_ENTRIES_OFFSET
             + (tail & (self.cq_entries - 1)) as usize * core::mem::size_of::<IoCompletion>();
         unsafe {
             *((virt + entry_offset as u64) as *mut IoCompletion) = cqe;
         }
 
-        // Release store: CQE data is visible before tail advances
+        // [spec: spsc_ring.tla ReleaseTail]
         hdr.tail.store(tail.wrapping_add(1), Ordering::Release);
 
         true
@@ -311,7 +313,9 @@ impl CompletionPort {
     /// Returns the thread index that was unblocked (if any), so syscall-context
     /// callers can use it for scheduler donate.  ISR callers can ignore the
     /// return value.
+    // [spec: completion_port.tla Post — entire body is one atomic step under IrqMutex]
     pub fn post(&mut self, c: Completion) -> Option<usize> {
+        // [spec: completion_port.tla Post — p_simple branch (cq_count) vs queue branch]
         if let Some(ref ring) = self.ring {
             if c.read_buf.is_none() && c.transfer_fds.is_none() {
                 // Fast path: write CQE directly to shared ring
@@ -332,6 +336,7 @@ impl CompletionPort {
                 self.queue.push_back(c);
             }
         }
+        // [spec: completion_port.tla Post — waiter check + unblock]
         if let Some(t) = self.waiter.take() {
             scheduler::unblock(t);
             Some(t)
@@ -347,6 +352,7 @@ impl CompletionPort {
     }
 
     /// Register the current thread as waiter. Only one waiter at a time.
+    // [spec: completion_port.tla CheckAndAct — "waiter := CONSUMER_ID"]
     pub fn set_waiter(&mut self, thread_idx: usize) {
         self.waiter = Some(thread_idx);
     }
