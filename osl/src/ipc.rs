@@ -106,8 +106,10 @@ pub fn sys_ipc_send(fd: i32, msg_ptr: u64, flags: u32) -> i64 {
                 return 0;
             }
             SendAction::Block => {
-                // Message stored in pending_send; block until receiver wakes us.
-                scheduler::block_current_thread();
+                // Message stored in pending_send; already marked blocked under
+                // the channel lock by try_send().  Yield to let the scheduler
+                // switch away.
+                scheduler::yield_now();
                 // Check if peer closed while we were blocked.
                 let recv_closed = channel.lock().is_recv_closed();
                 if recv_closed {
@@ -116,9 +118,9 @@ pub fn sys_ipc_send(fd: i32, msg_ptr: u64, flags: u32) -> i64 {
                 return 0;
             }
             SendAction::BlockWithMsg(env) => {
-                // Queue was full; block until receiver drains and wakes us.
+                // Queue was full; already marked blocked under the channel lock.
                 retry_env = Some(env);
-                scheduler::block_current_thread();
+                scheduler::yield_now();
                 // Retry — the receiver unblocked us, so there should be space.
                 continue;
             }
@@ -171,8 +173,8 @@ pub fn sys_ipc_recv(fd: i32, msg_ptr: u64, flags: u32) -> i64 {
                 return deliver_to_user(env, msg_ptr);
             }
             RecvAction::Block => {
-                // No message; block until sender wakes us.
-                scheduler::block_current_thread();
+                // No message; already marked blocked under the channel lock.
+                scheduler::yield_now();
                 // Retry — sender may have deposited a message or closed.
                 continue;
             }

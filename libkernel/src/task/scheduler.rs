@@ -101,6 +101,9 @@ struct Scheduler {
     current_idx: usize,
     /// Queue of thread indices (into `threads`) that are ready to run.
     ready_queue: VecDeque<usize>,
+    /// Index of the idle thread.  Never on the ready queue — used as fallback
+    /// when the ready queue is empty.
+    idle_thread_idx: usize,
 }
 
 impl Scheduler {
@@ -110,6 +113,7 @@ impl Scheduler {
             threads: Vec::new(),
             current_idx: 0,
             ready_queue: VecDeque::new(),
+            idle_thread_idx: 0,
         }
     }
 
@@ -301,6 +305,13 @@ pub fn migrate_to_heap_stack(continuation: fn() -> !) -> ! {
     }
 }
 
+/// The idle thread body.  Runs when no other thread is ready.
+fn idle_thread_main() -> ! {
+    loop {
+        x86_64::instructions::interrupts::enable_and_hlt();
+    }
+}
+
 /// Register the current execution context as thread 0.
 /// Call once, after the heap is initialised and before starting the executor.
 pub fn init() {
@@ -326,6 +337,19 @@ pub fn init() {
         });
         sched.current_idx = 0;
         sched.initialized = true;
+    });
+
+    // Spawn the idle thread outside the scheduler lock (spawn_thread locks internally).
+    spawn_thread(idle_thread_main);
+
+    // Remove the idle thread from the ready queue and record its index.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        let idle_idx = sched.ready_queue.pop_back()
+            .expect("idle thread should be on the ready queue");
+        sched.idle_thread_idx = idle_idx;
+        // Set idle thread to Ready (not on the queue — scheduler picks it as fallback).
+        sched.threads[idle_idx].state = ThreadState::Ready;
     });
 }
 
@@ -615,53 +639,55 @@ pub fn is_thread_dead(idx: usize) -> bool {
 
 /// Mark the current thread as dead and yield.
 ///
-/// The timer ISR will see `Dead` and not re-queue the thread.  This function
-/// never returns — it enables interrupts and spins until preempted.
+/// The scheduler will see `Dead` and switch to the next ready thread (or the
+/// idle thread).  This function never returns.
 pub fn kill_current_thread() -> ! {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut sched = SCHEDULER.lock();
         let idx = sched.current_idx;
         sched.threads[idx].state = ThreadState::Dead;
     });
-    // Enable interrupts and spin; the timer will preempt us and we won't be
-    // re-queued because our state is Dead.
-    loop {
-        x86_64::instructions::interrupts::enable_and_hlt();
-    }
+    yield_now();
+    unreachable!("dead thread was rescheduled");
 }
 
-/// Mark the current thread as blocked and yield.
+/// Mark the current thread as blocked WITHOUT yielding.
 ///
-/// The timer ISR will see `Blocked` and not re-queue the thread.
-/// When another context calls `unblock(thread_idx)`, the thread will be
-/// placed back on the ready queue and eventually rescheduled.
+/// Call this while still holding the caller's lock (e.g. port, pipe, channel)
+/// so that `unblock()` is guaranteed to find `ThreadState::Blocked`.
+/// Follow with `yield_now()` after releasing the lock.
 ///
-/// Returns when the thread is unblocked and rescheduled.
-// [spec: completion_port.tla Block — sets thread_state := "blocked" then
-//  await thread_state = "running".  BUG: this runs AFTER the port lock is
-//  released, so a producer can call unblock() before state is Blocked.
-//  See completion_port_fixed.tla: the fix moves mark_blocked under the port lock.]
-pub fn block_current_thread() {
+/// # Protocol
+/// ```text
+/// {
+///     let mut guard = resource.lock();
+///     guard.set_waiter(thread_idx);
+///     scheduler::mark_blocked();   // under the lock
+/// }                                // lock released
+/// scheduler::yield_now();          // switch away
+/// ```
+// [spec: completion_port_fixed.tla MarkBlocked — sets thread_state := "blocked"
+//  while the port lock is still held, closing the lost-wakeup window.]
+pub fn mark_blocked() {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut sched = SCHEDULER.lock();
         let idx = sched.current_idx;
         sched.threads[idx].state = ThreadState::Blocked;
     });
-    // Enable interrupts and spin; the timer will preempt us.
-    // When unblock() is called, our state becomes Ready and we'll be re-queued.
-    // We detect this by checking our state on each wake.
-    loop {
-        x86_64::instructions::interrupts::enable_and_hlt();
-        // Check if we've been unblocked (state changed to Running by the scheduler).
-        let state = x86_64::instructions::interrupts::without_interrupts(|| {
-            let sched = SCHEDULER.lock();
-            let idx = sched.current_idx;
-            sched.threads[idx].state
-        });
-        if state != ThreadState::Blocked {
-            break;
-        }
-    }
+}
+
+/// Mark the current thread as blocked and yield.
+///
+/// Convenience wrapper: `mark_blocked()` + `yield_now()`.
+/// Prefer calling `mark_blocked()` under the caller's lock and `yield_now()`
+/// after releasing it for new code — see [`mark_blocked`] doc comment.
+/// This function exists for backward compatibility with sites that cannot
+/// easily restructure their locking (e.g. `sys_wait4`, `blocking()`).
+// [spec: completion_port.tla Block — the split mark_blocked + yield_now avoids
+//  the lost-wakeup race documented in completion_port_fixed.tla.]
+pub fn block_current_thread() {
+    mark_blocked();
+    yield_now();
 }
 
 /// Unblock a previously blocked thread, placing it back on the ready queue.
@@ -833,13 +859,19 @@ unsafe extern "C" fn preempt_tick(current_rsp: u64) -> u64 {
         sched.ready_queue.push_back(current_idx);
     }
 
-    // Round-robin: pop from the front of the ready queue.
+    // Round-robin: pop from the front of the ready queue, or fall back to
+    // the idle thread when nothing else is runnable.
     let next_idx = match sched.ready_queue.pop_front() {
         Some(idx) => idx,
-        None => {
-            return current_rsp;
-        }
+        None => sched.idle_thread_idx,
     };
+
+    // Fast path: if we'd switch back to ourselves, just reset quantum.
+    if next_idx == current_idx {
+        sched.threads[current_idx].state = ThreadState::Running;
+        sched.threads[current_idx].ticks_remaining = QUANTUM_TICKS;
+        return current_rsp;
+    }
 
     sched.current_idx = next_idx;
     sched.threads[next_idx].state = ThreadState::Running;
@@ -902,7 +934,7 @@ unsafe extern "C" fn yield_tick(current_rsp: u64) -> u64 {
     } else {
         match sched.ready_queue.pop_front() {
             Some(idx) => idx,
-            None => return current_rsp,
+            None => sched.idle_thread_idx,
         }
     };
 

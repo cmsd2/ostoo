@@ -78,12 +78,15 @@ pub fn read_input(buf: &mut [u8]) -> ReadResult {
                 return ReadResult::Interrupted;
             }
         }
-        // Buffer empty — register ourselves as blocked reader and sleep.
+        // Buffer empty — register ourselves as blocked reader and mark blocked
+        // under the console lock so that unblock() from push_input() is safe.
+        // [spec: completion_port_fixed.tla MarkBlocked — under caller's lock]
         let thread_idx = scheduler::current_thread_idx();
         inner.blocked_reader = Some(thread_idx);
         inner.blocked_reader_pid = Some(pid);
-        drop(inner); // release lock before blocking
-        scheduler::block_current_thread();
+        scheduler::mark_blocked();
+        drop(inner); // release lock after mark_blocked
+        scheduler::yield_now();
         // Loop back to retry after being woken.
     }
 }

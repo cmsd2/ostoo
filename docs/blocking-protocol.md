@@ -2,7 +2,7 @@
 
 This document describes the blocking/wakeup protocol used throughout the
 kernel, the lost-wakeup race it currently suffers from, and a proposed fix
-based on a `WaitCondition` primitive.
+based on an idle thread and a `WaitCondition` primitive.
 
 Formal PlusCal/TLA+ models of the protocol live in `specs/`. See
 [specs/PLUSCAL.md](../specs/PLUSCAL.md) for authoring instructions and
@@ -82,14 +82,100 @@ The `sys_io_ring_enter` variant has an additional bug: check and set_waiter
 are under **separate** lock acquisitions, so a completion can arrive between
 the check and the registration.
 
+### Why Blocked threads spin today
+
+Both `preempt_tick` and `yield_tick` handle an empty ready queue by returning
+`current_rsp` — i.e. they keep running the current thread even if it's
+Blocked. This forces `block_current_thread()` to include a HLT spin loop:
+the Blocked thread keeps running on the CPU, calling `enable_and_hlt()` in a
+loop, waiting for the next timer interrupt to check if `unblock()` has
+changed its state. This wastes up to one full quantum (10ms) per blocking
+event and prevents the CPU from doing useful work while the thread is
+Blocked.
+
 ## Proposed fix
 
-### Step 1: Split `block_current_thread` into two halves
+The fix has three parts: an idle thread that eliminates the need for blocked
+threads to spin, a split of `block_current_thread` that fixes the race, and
+a `WaitCondition` wrapper that makes the correct pattern easy and the buggy
+pattern impossible.
+
+### Step 1: Add an idle thread
+
+Create a per-CPU idle thread that the scheduler falls back to when the ready
+queue is empty. The idle thread does nothing but HLT in a loop, yielding the
+CPU until the next interrupt:
 
 ```rust
-/// Mark the current thread Blocked. Safe to call while holding any lock.
-/// Caller MUST call wait_until_unblocked() after releasing their lock.
-// [spec: completion_port_fixed.tla CheckAndAct — "thread_state := blocked"]
+fn idle_thread() -> ! {
+    loop {
+        x86_64::instructions::interrupts::enable_and_hlt();
+    }
+}
+```
+
+The idle thread is created during scheduler init and stored in `Scheduler`:
+
+```rust
+struct Scheduler {
+    // ...
+    idle_thread_idx: usize,  // always present, never on the ready queue
+}
+```
+
+Then `preempt_tick` and `yield_tick` switch to the idle thread instead of
+staying on a Blocked/Dead thread:
+
+```rust
+let next_idx = match sched.ready_queue.pop_front() {
+    Some(idx) => idx,
+    None => sched.idle_thread_idx,  // was: return current_rsp
+};
+```
+
+The idle thread is never pushed onto the ready queue. The scheduler only runs
+it as a fallback when nothing else is Ready. The first `unblock()` call
+pushes a real thread onto the ready queue, and the next timer tick preempts
+idle and switches to it.
+
+With this change, a Blocked thread no longer needs to spin — the scheduler
+context-switches away from it immediately and never schedules it again until
+`unblock()` makes it Ready.
+
+### Step 2: Split `block_current_thread` into mark + yield
+
+```rust
+/// Mark the current thread Blocked and yield to the scheduler.
+///
+/// Safe to call while holding any lock (acquires SCHEDULER briefly).
+/// The scheduler will context-switch away and never schedule this thread
+/// again until unblock() is called. Execution resumes at the instruction
+/// after this call.
+// [spec: completion_port_fixed.tla CheckAndAct — "thread_state := blocked"
+//        + WaitUnblocked — "await thread_state = running"]
+pub fn mark_blocked_and_yield() {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        let idx = sched.current_idx;
+        sched.threads[idx].state = ThreadState::Blocked;
+    });
+    yield_now();  // context-switch away; resume here after unblock + reschedule
+}
+```
+
+There is no spin loop. `yield_now()` triggers `int 0x50`, which enters
+`yield_tick`. The scheduler sees the thread is Blocked, does not re-queue it,
+and switches to the next ready thread (or idle). When `unblock()` is called
+later, the thread is pushed onto the ready queue with state Ready. The
+scheduler eventually picks it and context-switches back, resuming execution
+right after the `yield_now()` call.
+
+A separate `mark_blocked()` (without yield) is still useful for callers that
+need to mark Blocked under a lock and yield after dropping it:
+
+```rust
+/// Mark the current thread Blocked. Does NOT yield.
+/// Caller must call yield_now() after releasing their lock.
 pub fn mark_blocked() {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut sched = SCHEDULER.lock();
@@ -97,28 +183,9 @@ pub fn mark_blocked() {
         sched.threads[idx].state = ThreadState::Blocked;
     });
 }
-
-/// Spin until another thread calls unblock(). Must be Blocked before calling.
-// [spec: completion_port_fixed.tla WaitUnblocked — "await thread_state = running"]
-pub fn wait_until_unblocked() {
-    loop {
-        x86_64::instructions::interrupts::enable_and_hlt();
-        let state = x86_64::instructions::interrupts::without_interrupts(|| {
-            let sched = SCHEDULER.lock();
-            sched.threads[sched.current_idx].state
-        });
-        if state != ThreadState::Blocked {
-            break;
-        }
-    }
-}
 ```
 
-This maps directly to the verified fix in `specs/completion_port_fixed.tla`:
-`mark_blocked()` is inside the `CheckAndAct` label (under the lock) and
-`wait_until_unblocked()` is the `WaitUnblocked` label (after unlock).
-
-### Step 2: Migrate call sites manually
+### Step 3: Migrate call sites
 
 Each site becomes:
 
@@ -128,27 +195,27 @@ Each site becomes:
     guard.waiter = Some(thread_idx);       // 2. register waiter
     scheduler::mark_blocked();             // 3. mark Blocked UNDER LOCK
 }                                          // 4. release lock
-scheduler::wait_until_unblocked();         // 5. spin until woken
+scheduler::yield_now();                    // 5. context-switch away
+// execution resumes here after unblock + reschedule
 ```
 
-Now `unblock()` is guaranteed to find `Blocked` if the waiter slot is set,
-because `mark_blocked()` ran before the lock was released.
+No loop, no spin, no HLT. The thread is off the CPU until explicitly woken.
 
-### Step 3: Introduce `WaitCondition` to enforce the pattern
+### Step 4: Introduce `WaitCondition` to enforce the pattern
 
 A condvar-like wrapper that makes the ordering impossible to get wrong:
 
 ```rust
 /// Single-waiter condvar for kernel blocking.
 ///
-/// Encapsulates the check → register → mark_blocked → unlock → wait cycle.
+/// Encapsulates the check → register → mark_blocked → unlock → yield cycle.
 /// The type system ensures mark_blocked happens before the guard drops.
 pub struct WaitCondition;
 
 impl WaitCondition {
     /// If `predicate(guard)` returns true (i.e. "should block"), register
-    /// the waiter, mark the thread Blocked, release the lock, and wait.
-    /// Returns when unblocked.
+    /// the waiter, mark the thread Blocked, release the lock, and yield.
+    /// Returns when unblocked and rescheduled.
     ///
     // [spec: completion_port_fixed.tla
     //   CheckAndAct (check + set_waiter + mark_blocked) = one label
@@ -163,9 +230,9 @@ impl WaitCondition {
         }
         let thread_idx = scheduler::current_thread_idx();
         register(&mut *guard, thread_idx);
-        scheduler::mark_blocked();
-        drop(guard);
-        scheduler::wait_until_unblocked();
+        scheduler::mark_blocked();  // mark Blocked while lock held
+        drop(guard);                // release lock
+        scheduler::yield_now();     // context-switch away; resume after unblock
     }
 }
 ```
@@ -204,11 +271,11 @@ WaitCondition::wait_while(
 );
 ```
 
-### Step 4: Deprecate `block_current_thread`
+### Step 5: Deprecate `block_current_thread`
 
 Once all sites are migrated, remove or `#[deprecated]` the old monolithic
-function. New blocking code must use `WaitCondition` or the split
-`mark_blocked` / `wait_until_unblocked` pair.
+function. New blocking code must use `WaitCondition` or the
+`mark_blocked()` / `yield_now()` pair.
 
 ## Lock ordering note
 
@@ -230,7 +297,7 @@ and mark blocked before acquiring the inner lock.
 | `register(guard, idx)` | Same label | Under same lock |
 | `mark_blocked()` | Same label | Under same lock (acquires SCHEDULER briefly) |
 | `drop(guard)` | End of label | Lock released |
-| `wait_until_unblocked()` | Next label | `await thread_state = "running"` |
+| `yield_now()` | Next label | `await thread_state = "running"` |
 | `unblock(idx)` in waker | Waker's label | `if thread_state = "blocked" then running` |
 
 Each `WaitCondition::wait_while` call maps to exactly two PlusCal labels,

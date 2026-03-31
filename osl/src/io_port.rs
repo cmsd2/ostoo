@@ -707,12 +707,13 @@ pub fn sys_io_wait(port_fd: i32, completions_ptr: u64, max: u32, min: u32, timeo
                 return count as i64;
             }
 
-            // Not enough completions yet — register as waiter and block
+            // Not enough completions yet — register as waiter and block.
+            // [spec: completion_port_fixed.tla CheckAndAct — set_waiter + mark_blocked
+            //  under the same lock acquisition, closing the lost-wakeup window.]
             p.set_waiter(thread_idx);
+            scheduler::mark_blocked();
         } // port lock released here
-        // [spec: completion_port.tla Block — BUG: thread_state set AFTER lock release]
-        // See completion_port_fixed.tla for the fix: mark blocked BEFORE unlock.
-        scheduler::block_current_thread();
+        scheduler::yield_now();
         // Woken — either by post() or by timeout timer. Loop back to check.
     }
 }
@@ -899,29 +900,23 @@ pub fn sys_io_ring_enter(port_fd: i32, to_submit: u32, min_complete: u32, flags:
     }
 
     // Phase 3: Wait for min_complete CQ entries
-    // [spec: completion_port.tla WaitLoop — but NOTE: check and set_waiter are
-    //  under separate lock acquisitions here, unlike the spec's atomic CheckAndAct.
-    //  This is a second bug variant not yet modelled in the spec.]
+    // [spec: completion_port_fixed.tla WaitLoop — check + set_waiter + mark_blocked
+    //  under a single lock acquisition, closing both the split-lock and lost-wakeup bugs.]
     if min_complete > 0 {
         let thread_idx = scheduler::current_thread_idx();
         loop {
-            // [spec: completion_port.tla CheckAndAct (check half) — first lock]
             {
-                let p = port.lock();
+                let mut p = port.lock();
                 if let Some(ring) = p.ring() {
                     let avail = ring.cq_available();
                     if avail >= min_complete {
                         return avail as i64;
                     }
                 }
-            } // lock released — a producer can post here and the check above is stale
-            // [spec: completion_port.tla CheckAndAct (set_waiter half) — second lock]
-            {
-                let mut p = port.lock();
                 p.set_waiter(thread_idx);
-            } // lock released
-            // [spec: completion_port.tla Block — same lost-wakeup bug as sys_io_wait]
-            scheduler::block_current_thread();
+                scheduler::mark_blocked();
+            } // port lock released
+            scheduler::yield_now();
             // Woken by post() — loop back to check.
             // Also flush any new deferred completions.
             {

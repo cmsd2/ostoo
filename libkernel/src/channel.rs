@@ -217,6 +217,8 @@ impl ChannelInner {
                 let thread_idx = scheduler::current_thread_idx();
                 self.pending_send = Some(env);
                 self.blocked_sender = Some(thread_idx);
+                // [spec: completion_port_fixed.tla MarkBlocked — under channel lock]
+                scheduler::mark_blocked();
                 SendAction::Block
             }
         } else {
@@ -240,6 +242,8 @@ impl ChannelInner {
                 }
                 let thread_idx = scheduler::current_thread_idx();
                 self.blocked_sender = Some(thread_idx);
+                // [spec: completion_port_fixed.tla MarkBlocked — under channel lock]
+                scheduler::mark_blocked();
                 SendAction::BlockWithMsg(env)
             }
         }
@@ -268,6 +272,8 @@ impl ChannelInner {
                 }
                 let thread_idx = scheduler::current_thread_idx();
                 self.blocked_receiver = Some(thread_idx);
+                // [spec: completion_port_fixed.tla MarkBlocked — under channel lock]
+                scheduler::mark_blocked();
                 RecvAction::Block
             }
         } else {
@@ -292,6 +298,8 @@ impl ChannelInner {
                 }
                 let thread_idx = scheduler::current_thread_idx();
                 self.blocked_receiver = Some(thread_idx);
+                // [spec: completion_port_fixed.tla MarkBlocked — under channel lock]
+                scheduler::mark_blocked();
                 RecvAction::Block
             }
         }

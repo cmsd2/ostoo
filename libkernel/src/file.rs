@@ -371,17 +371,20 @@ impl FileHandle for PipeReader {
                 }
             }
 
-            // Register as blocked reader and wait.
+            // Register as blocked reader and mark blocked under the pipe lock
+            // so that unblock() is guaranteed to find ThreadState::Blocked.
+            // [spec: completion_port_fixed.tla MarkBlocked — under caller's lock]
             let thread_idx = crate::task::scheduler::current_thread_idx();
             inner.reader_thread = Some(thread_idx);
-            // Mark as interruptible so sys_kill can wake us.
+            crate::task::scheduler::mark_blocked();
+            drop(inner);
+            // Register signal_thread after mark_blocked (best-effort for Ctrl+C).
             if pid != crate::process::ProcessId::KERNEL {
                 crate::process::with_process(pid, |p| {
                     p.signal_thread = Some(thread_idx);
                 });
             }
-            drop(inner);
-            crate::task::scheduler::block_current_thread();
+            crate::task::scheduler::yield_now();
             // Clear signal_thread after waking.
             if pid != crate::process::ProcessId::KERNEL {
                 crate::process::with_process(pid, |p| {
