@@ -11,9 +11,9 @@ use alloc::vec::Vec;
 use ostoo_rt::compositor_proto::*;
 use ostoo_rt::kbd_proto;
 use ostoo_rt::ostoo::{
-    self, CompletionPort, FramebufferMem, IpcRecv, IpcSend, IrqFd, NotifyFd, OsError, SharedMem,
+    self, FramebufferMem, IoRing, IpcRecv, IpcSend, IrqFd, NotifyFd, OsError, SharedMem,
 };
-use ostoo_rt::sys::{self, IoCompletion, IoSubmission, IpcMessage};
+use ostoo_rt::sys::{self, IoSubmission, IpcMessage};
 use ostoo_rt::{eprintln, println};
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -41,8 +41,6 @@ const TITLE_TEXT: u32 = 0x00FFFFFF;         // white text
 const TITLE_TEXT_INACTIVE: u32 = 0x00A0B8C8; // dimmed text
 
 const MAX_WINDOWS: usize = 4;
-const MAX_COMPLETIONS: usize = 16;
-
 // Completion user_data tag encoding:
 const TAG_NEW_CLIENT: u64 = 0x1000;
 const TAG_DAMAGE_BASE: u64 = 0x2000;
@@ -367,9 +365,9 @@ fn run() -> Result<(), OsError> {
     // Clear to background color.
     fill_rect(fb_ptr, 0, 0, FB_WIDTH, FB_HEIGHT, BG_COLOR);
 
-    // 2. Create registration channel + completion port.
+    // 2. Create registration channel + IO ring.
     let (reg_send, reg_recv) = ostoo::ipc_channel(4, 0)?;
-    let port = CompletionPort::new()?;
+    let ring = IoRing::new(16, 32)?;
 
     // 3. Register the compositor service.
     ostoo::service_register(SERVICE_NAME, reg_send.fd())?;
@@ -377,7 +375,7 @@ fn run() -> Result<(), OsError> {
 
     // 4. Connect to keyboard service (if available).
     let mut kbd_msg = IpcMessage::default();
-    let _kbd_recv: Option<IpcRecv> = match connect_keyboard(&port, &mut kbd_msg) {
+    let _kbd_recv: Option<IpcRecv> = match connect_keyboard(&ring, &mut kbd_msg) {
         Ok(recv) => Some(recv),
         Err(_) => {
             println!("compositor: keyboard service not found, no key input");
@@ -388,7 +386,7 @@ fn run() -> Result<(), OsError> {
     // 5. Claim mouse IRQ directly (no separate mouse driver).
     let mouse_irq = match IrqFd::new(12) {
         Ok(irq) => {
-            port.submit(&[IoSubmission::irq_wait(TAG_MOUSE, irq.fd())])?;
+            ring.submit(&[IoSubmission::irq_wait(TAG_MOUSE, irq.fd())])?;
             println!("compositor: claimed mouse IRQ 12");
             Some(irq)
         }
@@ -401,7 +399,7 @@ fn run() -> Result<(), OsError> {
 
     // 6. Arm OP_IPC_RECV on the registration channel.
     let mut reg_msg = IpcMessage::default();
-    port.submit(&[IoSubmission::ipc_recv(
+    ring.submit(&[IoSubmission::ipc_recv(
         TAG_NEW_CLIENT,
         reg_recv.fd(),
         &mut reg_msg,
@@ -410,8 +408,6 @@ fn run() -> Result<(), OsError> {
     // 7. State.
     let mut windows: Vec<Window> = Vec::new();
     let mut next_wid: u64 = 1;
-    let mut completions = [IoCompletion::default(); MAX_COMPLETIONS];
-
     // Mouse & focus state.
     let mut cursor_x: usize = FB_WIDTH / 2;
     let mut cursor_y: usize = FB_HEIGHT / 2;
@@ -428,18 +424,17 @@ fn run() -> Result<(), OsError> {
 
     // 8. Event loop.
     loop {
-        let n = port.wait(&mut completions, 1, 0)?;
+        ring.enter(0, 1)?;
         let mut scene_dirty = false;
         let mut cursor_moved = false;
 
-        for i in 0..n {
-            let cqe = completions[i];
+        while let Some(cqe) = ring.pop_cqe() {
             let ud = cqe.user_data;
 
             if ud == TAG_NEW_CLIENT {
                 if cqe.result >= 0 {
                     handle_connect(
-                        &port,
+                        &ring,
                         &reg_msg,
                         &mut windows,
                         &mut next_wid,
@@ -448,7 +443,7 @@ fn run() -> Result<(), OsError> {
                     scene_dirty = true;
                 }
                 reg_msg = IpcMessage::default();
-                port.submit(&[IoSubmission::ipc_recv(
+                ring.submit(&[IoSubmission::ipc_recv(
                     TAG_NEW_CLIENT,
                     reg_recv.fd(),
                     &mut reg_msg,
@@ -458,7 +453,7 @@ fn run() -> Result<(), OsError> {
                 if let Some(win) = windows.iter_mut().find(|w| w.id == wid) {
                     win.dirty = true;
                     scene_dirty = true;
-                    port.submit(&[IoSubmission::ring_wait(
+                    ring.submit(&[IoSubmission::ring_wait(
                         TAG_DAMAGE_BASE + wid,
                         win._notify.fd(),
                     )])?;
@@ -486,7 +481,7 @@ fn run() -> Result<(), OsError> {
                 }
                 kbd_msg = IpcMessage::default();
                 if let Some(ref recv) = _kbd_recv {
-                    port.submit(&[IoSubmission::ipc_recv(
+                    ring.submit(&[IoSubmission::ipc_recv(
                         TAG_KEYBOARD,
                         recv.fd(),
                         &mut kbd_msg,
@@ -682,7 +677,7 @@ fn run() -> Result<(), OsError> {
                 }
                 // Re-arm IRQ wait.
                 if let Some(ref irq) = mouse_irq {
-                    port.submit(&[IoSubmission::irq_wait(TAG_MOUSE, irq.fd())])?;
+                    ring.submit(&[IoSubmission::irq_wait(TAG_MOUSE, irq.fd())])?;
                 }
             } else if ud >= TAG_CMD_BASE {
                 let wid = ud - TAG_CMD_BASE;
@@ -714,7 +709,7 @@ fn run() -> Result<(), OsError> {
                     }
                     if let Some(win) = windows.iter_mut().find(|w| w.id == wid) {
                         win.cmd_msg = IpcMessage::default();
-                        port.submit(&[IoSubmission::ipc_recv(
+                        ring.submit(&[IoSubmission::ipc_recv(
                             TAG_CMD_BASE + wid,
                             win._c2s_recv.fd(),
                             &mut win.cmd_msg,
@@ -775,7 +770,7 @@ fn finalize_resize(win: &mut Window, new_w: usize, new_h: usize) {
 // ── Connection handling ──────────────────────────────────────────────
 
 fn handle_connect(
-    port: &CompletionPort,
+    ring: &IoRing,
     msg: &IpcMessage,
     windows: &mut Vec<Window>,
     next_wid: &mut u64,
@@ -850,11 +845,11 @@ fn handle_connect(
 
     let mut cmd_msg = IpcMessage::default();
 
-    let _ = port.submit(&[IoSubmission::ring_wait(
+    let _ = ring.submit(&[IoSubmission::ring_wait(
         TAG_DAMAGE_BASE + wid,
         notify.fd(),
     )]);
-    let _ = port.submit(&[IoSubmission::ipc_recv(
+    let _ = ring.submit(&[IoSubmission::ipc_recv(
         TAG_CMD_BASE + wid,
         c2s_recv.fd(),
         &mut cmd_msg,
@@ -1106,7 +1101,7 @@ fn draw_cursor(fb_ptr: *mut u8, cx: usize, cy: usize, style: CursorStyle) {
 // ── Service connections ──────────────────────────────────────────────
 
 fn connect_keyboard(
-    port: &CompletionPort,
+    ring: &IoRing,
     kbd_msg: &mut IpcMessage,
 ) -> Result<IpcRecv, OsError> {
     let reg_send_fd = ostoo::service_lookup_retry(kbd_proto::SERVICE_NAME, 10)?;
@@ -1123,7 +1118,7 @@ fn connect_keyboard(
     ostoo_rt::syscall::close(reg_send_fd as u32);
     drop(evt_send);
 
-    port.submit(&[IoSubmission::ipc_recv(TAG_KEYBOARD, evt_recv.fd(), kbd_msg)])?;
+    ring.submit(&[IoSubmission::ipc_recv(TAG_KEYBOARD, evt_recv.fd(), kbd_msg)])?;
 
     println!("compositor: connected to keyboard service");
     Ok(evt_recv)
