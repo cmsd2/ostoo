@@ -22,6 +22,7 @@ test-timeout = 30
 [dependencies]
 acpi                  = { workspace = true }
 apic_types            = { workspace = true }
+completion-port       = { workspace = true }
 bitflags              = { workspace = true }
 bootloader            = { workspace = true }
 conquer-once          = { workspace = true }

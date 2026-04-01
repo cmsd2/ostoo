@@ -5,13 +5,15 @@ members = [
     "devices",
     "devices-macros",
     "osl",
+    "completion-port",
 ]
 
 [workspace.dependencies]
 # workspace-local crates
-devices   = { path = "devices" }
-libkernel = { path = "libkernel" }
-osl       = { path = "osl" }
+completion-port = { path = "completion-port" }
+devices         = { path = "devices" }
+libkernel       = { path = "libkernel" }
+osl             = { path = "osl" }
 
 # external crates shared across two or more members
 acpi          = "6.1.1"

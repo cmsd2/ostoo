@@ -1,15 +1,25 @@
 //! Kernel completion port object for async I/O notification.
+//!
+//! Thin wrapper around the generic `spsc-ring` and `completion-port` crates,
+//! adding kernel-specific wiring (physical memory allocation, scheduler wake).
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
 use x86_64::PhysAddr;
 use crate::channel::TransferFds;
 use crate::memory::PHYS_MAP_BASE;
 use crate::task::scheduler;
 
 // ---------------------------------------------------------------------------
-// Opcode constants (shared with osl and userspace)
+// Re-exports — callers continue to import from libkernel::completion_port
+
+pub use completion_port::{
+    IoSubmission, IoCompletion, RingHeader,
+    RING_ENTRIES_OFFSET, MAX_SQ_ENTRIES, MAX_CQ_ENTRIES,
+};
+
+// ---------------------------------------------------------------------------
+// Opcode constants (kernel protocol, shared with osl and userspace)
 
 pub const OP_NOP: u32 = 0;
 pub const OP_TIMEOUT: u32 = 1;
@@ -21,58 +31,36 @@ pub const OP_IPC_RECV: u32 = 6;
 pub const OP_RING_WAIT: u32 = 7;
 
 // ---------------------------------------------------------------------------
-// Shared repr(C) structs (used by both kernel ring code and osl syscalls)
+// SchedulerWaker — bridges generic Waker trait to kernel scheduler
 
-/// Submission entry — shared layout between userspace and kernel.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IoSubmission {
-    pub user_data: u64,
-    pub opcode: u32,
-    pub flags: u32,
-    pub fd: i32,
-    pub _pad: i32,
-    pub buf_addr: u64,
-    pub buf_len: u32,
-    pub offset: u32,
-    pub timeout_ns: u64,
+struct SchedulerWaker;
+
+impl completion_port::Waker for SchedulerWaker {
+    fn wake(&self, token: usize) {
+        scheduler::unblock(token);
+    }
 }
 
-/// Completion entry — shared layout between userspace and kernel.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IoCompletion {
+// ---------------------------------------------------------------------------
+// Completion — kernel-side completion entry (unchanged)
+
+/// A completion entry stored in the kernel queue.
+pub struct Completion {
     pub user_data: u64,
     pub result: i64,
     pub flags: u32,
     pub opcode: u32,
-}
-
-/// Ring buffer header — shared between kernel and userspace.
-///
-/// `head` and `tail` are accessed atomically since they are shared across
-/// address spaces (kernel writes, userspace reads, or vice versa).
-#[repr(C)]
-pub struct RingHeader {
-    pub head: AtomicU32,
-    pub tail: AtomicU32,
-    pub mask: u32,
-    pub flags: u32,
+    /// For async OP_READ: kernel buffer containing read data, copied to user
+    /// space by io_wait (which runs in the process's syscall context).
+    pub read_buf: Option<Vec<u8>>,
+    /// For async OP_READ: user-space destination address for read_buf data.
+    pub read_dest: u64,
+    /// For OP_IPC_RECV: transferred fd objects to install in receiver's fd table.
+    pub transfer_fds: Option<TransferFds>,
 }
 
 // ---------------------------------------------------------------------------
-// IoRing — shared-memory SQ/CQ ring buffers
-
-/// Offset (in bytes) where ring entries start, cache-line aligned.
-const RING_ENTRIES_OFFSET: usize = 64;
-
-/// Maximum SQ entries that fit in a single 4 KiB page:
-/// (4096 - 64) / 48 = 84, rounded down to power of 2 = 64
-pub const MAX_SQ_ENTRIES: u32 = 64;
-
-/// Maximum CQ entries that fit in a single 4 KiB page:
-/// (4096 - 64) / 24 = 168, rounded down to power of 2 = 128
-pub const MAX_CQ_ENTRIES: u32 = 128;
+// IoRing — kernel wrapper owning physical pages, delegates to SpscRing
 
 /// Shared-memory submission and completion rings.
 ///
@@ -83,6 +71,8 @@ pub struct IoRing {
     cq_phys: Vec<PhysAddr>,
     sq_entries: u32,
     cq_entries: u32,
+    sq_ring: completion_port::SpscRing<IoSubmission>,
+    cq_ring: completion_port::SpscRing<IoCompletion>,
 }
 
 impl IoRing {
@@ -106,25 +96,21 @@ impl IoRing {
             Some(phys)
         })?;
 
-        // Initialise SQ header
-        let sq_virt = PHYS_MAP_BASE + sq_phys_addr.as_u64();
-        unsafe {
-            let hdr = sq_virt as *mut RingHeader;
-            (*hdr).head = AtomicU32::new(0);
-            (*hdr).tail = AtomicU32::new(0);
-            (*hdr).mask = sq_entries - 1;
-            (*hdr).flags = 0;
-        }
+        // Build SpscRing views over the kernel-mapped pages
+        let sq_virt = (PHYS_MAP_BASE + sq_phys_addr.as_u64()) as *mut u8;
+        let cq_virt = (PHYS_MAP_BASE + cq_phys_addr.as_u64()) as *mut u8;
 
-        // Initialise CQ header
-        let cq_virt = PHYS_MAP_BASE + cq_phys_addr.as_u64();
-        unsafe {
-            let hdr = cq_virt as *mut RingHeader;
-            (*hdr).head = AtomicU32::new(0);
-            (*hdr).tail = AtomicU32::new(0);
-            (*hdr).mask = cq_entries - 1;
-            (*hdr).flags = 0;
-        }
+        let sq_ring = unsafe {
+            let ring = completion_port::SpscRing::<IoSubmission>::from_raw_parts(sq_virt, sq_entries);
+            ring.init_header();
+            ring
+        };
+
+        let cq_ring = unsafe {
+            let ring = completion_port::SpscRing::<IoCompletion>::from_raw_parts(cq_virt, cq_entries);
+            ring.init_header();
+            ring
+        };
 
         let mut sq_frames = Vec::new();
         sq_frames.push(sq_phys_addr);
@@ -136,16 +122,14 @@ impl IoRing {
             cq_phys: cq_frames,
             sq_entries,
             cq_entries,
+            sq_ring,
+            cq_ring,
         })
     }
 
     /// Read an SQE from the SQ ring at the given logical index.
     pub fn read_sqe(&self, index: u32) -> IoSubmission {
-        let phys = self.sq_phys[0].as_u64();
-        let virt = PHYS_MAP_BASE + phys;
-        let entry_offset = RING_ENTRIES_OFFSET
-            + (index & (self.sq_entries - 1)) as usize * core::mem::size_of::<IoSubmission>();
-        unsafe { *((virt + entry_offset as u64) as *const IoSubmission) }
+        self.sq_ring.read_entry(index)
     }
 
     /// Write a CQE to the CQ ring, advancing the tail.
@@ -153,77 +137,39 @@ impl IoRing {
     /// Returns `false` if the CQ is full.
     // [spec: spsc_ring/spsc_ring.tla Producer — AcquireHead through ReleaseTail]
     pub fn post_cqe(&self, cqe: IoCompletion) -> bool {
-        let phys = self.cq_phys[0].as_u64();
-        let virt = PHYS_MAP_BASE + phys;
-        let hdr = unsafe { &*(virt as *const RingHeader) };
-
-        // [spec: spsc_ring/spsc_ring.tla AcquireHead]
-        let head = hdr.head.load(Ordering::Acquire);
-        let tail = hdr.tail.load(Ordering::Relaxed);
-
-        // [spec: spsc_ring/spsc_ring.tla CheckFull]
-        if tail.wrapping_sub(head) >= self.cq_entries {
-            return false;
-        }
-
-        // [spec: spsc_ring/spsc_ring.tla WriteSlot]
-        let entry_offset = RING_ENTRIES_OFFSET
-            + (tail & (self.cq_entries - 1)) as usize * core::mem::size_of::<IoCompletion>();
-        unsafe {
-            *((virt + entry_offset as u64) as *mut IoCompletion) = cqe;
-        }
-
-        // [spec: spsc_ring/spsc_ring.tla ReleaseTail]
-        hdr.tail.store(tail.wrapping_add(1), Ordering::Release);
-
-        true
+        self.cq_ring.push(&cqe)
     }
 
     /// Number of pending SQ entries (tail - head).
     pub fn sq_pending(&self) -> u32 {
-        let phys = self.sq_phys[0].as_u64();
-        let virt = PHYS_MAP_BASE + phys;
-        let hdr = unsafe { &*(virt as *const RingHeader) };
-        let head = hdr.head.load(Ordering::Relaxed);
-        // Acquire tail (written by userspace producer)
-        let tail = hdr.tail.load(Ordering::Acquire);
+        // Consumer side: acquire the producer's tail
+        let tail = self.sq_ring.tail_acquire();
+        let head = self.sq_ring.head();
         tail.wrapping_sub(head)
     }
 
     /// Read the SQ head value.
     pub fn sq_head(&self) -> u32 {
-        let phys = self.sq_phys[0].as_u64();
-        let virt = PHYS_MAP_BASE + phys;
-        let hdr = unsafe { &*(virt as *const RingHeader) };
-        hdr.head.load(Ordering::Relaxed)
+        self.sq_ring.head()
     }
 
     /// Read the SQ tail value (written by userspace, acquire ordering).
     pub fn sq_tail(&self) -> u32 {
-        let phys = self.sq_phys[0].as_u64();
-        let virt = PHYS_MAP_BASE + phys;
-        let hdr = unsafe { &*(virt as *const RingHeader) };
-        hdr.tail.load(Ordering::Acquire)
+        self.sq_ring.tail_acquire()
     }
 
     /// Advance the SQ head by `n` entries (release ordering).
     pub fn advance_sq_head(&self, n: u32) {
-        let phys = self.sq_phys[0].as_u64();
-        let virt = PHYS_MAP_BASE + phys;
-        let hdr = unsafe { &*(virt as *const RingHeader) };
-        let head = hdr.head.load(Ordering::Relaxed);
+        let head = self.sq_ring.head();
         // Release store: SQE reads are visible before head advances
-        hdr.head.store(head.wrapping_add(n), Ordering::Release);
+        self.sq_ring.set_head(head.wrapping_add(n));
     }
 
     /// Number of CQ entries available (not yet consumed by userspace).
     pub fn cq_available(&self) -> u32 {
-        let phys = self.cq_phys[0].as_u64();
-        let virt = PHYS_MAP_BASE + phys;
-        let hdr = unsafe { &*(virt as *const RingHeader) };
-        // Acquire head (written by userspace consumer)
-        let head = hdr.head.load(Ordering::Acquire);
-        let tail = hdr.tail.load(Ordering::Relaxed);
+        // Producer side: acquire the consumer's head
+        let head = self.cq_ring.head_acquire();
+        let tail = self.cq_ring.tail();
         tail.wrapping_sub(head)
     }
 
@@ -263,42 +209,18 @@ impl Drop for IoRing {
 }
 
 // ---------------------------------------------------------------------------
-// Completion — kernel-side completion entry
-
-/// A completion entry stored in the kernel queue.
-pub struct Completion {
-    pub user_data: u64,
-    pub result: i64,
-    pub flags: u32,
-    pub opcode: u32,
-    /// For async OP_READ: kernel buffer containing read data, copied to user
-    /// space by io_wait (which runs in the process's syscall context).
-    pub read_buf: Option<Vec<u8>>,
-    /// For async OP_READ: user-space destination address for read_buf data.
-    pub read_dest: u64,
-    /// For OP_IPC_RECV: transferred fd objects to install in receiver's fd table.
-    pub transfer_fds: Option<TransferFds>,
-}
-
-// ---------------------------------------------------------------------------
-// CompletionPort — the kernel object
-
-const DEFAULT_MAX_QUEUED: usize = 256;
+// CompletionPort — kernel wrapper
 
 pub struct CompletionPort {
-    queue: VecDeque<Completion>,
-    waiter: Option<usize>,
-    max_queued: usize,
-    ring: Option<IoRing>,
+    inner: completion_port::CompletionPort<Completion, SchedulerWaker>,
+    io_ring: Option<IoRing>,
 }
 
 impl CompletionPort {
     pub fn new() -> Self {
         CompletionPort {
-            queue: VecDeque::new(),
-            waiter: None,
-            max_queued: DEFAULT_MAX_QUEUED,
-            ring: None,
+            inner: completion_port::CompletionPort::new(SchedulerWaker),
+            io_ring: None,
         }
     }
 
@@ -316,7 +238,7 @@ impl CompletionPort {
     // [spec: completion_port/completion_port.tla Post — entire body is one atomic step under IrqMutex]
     pub fn post(&mut self, c: Completion) -> Option<usize> {
         // [spec: completion_port/completion_port.tla Post — p_simple branch (cq_count) vs queue branch]
-        if let Some(ref ring) = self.ring {
+        if let Some(ref ring) = self.io_ring {
             if c.read_buf.is_none() && c.transfer_fds.is_none() {
                 // Fast path: write CQE directly to shared ring
                 ring.post_cqe(IoCompletion {
@@ -325,55 +247,42 @@ impl CompletionPort {
                     flags: c.flags,
                     opcode: c.opcode,
                 });
-            } else {
-                // Deferred: needs syscall context for data copy / fd install
-                if self.queue.len() < self.max_queued {
-                    self.queue.push_back(c);
-                }
-            }
-        } else {
-            if self.queue.len() < self.max_queued {
-                self.queue.push_back(c);
+                // Wake waiter without queuing
+                return self.inner.wake_waiter();
             }
         }
-        // [spec: completion_port/completion_port.tla Post — waiter check + unblock]
-        if let Some(t) = self.waiter.take() {
-            scheduler::unblock(t);
-            Some(t)
-        } else {
-            None
-        }
+        // Slow path: queue in kernel memory
+        self.inner.post(c)
     }
 
     /// Drain up to `max` completions from the queue.
     pub fn drain(&mut self, max: usize) -> VecDeque<Completion> {
-        let count = max.min(self.queue.len());
-        self.queue.drain(..count).collect()
+        self.inner.drain(max)
     }
 
     /// Register the current thread as waiter. Only one waiter at a time.
     // [spec: completion_port/completion_port.tla CheckAndAct — "waiter := CONSUMER_ID"]
     pub fn set_waiter(&mut self, thread_idx: usize) {
-        self.waiter = Some(thread_idx);
+        self.inner.set_waiter(thread_idx);
     }
 
     /// Number of pending completions in the kernel queue.
     pub fn pending(&self) -> usize {
-        self.queue.len()
+        self.inner.pending()
     }
 
     /// Whether this port has shared-memory rings set up.
     pub fn has_ring(&self) -> bool {
-        self.ring.is_some()
+        self.io_ring.is_some()
     }
 
     /// Set up shared-memory rings on this port.
     pub fn setup_ring(&mut self, ring: IoRing) {
-        self.ring = Some(ring);
+        self.io_ring = Some(ring);
     }
 
     /// Access the ring (if set up).
     pub fn ring(&self) -> Option<&IoRing> {
-        self.ring.as_ref()
+        self.io_ring.as_ref()
     }
 }

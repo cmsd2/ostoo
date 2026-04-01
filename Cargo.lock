@@ -61,6 +61,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0213d356d3c4ea2c18c40b037c3be23cd639825c18f25ee670ac7813beeef99c"
 
 [[package]]
+name = "completion-port"
+version = "0.1.0"
+
+[[package]]
 name = "conquer-once"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -197,6 +201,7 @@ dependencies = [
  "apic_types",
  "bitflags 1.2.1",
  "bootloader",
+ "completion-port",
  "conquer-once",
  "crossbeam-queue",
  "futures-util",
