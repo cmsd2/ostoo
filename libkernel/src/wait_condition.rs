@@ -24,7 +24,7 @@ impl WaitCondition {
     ///     |guard, thread_idx| { guard.waiter = Some(thread_idx); },
     /// );
     /// ```
-    // [spec: completion_port.tla
+    // [spec: completion_port/completion_port.tla
     //   CheckAndAct (check + register + mark_blocked) = one atomic step
     //   WaitUnblocked (yield_now) = next step]
     pub fn wait_while<G>(guard: Option<G>, register: impl FnOnce(&mut G, usize)) {

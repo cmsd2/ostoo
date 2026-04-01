@@ -666,7 +666,7 @@ pub fn kill_current_thread() -> ! {
 /// }                                // lock released
 /// scheduler::yield_now();          // switch away
 /// ```
-// [spec: completion_port.tla MarkBlocked — sets thread_state := "blocked"
+// [spec: completion_port/completion_port.tla MarkBlocked — sets thread_state := "blocked"
 //  while the port lock is still held, closing the lost-wakeup window.]
 pub fn mark_blocked() {
     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -683,7 +683,7 @@ pub fn mark_blocked() {
 /// **Deprecated**: all blocking sites now use `WaitCondition` or the manual
 /// `mark_blocked()` / `yield_now()` split. This wrapper remains for any
 /// future one-off use but should not be the default pattern.
-// [spec: completion_port.tla CheckAndAct + WaitUnblocked —
+// [spec: completion_port/completion_port.tla CheckAndAct + WaitUnblocked —
 //  mark_blocked() corresponds to "thread_state := blocked" in CheckAndAct,
 //  yield_now() corresponds to "await thread_state = running" in WaitUnblocked.]
 pub fn block_current_thread() {
@@ -694,7 +694,7 @@ pub fn block_current_thread() {
 /// Unblock a previously blocked thread, placing it back on the ready queue.
 ///
 /// Safe to call from any context including ISR.
-// [spec: completion_port.tla Post — "if thread_state = blocked then
+// [spec: completion_port/completion_port.tla Post — "if thread_state = blocked then
 //  thread_state := running".  The conditional is safe because all callers
 //  now call mark_blocked() under their lock before releasing it, so
 //  unblock() always finds the thread in the Blocked state.]

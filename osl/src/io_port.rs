@@ -648,9 +648,9 @@ pub fn sys_io_wait(port_fd: i32, completions_ptr: u64, max: u32, min: u32, timeo
         }));
     }
 
-    // [spec: completion_port.tla WaitLoop]
+    // [spec: completion_port/completion_port.tla WaitLoop]
     loop {
-        // [spec: completion_port.tla CheckAndAct — WaitCondition]
+        // [spec: completion_port/completion_port.tla CheckAndAct — WaitCondition]
         let mut p = port.lock();
         let timed_out = deadline.is_some() && timer::ticks() >= deadline.unwrap();
 
@@ -897,7 +897,7 @@ pub fn sys_io_ring_enter(port_fd: i32, to_submit: u32, min_complete: u32, flags:
     }
 
     // Phase 3: Wait for min_complete CQ entries
-    // [spec: completion_port.tla WaitLoop — WaitCondition]
+    // [spec: completion_port/completion_port.tla WaitLoop — WaitCondition]
     if min_complete > 0 {
         loop {
             let p = port.lock();

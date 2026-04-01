@@ -58,7 +58,7 @@ A waker can execute between steps 3 (unlock) and 4 (mark Blocked):
    spins forever. No future waker will call `unblock` because the waiter
    slot was already consumed. **Deadlock.**
 
-This race is confirmed by the PlusCal model in `specs/completion_port.tla`
+This race is confirmed by the PlusCal model in `specs/completion_port/completion_port.tla`
 (TLC finds a deadlock trace) and by code inspection of `scheduler.rs` lines
 640-676.
 
@@ -159,7 +159,7 @@ context-switches away from it immediately and never schedules it again until
 /// The scheduler will context-switch away and never schedule this thread
 /// again until unblock() is called. Execution resumes at the instruction
 /// after this call.
-// [spec: completion_port.tla CheckAndAct — "thread_state := blocked"
+// [spec: completion_port/completion_port.tla CheckAndAct — "thread_state := blocked"
 //        + WaitUnblocked — "await thread_state = running"]
 pub fn mark_blocked_and_yield() {
     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -231,7 +231,7 @@ impl WaitCondition {
     /// the waiter, mark the thread Blocked, release the lock, and yield.
     /// Returns when unblocked and rescheduled.
     ///
-    // [spec: completion_port.tla
+    // [spec: completion_port/completion_port.tla
     //   CheckAndAct (check + set_waiter + mark_blocked) = one label
     //   WaitUnblocked (await running) = next label]
     pub fn wait_while<T, L: Lock<T>>(

@@ -391,7 +391,7 @@ impl FileHandle for PipeReader {
                 }
             }
 
-            // [spec: completion_port.tla CheckAndAct — WaitCondition]
+            // [spec: completion_port/completion_port.tla CheckAndAct — WaitCondition]
             crate::wait_condition::WaitCondition::wait_while(Some(inner), |inner, thread_idx| {
                 inner.reader_thread = Some(thread_idx);
             });

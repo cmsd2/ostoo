@@ -14,7 +14,7 @@ brew install tlaplus
 
 ## Specs
 
-### `spsc_ring.tla` — SPSC Ring Buffer Protocol
+### `spsc_ring/spsc_ring.tla` — SPSC Ring Buffer Protocol
 
 Models the single-producer, single-consumer ring buffer used by IoRing's
 SQ and CQ rings. Verifies that:
@@ -27,7 +27,7 @@ SQ and CQ rings. Verifies that:
 Maps to: `IoRing::post_cqe()` and userspace consumption in
 `libkernel/src/completion_port.rs`.
 
-### `completion_port.tla` — CompletionPort Blocking Protocol
+### `completion_port/completion_port.tla` — CompletionPort Blocking Protocol
 
 Models the completion port with multiple producers and a single consumer.
 The consumer uses the `WaitCondition` protocol: check + set_waiter +
@@ -51,10 +51,10 @@ The same abstract protocol applies to all blocking sites in the kernel
 cd specs
 
 # Check the SPSC ring model (should pass)
-tlc spsc_ring.tla -config spsc_ring.cfg
+tlc spsc_ring/spsc_ring.tla -config spsc_ring/spsc_ring.cfg
 
 # Check the completion port model (should pass)
-tlc completion_port.tla -config completion_port.cfg
+tlc completion_port/completion_port.tla -config completion_port/completion_port.cfg
 
 # Or use the helper script:
 ./check.sh                    # run all specs

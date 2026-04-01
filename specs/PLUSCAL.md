@@ -17,7 +17,24 @@ results.
 
 ## File layout
 
-Each spec consists of two files:
+Each spec lives in its own subdirectory under `specs/`. In-progress specs
+for bug investigation live under `specs/issues/`:
+
+```
+specs/
+  name/
+    name.tla   — PlusCal algorithm + auto-generated TLA+ translation + properties
+    name.cfg   — TLC configuration: constants, invariants, liveness properties
+  issues/
+    issue-name/
+      name.tla — work-in-progress spec (red → green)
+      name.cfg
+```
+
+| Directory | Purpose |
+|---|---|
+| `specs/name/` | Canonical specs — match the current Rust code, TLC passes |
+| `specs/issues/issue-name/` | In-progress specs — red-green bug investigation |
 
 | File | Purpose |
 |---|---|
@@ -53,43 +70,119 @@ AllDelivered == ...
 `end algorithm; *)`) and the section after `END TRANSLATION`. Never manually
 edit the translation block — pcal.trans overwrites it completely.
 
-## Workflow
+## Workflow: Red-Green Specification
 
-### 1. Edit the PlusCal code
+Specs follow a red-green workflow similar to test-driven development. You
+first model the suspected bug ("red"), confirm TLC catches it, then iterate
+on the spec until it passes ("green"), implement the fix in Rust to match,
+and finally promote the passing spec to the base spec location.
 
-Write or modify the algorithm between `(*--algorithm` and `end algorithm; *)`.
+### Overview
 
-### 2. Translate PlusCal to TLA+
-
-```bash
-./check.sh name    # translates then checks
+```
+1. Model the bug        → specs/issues/<issue>/   (red — TLC finds violation)
+2. Fix the spec         → specs/issues/<issue>/   (green — TLC passes)
+3. Implement in Rust    → match the green spec
+4. Promote the spec     → copy to specs/<name>/   (replaces base spec)
+5. Tag correspondence   → update [spec:] tags in Rust code
 ```
 
-Or translate only (useful during iteration):
+### Step 1: Model the bug (red)
+
+Create a new subdirectory under `specs/issues/` named after the issue or
+bug being investigated:
 
 ```bash
-java -cp tla2tools.jar pcal.trans name.tla
+mkdir -p specs/issues/lost-wakeup
 ```
+
+Write a PlusCal spec that faithfully models the **current (buggy)** code.
+Include the safety/liveness properties you expect to be violated:
+
+```bash
+specs/issues/lost-wakeup/
+  completion_port.tla    # models the buggy protocol
+  completion_port.cfg    # invariants + liveness properties
+```
+
+Run TLC and confirm it finds the violation:
+
+```bash
+./check.sh issues/lost-wakeup/completion_port
+```
+
+TLC should report a counterexample trace. This is the "red" phase — the
+spec proves the bug exists. If TLC passes, your model doesn't capture the
+race; revisit the label boundaries (atomicity).
+
+### Step 2: Fix the spec (green)
+
+Edit the PlusCal code in the same `specs/issues/<issue>/` directory to model
+the proposed fix. For example, move `mark_blocked` into the same label as
+`set_waiter` to model doing both under a single lock:
+
+```
+\* Before (buggy — two labels):
+SetWaiter:
+    waiter := self;
+MarkBlocked:
+    thread_state := "blocked";
+
+\* After (fixed — one label):
+CheckAndAct:
+    waiter := self;
+    thread_state := "blocked";
+```
+
+Re-run TLC until all properties pass:
+
+```bash
+./check.sh issues/lost-wakeup/completion_port
+```
+
+This is the "green" phase — the spec proves the fix is correct.
+
+### Step 3: Implement in Rust
+
+Write the Rust code to match the green spec. The PlusCal labels map to lock
+scopes — operations in the same label must be under the same lock in Rust.
+See [Mapping PlusCal to Rust code](#mapping-pluscal-to-rust-code) below.
+
+### Step 4: Promote the spec
+
+Once the Rust implementation matches and the spec passes, copy the green
+spec from `specs/issues/` to the base spec location:
+
+```bash
+cp specs/issues/lost-wakeup/completion_port.tla specs/completion_port/completion_port.tla
+cp specs/issues/lost-wakeup/completion_port.cfg specs/completion_port/completion_port.cfg
+```
+
+Update the MODULE name inside the `.tla` file if it changed. Verify the
+base spec still passes:
+
+```bash
+./check.sh completion_port
+```
+
+The issue directory can be deleted or kept for historical reference.
+
+### Step 5: Tag correspondence
+
+Update `// [spec: name/name.tla Label]` comments in the Rust code to match
+the promoted spec. Use `grep -rn '\[spec:' .` to find all tags.
+
+### Quick reference (editing a spec without a bug)
+
+For routine spec edits that don't start from a bug:
+
+1. Edit the PlusCal code between `(*--algorithm` and `end algorithm; *)`.
+2. Run `./check.sh name` — this translates PlusCal and runs TLC.
+3. If TLC finds a violation, read the trace, fix, re-run. Repeat.
 
 pcal.trans rewrites the `BEGIN TRANSLATION` ... `END TRANSLATION` block
-in-place. It uses checksums to detect changes — comments don't trigger
-regeneration, but any code change does. You never need to manually delete
-the translation block.
-
-### 3. Run TLC
-
-```bash
-./check.sh name
-```
-
-TLC exhaustively explores all reachable states and checks:
-- **Invariants** (safety): must hold in every reachable state
-- **Properties** (liveness): temporal formulas that must hold on all behaviors
-
-### 4. Iterate
-
-If TLC finds a violation, it prints a counterexample trace. Read the trace,
-fix the PlusCal code, re-run `./check.sh`. Repeat until all properties pass.
+in-place. It uses checksums to detect changes. You never need to manually
+delete the translation block.
 
 ## Writing PlusCal specs
 
@@ -244,11 +337,11 @@ Tag Rust code with `// [spec: file.tla Label]` comments to link back to the
 PlusCal spec. This makes the mapping greppable from both sides.
 
 ```rust
-// [spec: spsc_ring.tla AcquireHead]
+// [spec: spsc_ring/spsc_ring.tla AcquireHead]
 let head = hdr.head.load(Ordering::Acquire);
 let tail = hdr.tail.load(Ordering::Relaxed);
 
-// [spec: spsc_ring.tla CheckFull]
+// [spec: spsc_ring/spsc_ring.tla CheckFull]
 if tail.wrapping_sub(head) >= self.cq_entries {
     return false;
 }
@@ -263,11 +356,11 @@ label name, update the Rust tags to match.
   properties. Liveness checking is slower and harder to debug.
 - **Use ghost variables** for properties that need to track history (e.g. "no
   duplicate delivery" needs a set of consumed values).
-- **Model the bug first**: if you suspect a race, write a spec that models
-  the current (potentially buggy) code. If TLC finds the bug, you've
-  confirmed the race exists. Then write the fixed version and verify it
-  passes. Both specs are valuable — the buggy one serves as a regression
-  test for the model itself.
+- **Model the bug first** (red-green workflow): if you suspect a race,
+  create a spec under `specs/issues/` that models the current (potentially
+  buggy) code. If TLC finds the bug (red), fix the spec until it passes
+  (green), implement the fix in Rust, then promote the spec to `specs/`.
+  See [Workflow: Red-Green Specification](#workflow-red-green-specification).
 - **Don't over-model**: abstract away details that don't affect the property
   you're checking. The spec doesn't need to be a 1:1 translation of the
   Rust code — it needs to faithfully model the concurrency protocol.

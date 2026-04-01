@@ -28,7 +28,7 @@ pub(crate) fn sys_wait4(pid_arg: u64, status_ptr: u64, _options: u64) -> i64 {
     let parent_pid = process::current_pid();
     let target_pid = pid_arg as i64;
 
-    // [spec: completion_port.tla — single lock acquisition for
+    // [spec: completion_port/completion_port.tla — single lock acquisition for
     //  check + register + mark_blocked eliminates the lost-wakeup race]
     loop {
         let table = process::lock_table();

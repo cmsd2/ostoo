@@ -80,7 +80,7 @@ pub fn sys_clone(flags: u64, child_stack: u64, _ptid: u64, _ctid: u64, _tls: u64
     // Check under the process table lock whether the child has already consumed
     // the vfork_parent_thread field (via execve or _exit). If Some, the child
     // hasn't run yet → block. If None, the child already exec'd/exited → skip.
-    // [spec: completion_port.tla — atomic check + mark_blocked]
+    // [spec: completion_port/completion_port.tla — atomic check + mark_blocked]
     WaitCondition::wait_while(
         {
             let table = process::lock_table();

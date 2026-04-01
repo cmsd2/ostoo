@@ -14,7 +14,7 @@ use libkernel::wait_condition::WaitCondition;
 ///
 /// Spawns the future as a kernel async task. When it completes, the blocked
 /// thread is unblocked and the result is returned.
-// [spec: completion_port.tla — atomic check + mark_blocked]
+// [spec: completion_port/completion_port.tla — atomic check + mark_blocked]
 pub fn blocking<T: Send + 'static>(future: impl Future<Output = T> + Send + 'static) -> T {
     let result: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
     let thread_idx = scheduler::current_thread_idx();

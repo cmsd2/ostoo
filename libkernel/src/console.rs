@@ -80,7 +80,7 @@ pub fn read_input(buf: &mut [u8]) -> ReadResult {
             }
         }
         // Buffer empty — register + mark blocked under the console lock.
-        // [spec: completion_port.tla CheckAndAct — WaitCondition]
+        // [spec: completion_port/completion_port.tla CheckAndAct — WaitCondition]
         WaitCondition::wait_while(Some(inner), |inner, thread_idx| {
             inner.blocked_reader = Some(thread_idx);
             inner.blocked_reader_pid = Some(pid);
